@@ -31,4 +31,4 @@ The project is intended to serve both individual investors who want unrestricted
 
 The stable product focus is detailed U.S. quarterly financial statements. Annual and foreign-filer support should currently be treated as experimental.
 
-All generated outputs should be reviewed before being used the outputs from this script is not in any way shape or form financial advice.
+All generated outputs should be independently reviewed before use. This project is provided as-is and does not constitute financial, investment, accounting, or legal advice.
