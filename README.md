@@ -29,4 +29,6 @@ Foreign quarterly reporting, broad international exchange coverage, analyst esti
 
 The project is intended to serve both individual investors who want unrestricted local financial data and developers building open-source research platforms, Excel tools, APIs, dashboards, screeners, valuation systems, and financial applications.
 
-The stable product focus is detailed U.S. quarterly financial statements. Annual and foreign-filer support should currently be treated as experimental, and all generated outputs should be reviewed before being used for investment, accounting, or other high-stakes decisions.
+The stable product focus is detailed U.S. quarterly financial statements. Annual and foreign-filer support should currently be treated as experimental.
+
+##All generated outputs should be reviewed before being used the outputs from this script is not in any way shape or form financial advice.
