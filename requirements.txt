@@ -1,0 +1,27 @@
+# SEC Financials dependencies
+# Recommended Python version: 3.10 or newer
+#
+# Install everything with:
+#   python -m pip install -r requirements.txt
+
+# Core data and HTTP processing
+httpx
+pandas
+numpy
+
+# SEC filing retrieval and XBRL parsing
+edgartools
+
+# HTML parsing and table extraction
+beautifulsoup4
+lxml
+
+# Terminal progress display
+tqdm
+
+# Excel (.xlsx) export
+openpyxl
+
+# Optional only when every run uses --no-arelle.
+# The script enables Arelle by default, so keep this installed for full functionality.
+arelle-release
