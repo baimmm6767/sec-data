@@ -1,0 +1,552 @@
+SEC FINANCIALS — COMMAND-LINE ARGUMENTS GUIDE
+================================================
+
+SCRIPT
+------
+sec_data.py
+
+BASIC SYNTAX
+------------
+python "sec_data.py" --ticker TICKER [OPTIONS]
+
+Windows PowerShell example:
+python "sec_data.py" --ticker AAPL --limit 20 --xlsx
+
+macOS/Linux example:
+python3 "sec_data.py" --ticker AAPL --limit 20 --xlsx
+
+
+FIRST-RUN SEC IDENTITY SETUP
+----------------------------
+The SEC requires automated requests to identify the person or organization
+making them.
+
+On the first run, the script asks for:
+
+1. Your name or organization
+2. Your contact email address
+
+The script then saves the identity locally at:
+
+.cache/sec_identity.json
+
+This is not a login account. No password, API key, or SEC account is required.
+The file contains only the contact identity used in SEC request headers.
+
+Later runs reuse the saved identity automatically.
+
+To replace it, use:
+
+python "sec_data.py" --ticker AAPL --reset-identity
+
+The script deletes the existing identity, displays the setup screen again, and
+then continues the requested extraction.
+
+For automated or non-interactive environments, an identity can also be supplied
+through the SEC_IDENTITY environment variable.
+
+PowerShell:
+$env:SEC_IDENTITY = "Your Name (you@example.com)"
+python "sec_data.py" --ticker AAPL
+
+macOS/Linux:
+export SEC_IDENTITY="Your Name (you@example.com)"
+python3 "sec_data.py" --ticker AAPL
+
+
+ARGUMENT SUMMARY
+----------------
+--ticker TICKER
+--limit NUMBER
+--no-arelle
+--log
+--xlsx
+--workers NUMBER
+--annual
+--reset-identity
+
+
+1. --ticker
+-----------
+Required: Yes
+Value type: Stock ticker symbol
+Default: None
+
+Specifies the company to extract.
+
+Example:
+python "sec_data.py" --ticker AAPL
+
+Ticker input is converted to uppercase automatically, so these are equivalent:
+
+--ticker AAPL
+--ticker AAPL
+
+The script uses the ticker to find the company and its SEC filings.
+
+Typical supported use:
+- U.S. domestic companies filing 10-Q and 10-K reports
+- Foreign private issuers filing 20-F or 40-F reports, using the experimental
+  annual-only foreign pipeline
+
+The script may fail or return no data when:
+- The ticker is invalid
+- The company is not represented correctly in EDGAR
+- The company has no supported SEC filing history
+- The issuer uses an unsupported filing route
+
+
+2. --limit
+----------
+Required: No
+Value type: Integer
+Default: 50
+
+Controls how many filings or annual fiscal periods the script attempts to use.
+
+Quarterly mode:
+The script requests recent 10-Q and 10-K filings. A higher number normally
+provides more quarterly history but increases download and processing time.
+
+Example:
+python "sec_data.py" --ticker META --limit 20
+
+Annual mode:
+When --annual is used for a native U.S. filer, the limit represents the target
+number of annual fiscal-year columns. The script may scan additional 10-K or
+10-K/A filings internally to account for amendments and transition filings.
+
+Foreign private issuers:
+For 20-F and 40-F routes, the limit is treated as an annual-history limit.
+
+Practical guidance:
+- 8 to 12: quick test or recent history
+- 20: reasonable quarterly history for many companies
+- 40 to 50: deeper history, but slower
+- Very large values may provide little additional usable history because SEC
+  structured data availability and company history are finite
+
+Fewer filings:
+- Faster first run
+- Less historical coverage
+- Fewer opportunities for cross-filing reconciliation
+
+More filings:
+- More history
+- Better ability to reconcile renamed or restated rows
+- More SEC requests and processing time
+
+
+3. --xlsx
+---------
+Required: No
+Value type: Flag
+Default: Off
+
+Exports an Excel workbook instead of the normal CSV output.
+
+Example:
+python "sec_data.py" --ticker AAPL --limit 20 --xlsx
+
+Quarterly Excel output:
+output/financials/excel/AAPL_financials.xlsx
+
+Native annual Excel output:
+output/financials/excel/AAPL_annual_financials.xlsx
+
+The workbook is organized into statement sheets where supported.
+
+Without --xlsx, the default output is CSV:
+
+Quarterly:
+output/financials/AAPL_financials.csv
+
+Native annual:
+output/financials/AAPL_annual_financials.csv
+
+Important:
+The openpyxl package is required for Excel export. If Excel writing fails or
+openpyxl is unavailable, the script falls back to CSV and prints a message.
+
+
+4. --annual
+-----------
+Required: No
+Value type: Flag
+Default: Off
+
+Enables the experimental native U.S. annual-only pipeline.
+
+Example:
+python "sec_data.py" --ticker AAPL --limit 10 --annual
+
+For a native U.S. filer, this mode:
+- Fetches 10-K and 10-K/A filings only
+- Builds fiscal-year columns instead of quarterly columns
+- Writes an annual CSV or XLSX file
+- Keeps the normal quarterly pipeline isolated from annual-mode changes
+
+Output:
+output/financials/AAPL_annual_financials.csv
+
+With --xlsx:
+output/financials/excel/AAPL_annual_financials.xlsx
+
+Important limitations:
+- Native --annual mode is experimental and work in progress
+- It may handle unusual annual scopes, amendments, 52/53-week years, and
+  historical taxonomy changes imperfectly
+- It should not be assumed to match the maturity of the stable U.S. quarterly
+  pipeline
+
+Foreign private issuers:
+The script automatically routes detected 20-F and 40-F filers to the separate
+foreign annual-only path. They do not require --annual. Foreign annual support
+is also experimental.
+
+Do not use --annual when the goal is normal 10-Q/10-K quarterly output.
+
+
+5. --no-arelle
+--------------
+Required: No
+Value type: Flag
+Default: Off, meaning Arelle is enabled
+
+Disables the optional Arelle-assisted custom-tag preprocessing and enrichment.
+
+Example:
+python "sec_data.py" --ticker AAPL --limit 20 --no-arelle
+
+By default, the script passes:
+
+use_arelle=True
+
+With --no-arelle, it passes:
+
+use_arelle=False
+
+Arelle may help with:
+- Custom XBRL concepts
+- Annual 10-K enrichment
+- Experimental 20-F/40-F annual extraction
+- Filing structures where the normal parser misses concept relationships
+
+Reasons to use --no-arelle:
+- Faster execution
+- Arelle is not installed correctly
+- Troubleshooting an Arelle-specific failure
+- Testing the core extraction path without optional enrichment
+
+Trade-off:
+Disabling Arelle can reduce custom-tag or foreign annual coverage for some
+companies. It should not disable the main edgartools/XBRL extraction engine.
+
+The Python dependency is usually installed as:
+arelle-release
+
+
+6. --workers
+------------
+Required: No
+Value type: Integer
+Default: SEC_MAX_WORKERS environment variable, or 8
+
+Controls the number of parallel workers used to process native U.S. 10-Q and
+10-K filings.
+
+Example:
+python "sec_data.py" --ticker AAPL --limit 30 --workers 4
+
+The worker count controls local concurrency. It does not remove the script's
+global SEC request-rate limiter.
+
+Common values:
+- 1: sequential processing and easiest debugging
+- 2 to 4: conservative
+- 8: normal default
+- Higher values may not improve speed because SEC request starts remain
+  rate-limited and local CPU, memory, parsing, and network conditions differ
+
+The effective number of workers cannot exceed the number of filings queued.
+
+This option primarily affects the native quarterly extraction path. Annual and
+foreign routes may use their own isolated processing behavior.
+
+Environment-variable alternative:
+
+PowerShell:
+$env:SEC_MAX_WORKERS = "4"
+
+macOS/Linux:
+export SEC_MAX_WORKERS=4
+
+A command-line --workers value takes precedence over the default environment
+setting.
+
+Troubleshooting guidance:
+- Use --workers 1 when diagnosing inconsistent console output or failures
+- Reduce workers on low-memory machines
+- Increasing workers does not bypass SEC limits and should not be used to make
+  aggressive request bursts
+
+
+7. --log
+--------
+Required: No
+Value type: Flag
+Default: Off
+
+Enables detailed console logs.
+
+Example:
+python "sec_data.py" --ticker IBM --limit 20 --log
+
+Without --log:
+- The script uses its compact progress interface
+- Third-party console noise is suppressed where possible
+- High-level status, warnings, retries, and completion are shown
+
+With --log:
+- Detailed filing-processing messages are printed
+- Warnings and repair messages are easier to inspect
+- The compact progress interface is reduced or bypassed
+- Useful when diagnosing extraction, parsing, mapping, or reconciliation issues
+
+Use --log when:
+- A filing fails
+- A row appears missing or incorrect
+- You need to inspect HTML rescue, segment repair, bridge repair, or cache
+  behavior
+- Preparing a reproducible bug report
+
+The flag changes logging and presentation only. It is not intended to change the
+financial output.
+
+
+8. --reset-identity
+-------------------
+Required: No
+Value type: Flag
+Default: Off
+
+Deletes the saved SEC contact identity and launches first-run setup again.
+
+Example:
+python "sec_data.py" --ticker AAPL --reset-identity
+
+The argument still requires --ticker because --ticker is a required argument in
+the current command-line interface.
+
+The saved file is normally:
+
+.cache/sec_identity.json
+
+Use this option when:
+- The name or organization has changed
+- The contact email has changed
+- The cache was copied from another user
+- You want to replace a test identity before publishing or distributing the
+  project
+
+This resets only the identity file. It does not delete filing caches, parsed
+HTML caches, extraction caches, final-pivot caches, or generated outputs.
+
+
+COMMON COMMANDS
+---------------
+
+Normal U.S. quarterly CSV:
+python "sec_data.py" --ticker AAPL --limit 20
+
+Normal U.S. quarterly Excel:
+python "sec_data.py" --ticker AAPL --limit 20 --xlsx
+
+Detailed logs:
+python "sec_data.py" --ticker AAPL --limit 20 --log
+
+Reduced concurrency:
+python "sec_data.py" --ticker AAPL --limit 20 --workers 2
+
+Sequential debugging:
+python "sec_data.py" --ticker AAPL --limit 10 --workers 1 --log
+
+Run without Arelle:
+python "sec_data.py" --ticker AAPL --limit 20 --no-arelle
+
+Experimental native annual CSV:
+python "sec_data.py" --ticker AAPL --limit 10 --annual
+
+Experimental native annual Excel:
+python "sec_data.py" --ticker AAPL --limit 10 --annual --xlsx
+
+Reset SEC identity:
+python "sec_data.py" --ticker AAPL --reset-identity
+
+A conservative troubleshooting run:
+python "sec_data.py" --ticker AAPL --limit 8 --workers 1 --no-arelle --log
+
+
+ARGUMENT INTERACTIONS
+---------------------
+
+--annual + --xlsx
+Produces an experimental annual Excel workbook.
+
+--annual + --limit 10
+Targets approximately ten annual fiscal-year output columns rather than ten
+quarterly filings.
+
+--no-arelle + --annual
+Runs the experimental native annual pipeline without the optional Arelle
+enrichment pass.
+
+--workers + --annual
+The worker option is designed primarily for native quarterly 10-Q/10-K
+processing. Do not assume that increasing it accelerates every annual or
+foreign operation.
+
+--log + any other option
+Only changes console detail and progress presentation. It should not alter the
+result.
+
+--reset-identity + normal extraction options
+Resets the identity first, then starts the requested extraction.
+
+
+OUTPUT LOCATIONS
+----------------
+
+Default quarterly CSV:
+output/financials/{TICKER}_financials.csv
+
+Quarterly Excel:
+output/financials/excel/{TICKER}_financials.xlsx
+
+Native annual CSV:
+output/financials/{TICKER}_annual_financials.csv
+
+Native annual Excel:
+output/financials/excel/{TICKER}_annual_financials.xlsx
+
+The folders are created automatically when required.
+
+
+CACHE LOCATIONS
+---------------
+
+Default project cache root:
+.cache/
+
+The exact location can be changed with SEC_CACHE_DIR.
+
+PowerShell:
+$env:SEC_CACHE_DIR = "C:\path\to\my_cache"
+
+macOS/Linux:
+export SEC_CACHE_DIR="/path/to/my_cache"
+
+The cache may contain:
+- SEC contact identity
+- Parsed HTML tables
+- Native extraction results
+- Final pivot results
+- Experimental foreign annual cache data
+
+The identity file is separate from financial extraction cache entries.
+
+
+USEFUL ENVIRONMENT VARIABLES
+----------------------------
+
+SEC_IDENTITY
+Supplies the SEC identity without prompting.
+
+Example:
+SEC_IDENTITY="Your Name (you@example.com)"
+
+SEC_CACHE_DIR
+Changes the root directory used by script-managed persistent caches.
+
+Default:
+.cache
+
+SEC_MAX_WORKERS
+Changes the default native filing worker count when --workers is omitted.
+
+Default:
+8
+
+SEC_LOCAL_STORAGE
+When enabled, asks edgartools to use local filing storage.
+
+Accepted enabled examples:
+1
+true
+yes
+on
+
+SEC_PERSISTENT_HTML_CACHE
+Controls persistent parsed-HTML caching.
+
+Default:
+Enabled
+
+Disable examples:
+0
+false
+no
+off
+disabled
+
+SEC_PROFILE
+Enables internal runtime profiling and prints timing/counter summaries when the
+process exits.
+
+SEC_DEBUG
+Enables debug-only console messages.
+
+SEC_PROGRESS_LIGHT
+Uses a lighter progress mode for repeated development or profiling runs.
+
+NO_COLOR
+Disables colorized terminal output where supported.
+
+
+RECOMMENDED STARTING COMMAND
+----------------------------
+For a normal user testing the stable quarterly path:
+
+python "sec_data.py" --ticker AAPL --limit 20 --xlsx
+
+For the first diagnostic run:
+
+python "sec_data.py" --ticker AAPL --limit 8 --workers 1 --log
+
+
+SUPPORT STATUS
+--------------
+Primary stable focus:
+- U.S. domestic filer quarterly financials from 10-Q and 10-K filings
+- CSV and XLSX export
+- Income statement, balance sheet, and cash-flow extraction
+- Business and geographic segment extraction
+- Filing-aware organization and accounting reconciliation
+- Local persistent caching
+
+Experimental:
+- Native --annual mode
+- Foreign private issuer annual extraction from 20-F and 40-F filings
+- IFRS and non-U.S. taxonomy handling
+- Some unusual industry and filing structures
+
+Not part of the stable core:
+- Foreign quarterly extraction
+- Broad international exchange coverage
+- Analyst estimates
+- Market prices
+- Transcripts
+- Operating metrics
+
+Generated financial data should be reviewed before use in investment,
+accounting, regulatory, or other high-stakes decisions.
