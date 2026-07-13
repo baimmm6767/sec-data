@@ -2,7 +2,7 @@ sec-data is an open-source Python engine that extracts detailed, modelling-ready
 
 The primary supported workflow is quarterly financial extraction for U.S. domestic filers using 10-Q and 10-K filings. The engine combines XBRL facts, presentation and calculation linkbases, dynamic custom-tag handling, cross-filing reconciliation, HTML fallback extraction, accounting-identity repairs, Q4 derivation, segment and geographic disclosure extraction, filing-aware row ordering, parallel processing, and persistent caching.
 
-Unlike financial-data websites that limit exports or require paid API access, SEC Financials runs entirely on the user’s machine. The resulting datasets remain local, editable, and ready for financial modelling, valuation work, screening tools, research applications, or integration into other open-source platforms.
+Unlike financial-data websites that limit exports or require paid API access, sec-data runs entirely on the user’s machine. The resulting datasets remain local, editable, and ready for financial modelling, valuation work, screening tools, research applications, or integration into other open-source platforms.
 
 Current capabilities include:
 
