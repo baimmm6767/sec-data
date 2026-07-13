@@ -5639,43 +5639,136 @@ def resolve_custom_tags(calc_trees):
                         if not _ann:
                             _CONCEPT_TAG_TO_LABEL.setdefault(child_clean, target_label)
 
+# Geographic member classifier shared by XBRL, HTML, and final routing.
+#
+# A member is geographic only when its text can be fully explained by:
+#   * one or more country/region names;
+#   * geographic connectors such as "including" or "other countries"; and
+#   * harmless accounting/display words such as "revenue" or "segment".
+# Any remaining business word ("Gaming", "Cloud Services", "Government")
+# makes the result non-geographic. This keeps the fix generic and prevents
+# country words inside real business-segment names from being reclassified.
+_GEO_MEMBER_STOPWORDS = frozenset({
+    'revenue', 'revenues', 'sale', 'sales', 'fee', 'fees', 'income', 'loss',
+    'profit', 'earnings', 'margin', 'expense', 'expenses', 'cost', 'costs',
+    'asset', 'assets', 'liability', 'liabilities', 'debt', 'equity', 'cash',
+    'flow', 'flows', 'operations', 'operating', 'net', 'gross', 'total',
+    'segment', 'segments', 'member', 'group', 'company', 'corp', 'inc',
+    'ltd', 'llc', 'plc', 'division', 'subsidiary', 'consolidated',
+})
+_GEO_CONNECTOR_WORDS = frozenset({
+    'and', 'or', 'of', 'for', 'the', 'in', 'at', 'by', 'from',
+    'including', 'includes', 'included', 'excluding', 'excludes', 'excluded',
+    'except', 'plus', 'with', 'without', 'other', 'all', 'rest', 'remainder',
+    'greater', 'mainland', 'not', 'separately', 'disclosed', 'countries',
+    'country', 'regions', 'region', 'territories', 'territory', 'locations',
+    'location', 'international', 'domestic', 'foreign', 'worldwide',
+})
+_GEO_MULTI_SCOPE_WORDS = frozenset({
+    'including', 'excluding', 'and', 'or', 'other', 'all', 'rest',
+    'remainder', 'greater', 'mainland', 'countries', 'regions',
+    'territories', 'international', 'worldwide',
+})
+# Longest first so "papua new guinea" is consumed before "guinea" and
+# "united states" before a shorter overlapping phrase.
+_GEO_COUNTRY_PATTERNS = tuple(
+    (country, re.compile(r'(?<![a-z])' + re.escape(country) + r'(?![a-z])', re.I))
+    for country in sorted(GEOGRAPHIC_COUNTRIES, key=lambda value: (-len(value), value))
+)
+
+
+def _geo_clean_member_text(label: str) -> str:
+    text = html_lib.unescape(str(label or ''))
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+@lru_cache(maxsize=65536, typed=True)
+def _classify_geographic_member(label: str, is_geographic_axis: bool = False):
+    """Return ``country``, ``region``, or ``None`` for a display member.
+
+    Full country names are strong evidence even without a geographic axis.
+    ISO alpha-2 codes remain weak and are accepted only on a geographic axis.
+    Composite labels such as ``China (including Hong Kong)`` are regions,
+    because they combine more than one jurisdiction and should not be emitted
+    as a single country row.
+    """
+    original = _geo_clean_member_text(label)
+    if not original:
+        return None
+    lowered = original.casefold().strip(' .,:;()[]{}')
+    if lowered in GEOGRAPHIC_COUNTRIES:
+        return 'country'
+    if is_geographic_axis and lowered in GEOGRAPHIC_CODES:
+        return 'country'
+
+    # Standardize separators before token analysis. Parentheses are structural
+    # punctuation in labels such as "China (including Hong Kong)", not a
+    # signal that the member is non-geographic.
+    working = lowered.replace('&', ' and ')
+    working = re.sub(r'[/|,+;:()\[\]{}]', ' ', working)
+    working = re.sub(r'\s+', ' ', working).strip()
+
+    countries = []
+    country_stripped = working
+    for country, pattern in _GEO_COUNTRY_PATTERNS:
+        if pattern.search(country_stripped):
+            countries.append(country)
+            country_stripped = pattern.sub(' ', country_stripped)
+
+    had_region_keyword = bool(_REGION_KEYWORDS_RE.search(working))
+    country_stripped = _REGION_KEYWORDS_RE.sub(' ', country_stripped)
+    words = re.findall(r'[a-z]+', country_stripped)
+    leftovers = [
+        word for word in words
+        if word not in _GEO_MEMBER_STOPWORDS
+        and word not in _GEO_CONNECTOR_WORDS
+    ]
+    if leftovers:
+        return None
+
+    # A label must contain positive geographic evidence. Connector-only or
+    # accounting-only labels such as "Other Revenue" are not geography.
+    generic_geo_phrase = bool(re.search(
+        r'\b(?:other|all|rest|remainder)\s+(?:countries|regions|territories)\b',
+        working,
+    ))
+    if not countries and not had_region_keyword and not generic_geo_phrase:
+        return None
+
+    tokens = set(re.findall(r'[a-z]+', working))
+    is_composite = (
+        len(set(countries)) > 1
+        or had_region_keyword
+        or generic_geo_phrase
+        or bool(tokens & _GEO_MULTI_SCOPE_WORDS)
+    )
+    return 'region' if is_composite else 'country'
+
+
+def _canonical_geographic_member_label(label: str, is_geographic_axis: bool = False) -> str:
+    """Canonicalize punctuation/connectors only after geography is proven."""
+    text = _geo_clean_member_text(label)
+    if _classify_geographic_member(text, is_geographic_axis) is None:
+        return text
+    text = text.replace('&', ' And ')
+    text = re.sub(r'[/|,+;:()\[\]{}]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Normalize only structural connector casing. Preserve issuer spelling and
+    # acronyms in country/region names (U.S., EMEA, APAC, etc.).
+    for word in (
+        'including', 'excluding', 'except', 'and', 'or', 'other', 'all',
+        'rest', 'remainder', 'greater', 'mainland', 'not', 'separately',
+        'disclosed', 'countries', 'country', 'regions', 'region',
+        'territories', 'territory',
+    ):
+        text = re.sub(rf'\b{word}\b', word.title(), text, flags=re.I)
+    return text
+
+
 @lru_cache(maxsize=65536, typed=True)
 def _is_pure_geographic_label(label: str, is_geographic_axis: bool = False) -> bool:
-    import re
-    ml = label.lower()
-    
-    # Check for direct country/code match
-    if ml in GEOGRAPHIC_COUNTRIES or (ml in GEOGRAPHIC_CODES and is_geographic_axis):
-        return True
-        
-    # If the label has no region keywords at all, check if it contains a known country
-    if not _REGION_KEYWORDS_RE.search(ml):
-        has_country = any(c in ml for c in GEOGRAPHIC_COUNTRIES)
-        if not has_country:
-            return False
-            
-    # Subtract all geographic words and all metric/boilerplate stopwords.
-    # If anything is left (e.g. "hardware", "processing"), it's a business segment!
-    clean_ml = _REGION_KEYWORDS_RE.sub(' ', ml)
-    
-    for country in GEOGRAPHIC_COUNTRIES:
-        if country in clean_ml:
-            clean_ml = clean_ml.replace(country, ' ')
-            
-    METRIC_STOPWORDS = {
-        'revenue', 'revenues', 'sale', 'sales', 'fee', 'fees', 'income', 'loss', 
-        'profit', 'earnings', 'margin', 'expense', 'expenses', 'cost', 'costs', 
-        'asset', 'assets', 'liability', 'liabilities', 'debt', 'equity', 'cash', 
-        'flow', 'flows', 'operations', 'operating', 'net', 'gross', 'total', 
-        'segment', 'segments', 'member', 'group', 'company', 'corp', 'inc', 
-        'ltd', 'llc', 'plc', 'division', 'subsidiary', 'and', 'or', 'of', 'for', 'the',
-        'other', 'all', 'corporate', 'unallocated', 'eliminations', 'consolidated'
-    }
-    
-    words = re.findall(r'[a-z]+', clean_ml)
-    leftover_words = [w for w in words if w not in METRIC_STOPWORDS]
-    
-    return len(leftover_words) == 0
+    return _classify_geographic_member(label, is_geographic_axis) is not None
 
 # ---------------------------------------------------------------------------
 # Generic table-structured business-breakdown rescue
@@ -5919,6 +6012,20 @@ def _gb_has_positive_context(context: str) -> bool:
         or any(pattern.search(normalized)
                for pattern in _GENERIC_BUSINESS_DRIVER_CONTEXT_RE)
     )
+
+
+def _gb_geographic_basis_from_context(context: str):
+    """Return an explicit geography basis only when the heading is unambiguous."""
+    lowered = _gb_clean_text(context).casefold()
+    detected = []
+    if re.search(r'\bcustomer\s+headquarters(?:\s+location)?\b|\bheadquartered\s+(?:in|at)\b', lowered):
+        detected.append('Customer Headquarters Location')
+    if re.search(r'\bcustomer\s+billing(?:\s+location)?\b|\bbilling\s+location\b', lowered):
+        detected.append('Customer Billing Location')
+    if re.search(r'\bship(?:ment|ments|ped|ping)(?:\s+to)?\s+(?:destination|location)\b|\bship-to\b', lowered):
+        detected.append('Shipment Destination')
+    unique = list(dict.fromkeys(detected))
+    return unique[0] if len(unique) == 1 else None
 
 
 def _gb_context_class(context: str):
@@ -6244,7 +6351,7 @@ def _extract_generic_business_breakdowns_from_textblocks(
     accepted_keys = set()
 
     def _accept_candidates(candidates, candidate_end_dt, source_period_role,
-                           source_table_fingerprint):
+                           source_table_fingerprint, source_geographic_basis=None):
         candidate_fy, candidate_q = get_period_info(candidate_end_dt, ye_month)
         candidate_end_text = candidate_end_dt.strftime('%Y-%m-%d')
         for candidate in candidates:
@@ -6274,6 +6381,7 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 'SourceConfidence': candidate.get('Confidence'),
                 'SourcePeriodRole': source_period_role,
                 'SourceTableFingerprint': source_table_fingerprint,
+                'SourceGeographicBasis': source_geographic_basis,
             })
             accepted_keys.add(fact_key)
 
@@ -6284,7 +6392,9 @@ def _extract_generic_business_breakdowns_from_textblocks(
             preferred_duration=preferred_duration)
         if not candidates:
             return
-        _accept_candidates(candidates, end_dt, 'current', table_fingerprint)
+        geographic_basis = _gb_geographic_basis_from_context(context)
+        _accept_candidates(
+            candidates, end_dt, 'current', table_fingerprint, geographic_basis)
 
         # Comparative columns carry an explicit prior-year header and the same
         # quarter/annual duration.  They safely backfill an earlier period when
@@ -6300,7 +6410,7 @@ def _extract_generic_business_breakdowns_from_textblocks(
             comparative_end_dt = end_dt - pd.DateOffset(years=1)
             _accept_candidates(
                 comparative_candidates, comparative_end_dt, 'comparative',
-                table_fingerprint)
+                table_fingerprint, geographic_basis)
 
     for raw_value in text_blocks['value'].to_numpy(copy=False):
         html_text = str(raw_value or '')
@@ -6399,22 +6509,82 @@ def _gb_normalized_display_parts(label: str):
 
 
 def _gb_route_html_business_fact(fact: dict) -> dict:
-    """Route pure geographic HTML members before they reach segment cleanup."""
+    """Route proven geographic HTML revenue members before segment cleanup."""
     routed = dict(fact)
     metric, member = _split_segment_display_label(routed.get('Label'))
     member = _gb_clean_member_footnote(member)
     if not member or _normalize_label_key(metric) != 'revenue':
         return routed
-    if not _is_pure_geographic_label(member, False):
+    geo_kind = _classify_geographic_member(member, False)
+    if geo_kind is None:
         return routed
-    member_lower = member.casefold()
+    member = _canonical_geographic_member_label(member, False)
     routed['Category'] = (
         '4c_Segments_Geographic_Countries'
-        if member_lower in GEOGRAPHIC_COUNTRIES
+        if geo_kind == 'country'
         else '4b_Segments_Geographic_Regions'
     )
     routed['Label'] = f'{metric} - {member}'
     return routed
+
+
+def _normalize_extracted_geographic_facts(extracted):
+    """Normalize proven geographic revenue facts from every extraction path.
+
+    This is a metadata-only pass. It never changes a numeric value, period,
+    concept, rank, duration, filing date, or source. Running it after XBRL,
+    HTML, and label-repair extraction prevents the same geographic series from
+    surviving in 4a, 4b, and 4c under punctuation variants.
+
+    When one filing contains an unambiguous table heading such as "customer
+    billing location" or "customer headquarters location", that source-backed
+    basis is propagated to all geographic revenue facts from that filing. If
+    more than one basis is present, propagation fails closed.
+    """
+    if not extracted:
+        return extracted
+
+    explicit_bases = set()
+    for fact in extracted:
+        basis = str(fact.get('SourceGeographicBasis') or '').strip()
+        if basis:
+            explicit_bases.add(basis)
+    filing_basis = next(iter(explicit_bases)) if len(explicit_bases) == 1 else None
+
+    changed = 0
+    for fact in extracted:
+        if fact.get('Category') not in {
+            '4a_Segments_Business',
+            '4b_Segments_Geographic_Regions',
+            '4c_Segments_Geographic_Countries',
+        }:
+            continue
+        metric, member = _split_segment_display_label(fact.get('Label'))
+        if _normalize_label_key(metric) != 'revenue' or not member:
+            continue
+        axis_hint = fact.get('Category') in {
+            '4b_Segments_Geographic_Regions',
+            '4c_Segments_Geographic_Countries',
+        }
+        geo_kind = _classify_geographic_member(member, axis_hint)
+        if geo_kind is None:
+            continue
+        canonical_member = _canonical_geographic_member_label(member, axis_hint)
+        target_category = (
+            '4c_Segments_Geographic_Countries'
+            if geo_kind == 'country'
+            else '4b_Segments_Geographic_Regions'
+        )
+        basis = str(fact.get('SourceGeographicBasis') or filing_basis or '').strip()
+        basis_suffix = f' ({basis})' if basis else ''
+        target_label = f'{metric} - {canonical_member}{basis_suffix}'
+        if fact.get('Category') != target_category or fact.get('Label') != target_label:
+            fact['Category'] = target_category
+            fact['Label'] = target_label
+            changed += 1
+    if changed:
+        print(f"  [Geography] Normalized/routed {changed} geographic revenue fact(s).")
+    return extracted
 
 
 def _gb_series_categories_compatible(html_category: str, xbrl_category: str) -> bool:
@@ -7160,6 +7330,7 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                                      '_fy_fast', '_q_fast'],
                              errors='ignore')
     extracted = _correct_xbrl_segment_labels_from_html(extracted, facts_df, filing, ye_month)
+    extracted = _normalize_extracted_geographic_facts(extracted)
 
     # Passive provenance fields used by native annual mode.  These fields are
     # added after every extraction/recovery path so existing quarterly logic is
@@ -18168,7 +18339,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-14.final-pivot.v17-annual-consolidation-persist"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-14.final-pivot.v18-geography-basis-routing"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
