@@ -2385,10 +2385,7 @@ ul.task-list li.task-done::before {
 					const prevV = getPeriodValue(co, row, prevYear);
 					return (prevV === null || prevV === 0) ? null : ((v / prevV) - 1) * 100;
 				} else {
-					const curScore = parsePeriod(gp);
-					const prevScore = curScore - 10;
-					const prevPeriod = globalPeriods.find(p => parsePeriod(p) === prevScore)
-						|| co.periods.find(p => parsePeriod(p) === prevScore);
+					const prevPeriod = getPriorYoYPeriod(gp, chartPeriods, co.periods);
 					if (!prevPeriod) return null;
 					const prevV = getPeriodValue(co, row, prevPeriod);
 					return (prevV === null || prevV === 0) ? null : ((v / prevV) - 1) * 100;
@@ -2401,8 +2398,50 @@ ul.task-list li.task-done::before {
                 return m ? m[1] : null;
             }
 
-            // In multi-company quarterly/TTM views, columns are aligned by the
-            // actual statement period-end date instead of fiscal-quarter name.
+            // Multi-company quarterly/TTM comparison uses relative quarter slots:
+            // slot 0 is each company's latest reported quarter, slot 1 is the
+            // immediately preceding reported quarter, and so on. This keeps
+            // companies with different fiscal calendars visually comparable.
+            const RELATIVE_PERIOD_PREFIX = '__LATEST_QUARTER_SLOT_';
+
+            function relativePeriodKey(index) {
+                return `${RELATIVE_PERIOD_PREFIX}${index}`;
+            }
+
+            function getRelativePeriodIndex(periodStr) {
+                const text = String(periodStr || '');
+                if (!text.startsWith(RELATIVE_PERIOD_PREFIX)) return -1;
+                const idx = Number(text.slice(RELATIVE_PERIOD_PREFIX.length));
+                return Number.isInteger(idx) && idx >= 0 ? idx : -1;
+            }
+
+            function isRelativePeriod(periodStr) {
+                return getRelativePeriodIndex(periodStr) !== -1;
+            }
+
+            function useLatestQuarterAlignment() {
+                if (activePeriodType === 'annual' || companies.length < 2) return false;
+                // Mixed annual + quarterly workspaces retain the established annual
+                // compatibility behavior. Relative slots are only used when every
+                // loaded company has a native quarterly timeline.
+                return companies.every(c => c && !companyIsAnnualOnly(c) && Array.isArray(c.periods));
+            }
+
+            function getPriorYoYPeriod(periodStr, primaryPeriods = [], fallbackPeriods = []) {
+                if (isRelativePeriod(periodStr)) {
+                    return relativePeriodKey(getRelativePeriodIndex(periodStr) + 4);
+                }
+                const prevScore = parsePeriod(periodStr) - 10;
+                return primaryPeriods.find(p => parsePeriod(p) === prevScore)
+                    || fallbackPeriods.find(p => parsePeriod(p) === prevScore)
+                    || null;
+            }
+
+            function findPriorYoYIndex(periods, periodStr) {
+                const priorPeriod = getPriorYoYPeriod(periodStr, periods);
+                return priorPeriod === null ? -1 : periods.indexOf(priorPeriod);
+            }
+
             function isComparisonDatePeriod(periodStr) {
                 return /^\d{4}-\d{2}-\d{2}$/.test(String(periodStr || ''));
             }
@@ -2458,13 +2497,17 @@ ul.task-list li.task-done::before {
             }
 
             function formatDisplayPeriodLabel(periodStr) {
+                if (isRelativePeriod(periodStr)) {
+                    const idx = getRelativePeriodIndex(periodStr);
+                    return idx === 0 ? 'Latest' : `-${idx}Q`;
+                }
                 if (!isComparisonDatePeriod(periodStr)) return String(periodStr || '');
                 return formatShortDate(parseComparisonDate(periodStr)) || String(periodStr || '');
             }
 
             function isQuarterPeriod(periodStr) {
                 const text = String(periodStr || '');
-                return isComparisonDatePeriod(text) || /Q\d/i.test(text);
+                return isRelativePeriod(text) || isComparisonDatePeriod(text) || /Q\d/i.test(text);
             }
 
             function isAnnualPeriod(periodStr) {
@@ -2536,6 +2579,11 @@ ul.task-list li.task-done::before {
 
             function getSourcePeriodIndexForDisplay(company, periodStr) {
                 if (!company || !Array.isArray(company.periods)) return -1;
+
+                if (activePeriodType !== 'annual' && isRelativePeriod(periodStr)) {
+                    const relativeIdx = getRelativePeriodIndex(periodStr);
+                    return relativeIdx >= 0 && relativeIdx < company.periods.length ? relativeIdx : -1;
+                }
 
                 if (activePeriodType !== 'annual' && isComparisonDatePeriod(periodStr)) {
                     const comparisonIdx = findComparisonPeriodIndex(company, periodStr);
@@ -3167,6 +3215,7 @@ async function loadFredSeries(seriesId, seriesTitle, unitsShort = '', autoSelect
     } else {
         selectedMetrics.delete(key); // Prevents it from sneaking on if previously selected
     }
+    rebuildChartPeriods();
     
     if (btn) btn.textContent = 'Add';
     document.getElementById('fredMenu').classList.add('hidden');
@@ -3836,30 +3885,80 @@ document.addEventListener('DOMContentLoaded', () => {
 
             function rebuildGlobal() {
                 const pSet = new Set();
-                const alignByDate = useDateAlignedPeriods();
+                const alignByLatestQuarter = useLatestQuarterAlignment();
+                const alignByDate = !alignByLatestQuarter && useDateAlignedPeriods();
+                let maxRelativePeriods = 0;
                 allCategories.clear();
                 companies.forEach(c => { 
                     if (!c || !Array.isArray(c.periods)) return;
-                    c.periods.forEach((p, periodIndex) => {
-                        if (activePeriodType === 'annual') {
-                            const annualKey = periodToAnnualKey(p);
-                            if (annualKey) pSet.add(annualKey);
-                        } else if (alignByDate) {
-                            const comparisonKey = getComparisonPeriodKey(c, periodIndex);
-                            if (comparisonKey) pSet.add(comparisonKey);
-                        } else {
-                            pSet.add(p);
-                        }
-                    }); 
+                    if (alignByLatestQuarter) {
+                        maxRelativePeriods = Math.max(maxRelativePeriods, c.periods.length);
+                    } else {
+                        c.periods.forEach((p, periodIndex) => {
+                            if (activePeriodType === 'annual') {
+                                const annualKey = periodToAnnualKey(p);
+                                if (annualKey) pSet.add(annualKey);
+                            } else if (alignByDate) {
+                                const comparisonKey = getComparisonPeriodKey(c, periodIndex);
+                                if (comparisonKey) pSet.add(comparisonKey);
+                            } else {
+                                pSet.add(p);
+                            }
+                        });
+                    }
                     if (c.categories) c.categories.forEach(cat => allCategories.add(cat)); 
                 });
                 
                 if (activePeriodType === 'annual') {
                     globalPeriods = Array.from(pSet).sort((a, b) => parseInt(b) - parseInt(a));
+                } else if (alignByLatestQuarter) {
+                    globalPeriods = Array.from({ length: maxRelativePeriods }, (_, i) => relativePeriodKey(i));
                 } else {
                     globalPeriods = sortPeriods(Array.from(pSet));
                 }
-                chartPeriods = [...globalPeriods].reverse();
+                rebuildChartPeriods();
+            }
+
+            // Tables can stay aligned by each company's latest reported quarter,
+            // while charts use the companies' real period-ending dates. The chart
+            // timeline follows the currently selected companies so a single-company
+            // chart does not inherit unrelated dates from other loaded files.
+            function rebuildChartPeriods() {
+                const fallbackPeriods = [...globalPeriods].reverse();
+
+                if (activePeriodType !== 'annual') {
+                    const selectedCompanyIndexes = new Set();
+                    selectedMetrics.forEach(key => {
+                        const ci = Number(String(key).split(':')[0]);
+                        if (Number.isInteger(ci) && companies[ci]) selectedCompanyIndexes.add(ci);
+                    });
+
+                    const sourceCompanies = selectedCompanyIndexes.size > 0
+                        ? Array.from(selectedCompanyIndexes).map(ci => companies[ci]).filter(Boolean)
+                        : companies.filter(c => c && !companyIsAnnualOnly(c));
+
+                    if (sourceCompanies.length > 0 && sourceCompanies.every(companyHasComparisonDates)) {
+                        const dateKeys = new Set();
+                        sourceCompanies.forEach(company => {
+                            company.periods.forEach((_, index) => {
+                                const key = comparisonDateKey(company.exactDates?.[index]);
+                                if (key) dateKeys.add(key);
+                            });
+                        });
+
+                        if (dateKeys.size > 0) {
+                            chartPeriods = Array.from(dateKeys).sort((a, b) => {
+                                const da = parseComparisonDate(a);
+                                const db = parseComparisonDate(b);
+                                return da - db;
+                            });
+                            initSlider();
+                            return;
+                        }
+                    }
+                }
+
+                chartPeriods = fallbackPeriods;
                 initSlider();
             }
 
@@ -3874,6 +3973,10 @@ document.addEventListener('DOMContentLoaded', () => {
             function parsePeriod(p) {
                 if (!p) return 0;
                 const text = String(p);
+                if (isRelativePeriod(text)) {
+                    // Newer relative slots sort ahead of older slots.
+                    return 1000000 - getRelativePeriodIndex(text);
+                }
                 const dateMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
                 if (dateMatch) {
                     const year = parseInt(dateMatch[1]);
@@ -4060,14 +4163,20 @@ document.addEventListener('DOMContentLoaded', () => {
     <div class="col-resizer"></div>
 </th>`;
 
-                    const dateAlignedHeaders = useDateAlignedPeriods();
+                    const latestQuarterAlignedHeaders = useLatestQuarterAlignment();
+                    const dateAlignedHeaders = !latestQuarterAlignedHeaders && useDateAlignedPeriods();
                     dispPeriods.forEach(p => {
                         const d = getExactDateForDisplay(company, p);
                         const sourcePeriod = getSourcePeriodLabelForDisplay(company, p);
                         let primaryLabel = String(p || '');
                         let secondaryHtml = '';
 
-                        if (dateAlignedHeaders && isComparisonDatePeriod(p)) {
+                        if (latestQuarterAlignedHeaders && isRelativePeriod(p)) {
+                            primaryLabel = d ? formatShortDate(d) : (sourcePeriod || formatDisplayPeriodLabel(p));
+                            if (d && sourcePeriod) {
+                                secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${esc(sourcePeriod)}</div>`;
+                            }
+                        } else if (dateAlignedHeaders && isComparisonDatePeriod(p)) {
                             primaryLabel = d ? formatShortDate(d) : formatDisplayPeriodLabel(p);
                             if (sourcePeriod) {
                                 secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${esc(sourcePeriod)}</div>`;
@@ -4170,6 +4279,7 @@ document.addEventListener('DOMContentLoaded', () => {
             showAverage: false   // Initialize Average toggle
         };
     }
+    rebuildChartPeriods();
     renderAllCards();
     renderActiveLegend();
     renderChart();
@@ -4178,6 +4288,7 @@ document.addEventListener('DOMContentLoaded', () => {
             function clearSelection() {
                 selectedMetrics.clear();
                 metricConfigs = {};
+                rebuildChartPeriods();
                 renderAllCards();
                 renderActiveLegend();
                 renderChart();
@@ -4475,9 +4586,7 @@ pill.querySelector('.avg-pill-btn').onclick = (e) => {
                                 const globalIndex = si + localIndex;
                                 const v = globalSumRaw[globalIndex];
                                 if (v === 0 || v === null) return null;
-                                const curScore = parsePeriod(gp);
-                                const prevScore = curScore - 10;
-                                const prevGlobalIndex = chartPeriods.findIndex(p => parsePeriod(p) === prevScore);
+                                const prevGlobalIndex = findPriorYoYIndex(chartPeriods, gp);
                                 if (prevGlobalIndex === -1) return null;
                                 const prevV = globalSumRaw[prevGlobalIndex];
                                 return (prevV === null || prevV === 0) ? null : ((v / prevV) - 1) * 100;
@@ -4830,10 +4939,7 @@ pill.querySelector('.avg-pill-btn').onclick = (e) => {
                             const v = globalSumRaw[globalIndex];
                             if (v === 0 || v === null) return null;
 
-                            const curScore = parsePeriod(gp);
-                            const prevScore = curScore - 10;
-
-                            const prevGlobalIndex = chartPeriods.findIndex(p => parsePeriod(p) === prevScore);
+                            const prevGlobalIndex = findPriorYoYIndex(chartPeriods, gp);
                             if (prevGlobalIndex === -1) return null;
 
                             const prevV = globalSumRaw[prevGlobalIndex];
@@ -5188,8 +5294,8 @@ pill.querySelector('.avg-pill-btn').onclick = (e) => {
     if (row) {
         chartTitle.textContent = companies.length > 1 ? `${companies[ci].name} — ${row.label}` : row.label;
         // Construct a rolled-up values timeline array for accurate historical analytics calculation:
-        const transformedVals = globalPeriods.map(p => getPeriodValue(companies[ci], row, p));
-        renderStats({ values: transformedVals }, globalPeriods, ei);
+        const transformedVals = chartPeriods.map(p => getPeriodValue(companies[ci], row, p));
+        renderStats({ values: transformedVals }, chartPeriods, ei);
     }
 } else if (summedKeys.length === selectedMetrics.size && summedKeys.length > 0) {
                     // Show stats when ALL items are summed
@@ -5261,10 +5367,7 @@ pill.querySelector('.avg-pill-btn').onclick = (e) => {
                             const v = globalSumRaw[globalIndex];
                             if (v === 0 || v === null) return null;
 
-                            const curScore = parsePeriod(gp);
-                            const prevScore = curScore - 10;
-
-                            const prevGlobalIndex = chartPeriods.findIndex(p => parsePeriod(p) === prevScore);
+                            const prevGlobalIndex = findPriorYoYIndex(chartPeriods, gp);
                             if (prevGlobalIndex === -1) return null;
 
                             const prevV = globalSumRaw[prevGlobalIndex];
@@ -5391,6 +5494,7 @@ pill.querySelector('.avg-pill-btn').onclick = (e) => {
                         pointHoverRadius: isBar ? 0 : (isFred ? 8 : 7),
                         fill: !isBar && chartType === 'area',
                         tension: 0.4,
+                        spanGaps: !isBar,
                         yAxisID: !dualY ? 'y' : yAxisAssignments[key],
                         stack: isPartSumStack ? 'sum_group' : (chartType === 'stacked' ? 'stack1' : `stack-${key}`),
                         barPercentage: 0.8,
@@ -8996,7 +9100,7 @@ data.forEach((d, ci) => {
             function exportFormulaCSV(formula, computed, dispPeriods) {
                 const { terms } = formula;
                 const asPercent = isPercentFormula(formula, computed);
-                const header = ['Metric', ...dispPeriods].join(',');
+                const header = ['Metric', ...dispPeriods.map(formatDisplayPeriodLabel)].join(',');
                 const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
                 const termRows = terms.map((t, i) => {
                     const co = companies[t.ci];
@@ -9061,7 +9165,7 @@ data.forEach((d, ci) => {
                 formulaChartInstances[formula.id] = new Chart(ctx2, {
                     type: 'line',
                     data: {
-                        labels: chronoPeriods,
+                        labels: chronoPeriods.map(formatDisplayPeriodLabel),
                         datasets: [{
                             label: formula.name,
                             data: chartData,
@@ -9332,8 +9436,8 @@ data.forEach((d, ci) => {
                             h += mkStat('Latest', fmtS(stats.latest));
                             h += mkStat('YoY \u0394', yoyStr, yoyColor);
                             h += mkStat('Average', fmtS(stats.avg));
-                            h += mkStat('Min', fmtS(stats.min) + (stats.troughPeriod ? ` <span style="font-size:10px;color:var(--term-text-dimmer)">(${esc(stats.troughPeriod)})</span>` : ''));
-                            h += mkStat('Max', fmtS(stats.max) + (stats.peakPeriod ? ` <span style="font-size:10px;color:var(--term-text-dimmer)">(${esc(stats.peakPeriod)})</span>` : ''));
+                            h += mkStat('Min', fmtS(stats.min) + (stats.troughPeriod ? ` <span style="font-size:10px;color:var(--term-text-dimmer)">(${esc(formatDisplayPeriodLabel(stats.troughPeriod))})</span>` : ''));
+                            h += mkStat('Max', fmtS(stats.max) + (stats.peakPeriod ? ` <span style="font-size:10px;color:var(--term-text-dimmer)">(${esc(formatDisplayPeriodLabel(stats.peakPeriod))})</span>` : ''));
                             h += mkStat('Periods', String(stats.count));
                             h += `</div>`;
                         }
@@ -9347,7 +9451,7 @@ data.forEach((d, ci) => {
                             h += `<thead><tr style="background:var(--term-bg-card);">`;
                             h += `<th style="padding:8px 14px;text-align:left;font-weight:700;color:var(--term-text);white-space:nowrap;position:sticky;left:0;background:var(--term-bg-card);border-bottom:1px solid var(--term-border);border-right:1px solid var(--term-bg-btn);min-width:220px;">Metric</th>`;
                             dispPeriods.forEach(p => {
-                                h += `<th style="padding:8px 12px;text-align:right;font-weight:600;color:var(--term-text);white-space:nowrap;min-width:90px;border-bottom:1px solid var(--term-border);">${esc(p)}</th>`;
+                                h += `<th style="padding:8px 12px;text-align:right;font-weight:600;color:var(--term-text);white-space:nowrap;min-width:90px;border-bottom:1px solid var(--term-border);">${esc(formatDisplayPeriodLabel(p))}</th>`;
                             });
                             h += `</tr></thead><tbody>`;
 
