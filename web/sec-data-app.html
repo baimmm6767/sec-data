@@ -5878,11 +5878,7 @@ if (validDataPoints.length > 0 && !isPartSumStack) {
                                             }
                                         }
 
-                                        const valueLine = `${c.dataset.label}: ${valStr}`;
-                                        const dateLabel = Array.isArray(c.dataset.periodDateLabels)
-                                            ? c.dataset.periodDateLabels[c.dataIndex]
-                                            : '';
-                                        return dateLabel ? [valueLine, `  Date ${dateLabel}`] : valueLine;
+                                        return `${c.dataset.label}: ${valStr}`;
                                     }
                                 }
                             }
