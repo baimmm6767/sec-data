@@ -21,7 +21,7 @@ def proxy():
 # 2. Serve the main index.html file
 @app.route('/')
 def serve_index():
-    return send_from_directory('.', 'index.html')
+    return send_from_directory('.', 'sec-data-app.html')
 
 # 3. Serve any other static files (CSS, JS, images) if you have them
 @app.route('/<path:path>')
