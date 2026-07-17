@@ -2592,7 +2592,7 @@ CONCEPT_MAP = {
 
     # 3. CASH FLOW
     'Net Income (CF)': {'tags': ['NetIncomeLoss', 'ProfitLoss', 'NetIncomeLossAvailableToCommonStockholdersBasic', 'NetIncomeLossAttributableToParent', 'IncomeLossFromContinuingOperationsNetOfTax'], 'cat': '3_Cash_Flow'},
-    'Depreciation & Amortization': {'tags': ['Depreciation', 'DepreciationAmortizationAndOther', 'DepreciationDepletionAndAmortization', 'DepreciationAndAmortization', 'Depletion', 'OtherDepreciationAndAmortization', 'DepreciationAndAmortizationOfFinanceLeaseRightOfUseAssets', 'DepreciationAndAmortizationOfPropertyPlantAndEquipment', 'AmortizationOfComputerSoftwareCosts', 'AmortizationOfDeferredCharges', 'OperatingLeaseRightOfUseAssetAmortization', 'DepreciationAndImpairmentOnDispositionOfPropertyAndEquipment'], 'cat': '3_Cash_Flow'},
+    'Depreciation & Amortization': {'tags': ['Depreciation', 'DepreciationAmortizationAndOther', 'DepreciationDepletionAndAmortization', 'DepreciationAndAmortization', 'Depletion', 'OtherDepreciationAndAmortization', 'DepreciationAndAmortizationOfFinanceLeaseRightOfUseAssets', 'DepreciationAndAmortizationOfPropertyPlantAndEquipment', 'AmortizationOfComputerSoftwareCosts', 'AmortizationOfDeferredCharges', 'OperatingLeaseRightOfUseAssetAmortization', 'DepreciationAndImpairmentOnDispositionOfPropertyAndEquipment', 'AmortizationOfIntangibleAssets', 'AmortizationOfAcquisitionCosts', 'AcquiredInPlaceLeasesAmortizationExpense'], 'cat': '3_Cash_Flow'},
     'Amortization of Intangibles (CF)': {'tags': ['AmortizationOfIntangibleAssets', 'AmortizationAndImpairmentOfIntangibleAssets'], 'cat': '3_Cash_Flow'},
     'Stock-Based Compensation': {'tags': ['ShareBasedCompensation', 'AllocatedShareBasedCompensationExpense', 'ShareBasedCompensationExpense', 'NoncashOrPartNoncashExpenseShareBasedCompensation'], 'cat': '3_Cash_Flow'},
     'Deferred Income Taxes': {'tags': ['DeferredIncomeTaxExpenseBenefit', 'DeferredIncomeTaxesAndTaxCredits', 'DeferredIncomeTaxAssetsNet'], 'cat': '3_Cash_Flow'},
@@ -4659,6 +4659,8 @@ KPI_ORDER = [
     'Metric: Gross Margin %',
     'Metric: Net Margin %',
     'Metric: EBIT Margin %',
+    'Metric: EBITDA',
+    'Metric: EBITDA Margin %',
     'Metric: Free Cash Flow',
     'Metric: FCF Margin %',
     'Metric: Unlevered Free Cash Flow',
@@ -4668,6 +4670,14 @@ KPI_ORDER = [
     'Metric: ROE % (Annualised)',
     'Metric: Effective Tax Rate %',
 ]
+
+# Public/export labels created by _normalize_output_margin_rows must retain the
+# same sort position as their internal calculation labels.  Without this alias,
+# FCF Margin (%) is treated as an unknown KPI after normalization and falls to
+# the bottom of the KPI section.
+KPI_ORDER_ALIASES = {
+    'FCF Margin (%)': 'Metric: FCF Margin %',
+}
 
 # Disclosure noise patterns: labels whose sub-part (after " - ") looks like a raw
 # XBRL tag rather than a real segment name.  Matched case-insensitively.
@@ -9268,8 +9278,29 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df = df.sort_values(['Label', 'End', 'Duration', '_Filed_dt', '_IsCalcSort', 'TagRank', '_DimSort'], ascending=[True, True, True, False, True, True, True])
 
     if 'Depreciation & Amortization' in df['Label'].values:
-        total_tags = {'DepreciationDepletionAndAmortization', 'DepreciationAndAmortization', 'DepreciationAmortizationAndOther'}
-        component_tags = {'Depreciation', 'AmortizationOfIntangibleAssets', 'Depletion', 'OtherDepreciationAndAmortization'}
+        total_tags = {
+            'DepreciationDepletionAndAmortization',
+            'DepreciationAndAmortization',
+            'DepreciationAmortizationAndOther',
+        }
+        # Component concepts are grouped by economic family.  A broad family
+        # total wins over its details, while independent families are added.
+        # This derives D&A when no combined tag is filed without double-counting
+        # (for example, a total intangible-amortization fact plus software detail).
+        depreciation_total_tags = {'Depreciation'}
+        depreciation_detail_families = (
+            {'DepreciationAndAmortizationOfPropertyPlantAndEquipment'},
+            {'DepreciationAndAmortizationOfFinanceLeaseRightOfUseAssets'},
+        )
+        depletion_tags = {'Depletion'}
+        amortization_total_tags = {'AmortizationOfIntangibleAssets'}
+        amortization_detail_families = (
+            {'AmortizationOfComputerSoftwareCosts'},
+            {'AmortizationOfDeferredCharges'},
+            {'AmortizationOfAcquisitionCosts'},
+            {'AcquiredInPlaceLeasesAmortizationExpense'},
+        )
+        other_da_tags = {'OtherDepreciationAndAmortization'}
         da_mask = df['Label'] == 'Depreciation & Amortization'
         da_df, new_da_rows = df[da_mask], []
         for (end, dur), group in da_df.groupby(['End', 'Duration']):
@@ -9277,21 +9308,73 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 tags_list = CONCEPT_MAP['Depreciation & Amortization']['tags']
                 f_group = f_group.copy()
                 f_group['ConceptName'] = f_group['TagRank'].apply(lambda x: tags_list[int(x)] if x < len(tags_list) else 'Unknown')
-                present_total = f_group[f_group['ConceptName'].isin(total_tags)]
-                if not present_total.empty: new_da_rows.append(present_total.sort_values(['_Filed_dt', 'TagRank'], ascending=[False, True]).iloc[0])
+                present_total = f_group[f_group['ConceptName'].isin(total_tags)].copy()
+                if not present_total.empty:
+                    # Prefer a clean D&A/DD&A total over the broader
+                    # DepreciationAmortizationAndOther concept even when the
+                    # latter happens to have an earlier configured tag rank.
+                    total_priority = {
+                        'DepreciationDepletionAndAmortization': 0,
+                        'DepreciationAndAmortization': 1,
+                        'DepreciationAmortizationAndOther': 2,
+                    }
+                    present_total['_DATotalPriority'] = present_total['ConceptName'].map(total_priority)
+                    selected_total = present_total.sort_values(
+                        ['_Filed_dt', '_DATotalPriority', 'TagRank'],
+                        ascending=[False, True, True],
+                    ).iloc[0]
+                    new_da_rows.append(selected_total.drop(labels=['_DATotalPriority'], errors='ignore'))
+                    continue
+
+                def _best_component(tag_set):
+                    candidates = f_group[f_group['ConceptName'].isin(tag_set)].copy()
+                    if candidates.empty:
+                        return None
+                    candidates['_NumericValue'] = pd.to_numeric(candidates['Value'], errors='coerce')
+                    candidates = candidates[candidates['_NumericValue'].notna()]
+                    if candidates.empty:
+                        return None
+                    return candidates.sort_values(
+                        ['_Filed_dt', 'TagRank'], ascending=[False, True]
+                    ).iloc[0]
+
+                selected_components = []
+                dep_total = _best_component(depreciation_total_tags)
+                if dep_total is not None:
+                    selected_components.append(dep_total)
                 else:
-                    sum_group = f_group[f_group['ConceptName'].isin(component_tags)]
-                    if not sum_group.empty:
-                        summed_val = 0
-                        sorted_sum = sum_group.sort_values(['_Filed_dt', 'TagRank'], ascending=[False, True])
-                        for _value in sorted_sum['Value']:
-                            try:
-                                summed_val += float(_value)
-                            except (ValueError, TypeError):
-                                pass
-                        best_row = sorted_sum.iloc[0].copy()
-                        best_row['Value'] = summed_val; best_row['TagRank'] = 0; new_da_rows.append(best_row)
-                    else: new_da_rows.append(f_group.sort_values(['_Filed_dt', 'TagRank'], ascending=[False, True]).iloc[0])
+                    for family in depreciation_detail_families:
+                        component = _best_component(family)
+                        if component is not None:
+                            selected_components.append(component)
+
+                depletion = _best_component(depletion_tags)
+                if depletion is not None:
+                    selected_components.append(depletion)
+
+                amort_total = _best_component(amortization_total_tags)
+                if amort_total is not None:
+                    selected_components.append(amort_total)
+                else:
+                    for family in amortization_detail_families:
+                        component = _best_component(family)
+                        if component is not None:
+                            selected_components.append(component)
+
+                other_da = _best_component(other_da_tags)
+                if other_da is not None:
+                    selected_components.append(other_da)
+
+                if selected_components:
+                    best_row = selected_components[0].copy()
+                    best_row['Value'] = sum(float(r['_NumericValue']) for r in selected_components)
+                    best_row['TagRank'] = 0
+                    best_row['Concept'] = 'DerivedDepreciationAndAmortizationComponents'
+                    new_da_rows.append(best_row.drop(labels=['_NumericValue'], errors='ignore'))
+                else:
+                    # Preserve an unusual mapped D&A concept rather than losing
+                    # data merely because its taxonomy name is not yet classified.
+                    new_da_rows.append(f_group.sort_values(['_Filed_dt', 'TagRank'], ascending=[False, True]).iloc[0])
         df = pd.concat([df[~da_mask], pd.DataFrame(new_da_rows)])
         df = df.sort_values(['Label', 'End', 'Duration', '_Filed_dt', '_IsCalcSort', 'TagRank', '_DimSort'], ascending=[True, True, True, False, True, True, True])
 
@@ -11224,6 +11307,86 @@ def _effective_capex_series(df: pd.DataFrame) -> pd.Series:
     return capex.where(~capex_missing_or_stale_zero, detail_sum.where(detail_mask))
 
 
+def _effective_depreciation_amortization_series(df: pd.DataFrame) -> pd.Series:
+    """Return the best supported D&A amount for EBITDA for every period.
+
+    A filed combined cash-flow add-back is strongest because it captures D&A
+    allocated across both cost of revenue and operating expenses.  When it is
+    absent, derive the amount from separately surfaced depreciation and
+    amortization components.  Income-statement D&A totals are the final fallback.
+    Components are only added when a combined amount is unavailable (or is a
+    stale zero), preventing a filed total from being counted again as detail.
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype='float64')
+    cols = df.columns
+
+    def row(category, label):
+        key = (category, label)
+        if key not in df.index:
+            return pd.Series(np.nan, index=cols, dtype='float64')
+        values = pd.to_numeric(df.loc[key], errors='coerce')
+        # D&A is an expense/add-back.  Reject sign-inverted or reversal facts
+        # instead of silently reducing EBITDA with an economically invalid input.
+        return values.where(values >= 0)
+
+    combined_cf = row('3_Cash_Flow', 'Depreciation & Amortization')
+
+    depreciation = row('3_Cash_Flow', 'Depreciation')
+    dep_and_depletion = row('3_Cash_Flow', 'Depreciation & Depletion')
+    depreciation = depreciation.combine_first(dep_and_depletion)
+
+    amortization = row('3_Cash_Flow', 'Amortization')
+    intangible_amortization = row('3_Cash_Flow', 'Amortization of Intangibles (CF)')
+    amortization = amortization.combine_first(intangible_amortization)
+
+    component_mask = depreciation.notna() | amortization.notna()
+    derived_components = (
+        depreciation.fillna(0) + amortization.fillna(0)
+    ).where(component_mask)
+
+    # A real reported zero is retained unless nonzero component evidence proves
+    # the aggregate is stale/incomplete for that period.
+    stale_zero = (
+        combined_cf.notna()
+        & (combined_cf.abs() <= 1e-9)
+        & derived_components.notna()
+        & (derived_components.abs() > 1e-9)
+    )
+    effective = combined_cf.where(~stale_zero, derived_components)
+    effective = effective.combine_first(derived_components)
+
+    income_statement_total = row(
+        '1_Income_Statement', 'Depreciation, Depletion & Amortization'
+    ).combine_first(row('1_Income_Statement', 'Depreciation & Amortization Expense'))
+    return effective.combine_first(income_statement_total)
+
+
+def _refresh_ebitda(df: pd.DataFrame) -> pd.DataFrame:
+    """Recompute EBITDA and its margin from the latest EBIT and D&A."""
+    if df is None or df.empty:
+        return df
+    ebit_key = ('1_Income_Statement', 'Operating Income')
+    if ebit_key not in df.index:
+        return df
+    ebit = pd.to_numeric(df.loc[ebit_key], errors='coerce')
+    da = _effective_depreciation_amortization_series(df).reindex(df.columns)
+    have = ebit.notna() & da.notna()
+    if not have.any():
+        return df
+    out = df.copy()
+    ebitda = (ebit + da).where(have)
+    out.loc[('5_KPI_Metrics', 'Metric: EBITDA'), :] = ebitda.values
+    revenue_key = ('1_Income_Statement', 'Revenue')
+    if revenue_key in out.index:
+        revenue = pd.to_numeric(out.loc[revenue_key], errors='coerce')
+        margin = ((ebitda / revenue) * 100).where(revenue.notna() & (revenue != 0))
+        margin_key = ('5_KPI_Metrics', 'Metric: EBITDA Margin %')
+        if margin.notna().any() or margin_key in out.index:
+            out.loc[('5_KPI_Metrics', 'Metric: EBITDA Margin %'), :] = margin.values
+    return out
+
+
 def _refresh_fcf_from_effective_capex(df: pd.DataFrame) -> pd.DataFrame:
     """Recompute FCF/UFCF from OCF and effective capex for every period.
 
@@ -11605,6 +11768,7 @@ def _apply_quality_result_fixes(df: pd.DataFrame) -> pd.DataFrame:
     df = _repair_total_net_debt_from_components(df)
     df = _move_duplicate_short_term_debt_net_change_to_disclosures(df)
     df = _refresh_insurance_statement_subtotals(df)
+    df = _refresh_ebitda(df)
     df = _refresh_fcf_from_effective_capex(df)
     df = _repair_segment_revenue_residuals(df)
     df = _move_noisy_business_segment_rows_to_disclosures(df)
@@ -13001,6 +13165,11 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     add_val('5_KPI_Metrics', 'Metric: Gross Margin %', (gp_n / rev_n) * 100)
     add_val('5_KPI_Metrics', 'Metric: Net Margin %', (ni_n / rev_n) * 100)
     add_val('5_KPI_Metrics', 'Metric: EBIT Margin %', (op_inc_n / rev_n) * 100)
+    da_n = _effective_depreciation_amortization_series(pivoted).reindex(pivoted.columns)
+    ebitda = (op_inc_n + da_n).where(op_inc_n.notna() & da_n.notna())
+    add_val('5_KPI_Metrics', 'Metric: EBITDA', ebitda)
+    ebitda_margin = ((ebitda / rev_n) * 100).where(rev_n.notna() & (rev_n != 0))
+    add_val('5_KPI_Metrics', 'Metric: EBITDA Margin %', ebitda_margin)
     
     ocf = get_row('Operating Cash Flow'); capex = get_row('Capital Expenditures')
     ocf_n, capex_n = pd.to_numeric(ocf, errors='coerce'), pd.to_numeric(capex, errors='coerce')
@@ -15097,6 +15266,7 @@ _FX_ORDER = {
              "Financing Cash Flow",
              "Effect of Exchange Rate Changes on Cash and Cash Equivalents",
              "Net Cash Flow", "Free Cash Flow"],
+    _FX_KPI: KPI_ORDER,
 }
 
 
@@ -17341,6 +17511,15 @@ def _fx_assemble(annual, xbrl_layer, qz, ye_month):
         tax, ptx = g("Income Tax Expense", col), g("Pretax Income", col)
         cfo = g("Operating Cash Flow", col, _FX_CF)
         capex = g("Capital Expenditures", col, _FX_CF)
+        da_total = g("Depreciation & Amortization", col, _FX_CF)
+        if da_total is None:
+            da_parts = [
+                v for v in (
+                    g("Depreciation", col, _FX_CF),
+                    g("Amortization", col, _FX_CF),
+                ) if v is not None and v >= 0
+            ]
+            da_total = sum(da_parts) if da_parts else None
         cash = g("Cash & Equivalents", col, _FX_BS)
         std = g("Short-term Debt", col, _FX_BS) or 0.0
         ltd = g("Long-term Debt", col, _FX_BS) or 0.0
@@ -17351,6 +17530,13 @@ def _fx_assemble(annual, xbrl_layer, qz, ye_month):
             m = _fx_safe_div(num, rev)
             if m is not None:
                 put((_FX_KPI, lab), col, round(m * 100, 2))
+        if oi is not None and da_total is not None and da_total >= 0:
+            ebitda = oi + da_total
+            put((_FX_KPI, "Metric: EBITDA"), col, ebitda)
+            ebitda_margin = _fx_safe_div(ebitda, rev)
+            if ebitda_margin is not None:
+                put((_FX_KPI, "Metric: EBITDA Margin %"), col,
+                    round(ebitda_margin * 100, 2))
         if cfo is not None and capex is not None:
             fcf = cfo - abs(capex)
             put((_FX_KPI, "Metric: Free Cash Flow"), col, fcf)
@@ -17473,6 +17659,7 @@ def _fx_write_foreign_outputs(final_pivot, ticker, out_dir, diagnostics=None,
         except Exception as _xe:
             print(f"  [xlsx] export failed ({_xe}); saved CSV instead.")
 
+    final_pivot = _normalize_output_margin_rows(final_pivot)
     out_path = f"{out_dir}/{ticker}_annual_financials.csv"
     _profile_call("write_csv", final_pivot.to_csv, out_path)
     return out_path
@@ -17524,7 +17711,16 @@ def _fx_display_cleanup(df, ads_ratio_by_year=None, stable_ads_ratio=None):
     # Reference-style cash-flow rollups from the raw parsed IFRS rows.
     dep = _row(_FX_CF, "Depreciation")
     amo = _row(_FX_CF, "Amortization")
-    _put(_FX_CF, "Depreciation & Amortization", _sum_present(dep, amo))
+    da = _sum_present(dep, amo)
+    _put(_FX_CF, "Depreciation & Amortization", da)
+    operating_income = _row(_FX_IC, "Operating Income")
+    ebitda = (operating_income + da).where(
+        operating_income.notna() & da.notna() & (da >= 0)
+    )
+    _put(_FX_KPI, "Metric: EBITDA", ebitda)
+    revenue = _row(_FX_IC, "Revenue")
+    _put(_FX_KPI, "Metric: EBITDA Margin %",
+         ((ebitda / revenue) * 100).where(revenue.notna() & (revenue != 0)).round(2))
     _put(_FX_CF, "Share-Based Compensation", _row(_FX_CF, "Share Based Compensation"))
     # IFRS cash-flow statements often start from income before income tax.
     # Do not relabel that starter as "Net Income"; keep it as a distinct
@@ -18307,6 +18503,9 @@ def _sort_final_output_pivot(final_pivot, is_financial=False, is_insurance=False
     else:
         dynamic_kpis = ['Gross Margin (%)', 'Operating Margin (%)', 'Net Margin (%)'] + KPI_ORDER
     kpi_order = {k: i for i, k in enumerate(dynamic_kpis)}
+    for alias, canonical in KPI_ORDER_ALIASES.items():
+        if canonical in kpi_order:
+            kpi_order[alias] = kpi_order[canonical]
     for k in final_pivot.index.get_level_values('Label').unique():
         if k not in kpi_order:
             kpi_order[k] = 99
@@ -18359,6 +18558,43 @@ def _sort_final_output_pivot(final_pivot, is_financial=False, is_insurance=False
 
     return _sort_preserving_values(final_pivot, sort_key, is_item_order,
                                    is_financial, is_insurance, context)
+
+
+def _normalize_output_margin_rows(final_pivot):
+    """Expose one public row for each margin in CSV/XLSX output.
+
+    KPI construction still uses the older ``Metric: ...`` rows internally,
+    while the industry KPI pass creates friendlier display labels.  Keeping
+    both in the exported file made the same gross, operating, and net margins
+    appear twice.  Consolidate those aliases only at the output boundary so
+    downstream calculations remain unchanged and CSV consumers get one stable,
+    human-readable label per metric.
+    """
+    if final_pivot is None or final_pivot.empty:
+        return final_pivot
+
+    aliases = {
+        'Metric: Gross Margin %': 'Gross Margin (%)',
+        'Metric: EBIT Margin %': 'Operating Margin (%)',
+        'Metric: Net Margin %': 'Net Margin (%)',
+        'Metric: FCF Margin %': 'FCF Margin (%)',
+    }
+    result = final_pivot.copy()
+    for legacy_label, public_label in aliases.items():
+        legacy_idx = ('5_KPI_Metrics', legacy_label)
+        public_idx = ('5_KPI_Metrics', public_label)
+        if legacy_idx not in result.index:
+            continue
+        if public_idx in result.index:
+            # Prefer the display row and use the legacy calculation only to
+            # fill periods that the display pass did not populate.
+            result.loc[public_idx, :] = result.loc[public_idx, :].combine_first(
+                result.loc[legacy_idx, :]
+            )
+            result = result.drop(index=legacy_idx)
+        else:
+            result = result.rename(index={legacy_label: public_label}, level='Label')
+    return result
 
 def _native_annual_sort_output(final_pivot, is_financial=False, is_insurance=False):
     return _sort_final_output_pivot(
@@ -19377,6 +19613,7 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
         )
 
     final_pivot = _apply_quality_result_fixes(final_pivot)
+    final_pivot = _normalize_output_margin_rows(final_pivot)
     final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native annual pre-write sort")
 
     progress.set(98.0, "Writing annual output file")
@@ -19995,6 +20232,9 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 dynamic_kpis = ['Gross Margin (%)', 'Operating Margin (%)', 'Net Margin (%)'] + KPI_ORDER
             
             kpi_order = {k: i for i, k in enumerate(dynamic_kpis)}
+            for alias, canonical in KPI_ORDER_ALIASES.items():
+                if canonical in kpi_order:
+                    kpi_order[alias] = kpi_order[canonical]
             for k in final_pivot.index.get_level_values('Label').unique():
                 if k not in kpi_order:
                     kpi_order[k] = 99
@@ -20135,6 +20375,7 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             )
 
         final_pivot = _apply_quality_result_fixes(final_pivot)
+        final_pivot = _normalize_output_margin_rows(final_pivot)
         final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native quarterly pre-write sort")
 
         progress.set(98.0, "Writing output file")
