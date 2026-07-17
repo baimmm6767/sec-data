@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Load CSV to Start</title>
+    <!-- Comparable quarter calendarization: greatest overlap / nearest standard quarter end -->
 	<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><polyline points='-2,15 6,13 14,7 26,5' fill='none' stroke='%23ff9900' stroke-width='1.5' stroke-linecap='round'/><line x1='4' y1='6' x2='4' y2='18' stroke='%23ff5555' stroke-width='1.5' stroke-linecap='round'/><rect x='2' y='8' width='4' height='8' fill='%23ff5555' rx='0.5'/><line x1='12' y1='4' x2='12' y2='14' stroke='%2300ff00' stroke-width='1.5' stroke-linecap='round'/><rect x='10' y='6' width='4' height='6' fill='%2300ff00' rx='0.5'/><line x1='20' y1='2' x2='20' y2='10' stroke='%2300ff00' stroke-width='1.5' stroke-linecap='round'/><rect x='18' y='4' width='4' height='4' fill='%2300ff00' rx='0.5'/><rect x='2' y='21' width='4' height='3' fill='%23ff5555' opacity='0.7' rx='0.5'/><rect x='10' y='18' width='4' height='6' fill='%2300ff00' opacity='0.7' rx='0.5'/><rect x='18' y='20' width='4' height='4' fill='%2300ff00' opacity='0.7' rx='0.5'/></svg>" />
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
@@ -2462,11 +2463,93 @@ ul.task-list li.task-done::before {
                 return `${dateObj.getFullYear()}-Q${quarter}`;
             }
 
+            function quarterEndDate(year, quarter) {
+                return new Date(year, quarter * 3, 0);
+            }
+
+            function quarterStartDate(year, quarter) {
+                return new Date(year, (quarter - 1) * 3, 1);
+            }
+
+            function dateOnlyUtcMs(dateObj) {
+                if (!(dateObj instanceof Date) || isNaN(dateObj.getTime())) return NaN;
+                return Date.UTC(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate());
+            }
+
+            function nearestStandardQuarterKey(dateObj) {
+                if (!(dateObj instanceof Date) || isNaN(dateObj.getTime())) return null;
+                const targetMs = dateOnlyUtcMs(dateObj);
+                let best = null;
+
+                // Search the surrounding calendar years because retail/52-week fiscal
+                // quarters often end in January or April and belong economically to
+                // the preceding standard calendar quarter.
+                for (let year = dateObj.getFullYear() - 1; year <= dateObj.getFullYear() + 1; year++) {
+                    for (let quarter = 1; quarter <= 4; quarter++) {
+                        const endDate = quarterEndDate(year, quarter);
+                        const distance = Math.abs(targetMs - dateOnlyUtcMs(endDate));
+                        if (!best || distance < best.distance ||
+                            (distance === best.distance && dateOnlyUtcMs(endDate) < dateOnlyUtcMs(best.endDate))) {
+                            best = { year, quarter, distance, endDate };
+                        }
+                    }
+                }
+                return best ? `${best.year}-Q${best.quarter}` : null;
+            }
+
+            function overlapDaysInclusive(startDate, endDate, rangeStart, rangeEnd) {
+                const start = Math.max(dateOnlyUtcMs(startDate), dateOnlyUtcMs(rangeStart));
+                const end = Math.min(dateOnlyUtcMs(endDate), dateOnlyUtcMs(rangeEnd));
+                if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return 0;
+                return Math.floor((end - start) / 86400000) + 1;
+            }
+
+            function greatestOverlapQuarterKey(startDate, endDate) {
+                if (!(startDate instanceof Date) || isNaN(startDate.getTime()) ||
+                    !(endDate instanceof Date) || isNaN(endDate.getTime()) ||
+                    startDate > endDate) return null;
+
+                const durationDays = Math.floor((dateOnlyUtcMs(endDate) - dateOnlyUtcMs(startDate)) / 86400000) + 1;
+                // Only apply the overlap rule to a genuine quarterly duration. A YTD
+                // or annual start date would otherwise distort a single-quarter key.
+                if (durationDays < 45 || durationDays > 120) return null;
+
+                let best = null;
+                for (let year = startDate.getFullYear() - 1; year <= endDate.getFullYear() + 1; year++) {
+                    for (let quarter = 1; quarter <= 4; quarter++) {
+                        const qStart = quarterStartDate(year, quarter);
+                        const qEnd = quarterEndDate(year, quarter);
+                        const overlap = overlapDaysInclusive(startDate, endDate, qStart, qEnd);
+                        const endDistance = Math.abs(dateOnlyUtcMs(endDate) - dateOnlyUtcMs(qEnd));
+                        if (!best || overlap > best.overlap ||
+                            (overlap === best.overlap && endDistance < best.endDistance)) {
+                            best = { year, quarter, overlap, endDistance };
+                        }
+                    }
+                }
+                return best && best.overlap > 0 ? `${best.year}-Q${best.quarter}` : null;
+            }
+
+            function comparableCalendarQuarterKey(company, index) {
+                if (!company || index < 0) return null;
+                const endDate = Array.isArray(company.periodEndingDates) && company.periodEndingDates[index]
+                    ? company.periodEndingDates[index]
+                    : (Array.isArray(company.exactDates) ? company.exactDates[index] : null);
+                const startDate = Array.isArray(company.periodStartDates) ? company.periodStartDates[index] : null;
+
+                // Institutional-style calendarization: use the calendar quarter that
+                // contains most of the reporting period. If the CSV has no trustworthy
+                // start date, snap the period end to the nearest standard quarter end.
+                return greatestOverlapQuarterKey(startDate, endDate)
+                    || nearestStandardQuarterKey(endDate)
+                    || null;
+            }
+
             function calendarQuarterKeyFromPeriod(periodStr) {
                 const parsedQuarter = parseCalendarQuarter(periodStr);
                 if (parsedQuarter) return `${parsedQuarter.year}-Q${parsedQuarter.quarter}`;
                 const dateObj = parsePeriodToDate(periodStr);
-                return calendarQuarterKeyFromDate(dateObj);
+                return nearestStandardQuarterKey(dateObj);
             }
 
             function parseComparisonDate(periodStr) {
@@ -2511,38 +2594,52 @@ ul.task-list li.task-done::before {
 
             function rebuildCompanyCalendarQuarterIndex(company) {
                 if (!company) return new Map();
-                const dates = Array.isArray(company.exactDates) ? company.exactDates : [];
-                const signature = dates.map(d => d instanceof Date && !isNaN(d.getTime()) ? d.getTime() : '').join('|');
+                const endDates = Array.isArray(company.periodEndingDates) ? company.periodEndingDates : [];
+                const startDates = Array.isArray(company.periodStartDates) ? company.periodStartDates : [];
+                const displayDates = Array.isArray(company.exactDates) ? company.exactDates : [];
+                const signature = [endDates, startDates, displayDates]
+                    .map(list => list.map(d => d instanceof Date && !isNaN(d.getTime()) ? d.getTime() : '').join('|'))
+                    .join('::');
                 if (company._calendarQuarterIndex instanceof Map && company._calendarQuarterSignature === signature) {
                     return company._calendarQuarterIndex;
                 }
 
                 const indexMap = new Map();
                 const dateMap = new Map();
-                dates.forEach((dateObj, index) => {
-                    const quarterKey = calendarQuarterKeyFromDate(dateObj);
+                const methodMap = new Map();
+                const keys = new Array(company.periods?.length || displayDates.length).fill(null);
+
+                keys.forEach((_, index) => {
+                    const quarterKey = comparableCalendarQuarterKey(company, index);
                     if (!quarterKey) return;
+                    keys[index] = quarterKey;
+                    const dateObj = endDates[index] || displayDates[index] || null;
                     const priorDate = dateMap.get(quarterKey);
-                    // When multiple source columns fall in one calendar quarter,
-                    // keep the latest dated observation. Exact ties keep the first
-                    // source column, which is normally the newest SEC column.
-                    if (!priorDate || dateObj.getTime() > priorDate.getTime()) {
+
+                    // Duplicate/restated source columns can land in the same comparable
+                    // quarter. Keep the latest period end without manufacturing values.
+                    if (!priorDate || (dateObj && dateObj.getTime() > priorDate.getTime())) {
                         indexMap.set(quarterKey, index);
                         dateMap.set(quarterKey, dateObj);
+                        methodMap.set(quarterKey,
+                            greatestOverlapQuarterKey(startDates[index], endDates[index]) ? 'greatest_overlap' : 'nearest_quarter_end');
                     }
                 });
 
+                company._calendarQuarterKeys = keys;
                 company._calendarQuarterIndex = indexMap;
                 company._calendarQuarterDate = dateMap;
+                company._calendarQuarterMethod = methodMap;
                 company._calendarQuarterSignature = signature;
                 return indexMap;
             }
 
             function getComparisonPeriodKey(company, index) {
-                // Strictly derive the standardized quarter from the displayed date.
-                // Do not fall back to the company's fiscal-year/fiscal-quarter label.
-                const exactDate = company && Array.isArray(company.exactDates) ? company.exactDates[index] : null;
-                return calendarQuarterKeyFromDate(exactDate);
+                if (!company || index < 0) return null;
+                rebuildCompanyCalendarQuarterIndex(company);
+                return Array.isArray(company._calendarQuarterKeys)
+                    ? company._calendarQuarterKeys[index] || null
+                    : comparableCalendarQuarterKey(company, index);
             }
 
             function findComparisonPeriodIndex(company, comparisonPeriod) {
@@ -3927,11 +4024,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 const rows = [];
                 let id = 0;
                 
-                // Capture the date used for standardized calendar-quarter alignment.
-                // Prefer an explicit Filing Date row when present; otherwise use
-                // Period Ending, which is the date emitted by the SEC CSV pipeline.
+                // Keep the reporting-period dates separate from the SEC filing date.
+                // Comparable-quarter alignment uses period start/end; the filing date
+                // is metadata only and never determines the economic quarter.
                 let filingDates = [];
                 let periodEndingDates = [];
+                let periodStartDates = [];
 
                 for (let i = 1; i < data.length; i++) {
                     const row = data[i];
@@ -3941,16 +4039,31 @@ document.addEventListener('DOMContentLoaded', () => {
                     const cat = (row[0] || '').trim();
                     const label = (row[1] || '').trim();
                     
-                    // Extract only date-header rows for quarter alignment. Fiscal
-                    // labels remain internal and are not displayed or used to align.
-                    if (cat === '0_Period_Header' && /^(Filing Date|Filed Date|Period Ending)$/i.test(label)) {
+                    // Extract date-header rows. Period Ending drives the visible
+                    // date and nearest-quarter fallback. A genuine period-start row,
+                    // when available, enables greatest-overlap calendarization.
+                    if (cat === '0_Period_Header' && /^(Filing Date|Filed Date|Period Ending|Period End|Period Start|Period Beginning|Period Begin|Start Date|Fiscal Period Start)$/i.test(label)) {
                         const parsedDates = row.slice(sc, sc + originalPerds.length).map(v => {
                             if (!v || v.trim() === '') return null;
-                            const d = new Date(v.trim());
-                            return isNaN(d.getTime()) ? null : d;
+                            const raw = v.trim();
+                            let d = null;
+                            const iso = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+                            const us = raw.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{2}|\d{4})$/);
+                            if (iso) {
+                                d = new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+                            } else if (us) {
+                                let year = Number(us[3]);
+                                if (year < 100) year += year >= 70 ? 1900 : 2000;
+                                d = new Date(year, Number(us[1]) - 1, Number(us[2]));
+                            } else {
+                                const parsed = new Date(raw);
+                                d = isNaN(parsed.getTime()) ? null : parsed;
+                            }
+                            return d && !isNaN(d.getTime()) ? d : null;
                         });
                         if (/^(Filing Date|Filed Date)$/i.test(label)) filingDates = parsedDates;
-                        else periodEndingDates = parsedDates;
+                        else if (/^(Period Ending|Period End)$/i.test(label)) periodEndingDates = parsedDates;
+                        else periodStartDates = parsedDates;
                         continue;
                     }
 
@@ -3982,10 +4095,23 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 });
                 
-                const exactDates = perds.map((_, i) => filingDates[i] || periodEndingDates[i] || null);
+                // Display the actual reporting-period end. Filing date is retained
+                // separately and used only if a legacy CSV lacks Period Ending.
+                const exactDates = perds.map((_, i) => periodEndingDates[i] || filingDates[i] || null);
 
                 const isAnnualOnly = perds.length > 0 && perds.every(p => isAnnualPeriod(p));
-                const company = { name, parsedData: rows, periods: perds, categories: cats, exactDates: exactDates, earningsDates: [], isAnnualOnly: isAnnualOnly };
+                const company = {
+                    name,
+                    parsedData: rows,
+                    periods: perds,
+                    categories: cats,
+                    exactDates,
+                    periodEndingDates: perds.map((_, i) => periodEndingDates[i] || null),
+                    periodStartDates: perds.map((_, i) => periodStartDates[i] || null),
+                    filingDates: perds.map((_, i) => filingDates[i] || null),
+                    earningsDates: [],
+                    isAnnualOnly
+                };
                 rebuildCompanyCalendarQuarterIndex(company);
                 return company;
             }
@@ -4328,7 +4454,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             }
                         } else if (dateAlignedHeaders && isCalendarQuarterPeriod(p)) {
                             // Standardized quarter is the only period label. The second
-                            // line is the filing/period date; company fiscal labels are hidden.
+                            // line is the actual period-end date; company fiscal labels are hidden.
                             if (d) {
                                 secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${formatShortDate(d)}</div>`;
                             }
