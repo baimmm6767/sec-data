@@ -1481,8 +1481,8 @@ ul.task-list li.task-done::before {
 
 <body class="text-term-text antialiased bg-term-bg transition-colors duration-200">
 
-    <input type="file" id="csvFileInput" accept=".csv" class="hidden" />
-    <input type="file" id="csvAddCompanyInput" accept=".csv" class="hidden" />
+    <input type="file" id="csvFileInput" accept=".csv,text/csv" multiple class="hidden" />
+    <input type="file" id="csvAddCompanyInput" accept=".csv,text/csv" multiple class="hidden" />
 
     <!-- ── Welcome ──────────────────────────────────────────────── -->
     <div id="welcomeMessage" class="min-h-screen flex flex-col items-center justify-center p-12 text-center">
@@ -1493,7 +1493,7 @@ ul.task-list li.task-done::before {
                     d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
             </svg>
             <h2 class="text-xl font-semibold text-term-text">Ready to analyze</h2>
-            <p class="text-term-text-muted mt-2">Drag and drop your SEC financials CSV, or click to browse.</p>
+            <p class="text-term-text-muted mt-2">Drag and drop one or more SEC financials CSVs, or click to browse.</p>
         </label>
     </div>
 
@@ -2137,7 +2137,7 @@ ul.task-list li.task-done::before {
             <div class="flex items-center gap-2 w-full sm:w-auto flex-none shrink-0 px-1 pb-1 sm:pb-0">
                 <label for="csvFileInput" id="toolbarDropZone"
                     class="flex items-center justify-center px-2 py-1 border border-dashed border-term-border-dashed rounded bg-term-card hover:bg-term-accent-sub hover:border-term-accent transition-all cursor-pointer"
-                    title="Replace first company CSV">
+                    title="Load one or more company CSVs">
                     <svg class="w-3.5 h-3.5 text-term-text-muted" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
                             d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
@@ -2209,7 +2209,7 @@ ul.task-list li.task-done::before {
             </span>
             <div>
                 <p class="text-sm font-semibold leading-tight">Add company</p>
-                <p class="text-xs text-term-text-dimmer mt-0.5">Click or drag &amp; drop a CSV to compare</p>
+                <p class="text-xs text-term-text-dimmer mt-0.5">Click or drag &amp; drop one or more CSVs to compare</p>
             </div>
         </label>
         <div class="h-4"></div>
@@ -2385,7 +2385,7 @@ ul.task-list li.task-done::before {
 					const prevV = getPeriodValue(co, row, prevYear);
 					return (prevV === null || prevV === 0) ? null : ((v / prevV) - 1) * 100;
 				} else {
-					const prevPeriod = getPriorYoYPeriod(gp, chartPeriods, co.periods);
+					const prevPeriod = getPriorYoYPeriod(gp, globalPeriods, co.periods);
 					if (!prevPeriod) return null;
 					const prevV = getPeriodValue(co, row, prevPeriod);
 					return (prevV === null || prevV === 0) ? null : ((v / prevV) - 1) * 100;
@@ -2398,10 +2398,10 @@ ul.task-list li.task-done::before {
                 return m ? m[1] : null;
             }
 
-            // Multi-company quarterly/TTM comparison uses relative quarter slots:
-            // slot 0 is each company's latest reported quarter, slot 1 is the
-            // immediately preceding reported quarter, and so on. This keeps
-            // companies with different fiscal calendars visually comparable.
+            // Legacy relative-quarter keys are retained only so saved state from
+            // older builds can still be interpreted. New quarterly/TTM workspaces
+            // align observations to calendar-quarter buckets derived from each
+            // company's actual Period Ending date (Jan-Mar = Q1, etc.).
             const RELATIVE_PERIOD_PREFIX = '__LATEST_QUARTER_SLOT_';
 
             function relativePeriodKey(index) {
@@ -2420,11 +2420,9 @@ ul.task-list li.task-done::before {
             }
 
             function useLatestQuarterAlignment() {
-                if (activePeriodType === 'annual' || companies.length < 2) return false;
-                // Mixed annual + quarterly workspaces retain the established annual
-                // compatibility behavior. Relative slots are only used when every
-                // loaded company has a native quarterly timeline.
-                return companies.every(c => c && !companyIsAnnualOnly(c) && Array.isArray(c.periods));
+                // Deprecated: charts and tables now use calendar-quarter buckets
+                // rather than Latest/-1Q relative slots.
+                return false;
             }
 
             function getPriorYoYPeriod(periodStr, primaryPeriods = [], fallbackPeriods = []) {
@@ -2446,7 +2444,37 @@ ul.task-list li.task-done::before {
                 return /^\d{4}-\d{2}-\d{2}$/.test(String(periodStr || ''));
             }
 
+            function isCalendarQuarterPeriod(periodStr) {
+                return /^(?:\d{4}-Q[1-4]|Q[1-4] \d{4})$/i.test(String(periodStr || '').trim());
+            }
+
+            function parseCalendarQuarter(periodStr) {
+                const text = String(periodStr || '').trim();
+                let m = text.match(/^(\d{4})-Q([1-4])$/i);
+                if (m) return { year: Number(m[1]), quarter: Number(m[2]) };
+                m = text.match(/^Q([1-4]) (\d{4})$/i);
+                return m ? { year: Number(m[2]), quarter: Number(m[1]) } : null;
+            }
+
+            function calendarQuarterKeyFromDate(dateObj) {
+                if (!(dateObj instanceof Date) || isNaN(dateObj.getTime())) return null;
+                const quarter = Math.floor(dateObj.getMonth() / 3) + 1;
+                return `${dateObj.getFullYear()}-Q${quarter}`;
+            }
+
+            function calendarQuarterKeyFromPeriod(periodStr) {
+                const parsedQuarter = parseCalendarQuarter(periodStr);
+                if (parsedQuarter) return `${parsedQuarter.year}-Q${parsedQuarter.quarter}`;
+                const dateObj = parsePeriodToDate(periodStr);
+                return calendarQuarterKeyFromDate(dateObj);
+            }
+
             function parseComparisonDate(periodStr) {
+                const quarter = parseCalendarQuarter(periodStr);
+                if (quarter) {
+                    // Use the standard calendar quarter end for chronological sorting.
+                    return new Date(quarter.year, quarter.quarter * 3, 0);
+                }
                 const m = String(periodStr || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
                 if (!m) return null;
                 const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
@@ -2478,18 +2506,25 @@ ul.task-list li.task-done::before {
             }
 
             function useDateAlignedPeriods() {
-                if (activePeriodType === 'annual' || companies.length < 2) return false;
+                if (activePeriodType === 'annual' || companies.length === 0) return false;
                 const quarterlyCompanies = companies.filter(c => !companyIsAnnualOnly(c));
-                return quarterlyCompanies.length >= 2 && quarterlyCompanies.every(companyHasComparisonDates);
+                // Use calendar-quarter buckets whenever all quarterly companies have
+                // actual Period Ending dates. This also keeps a one-company workspace
+                // consistent with a later bulk-loaded comparison.
+                return quarterlyCompanies.length >= 1 && quarterlyCompanies.every(companyHasComparisonDates);
             }
 
             function getComparisonPeriodKey(company, index) {
                 const exactDate = company && Array.isArray(company.exactDates) ? company.exactDates[index] : null;
-                return comparisonDateKey(exactDate) || company?.periods?.[index] || null;
+                return calendarQuarterKeyFromDate(exactDate)
+                    || calendarQuarterKeyFromPeriod(company?.periods?.[index])
+                    || company?.periods?.[index]
+                    || null;
             }
 
             function findComparisonPeriodIndex(company, comparisonPeriod) {
-                if (!company || !isComparisonDatePeriod(comparisonPeriod) || !Array.isArray(company.periods)) return -1;
+                if (!company || !Array.isArray(company.periods)) return -1;
+                if (!isCalendarQuarterPeriod(comparisonPeriod) && !isComparisonDatePeriod(comparisonPeriod)) return -1;
                 for (let i = 0; i < company.periods.length; i++) {
                     if (getComparisonPeriodKey(company, i) === comparisonPeriod) return i;
                 }
@@ -2501,6 +2536,8 @@ ul.task-list li.task-done::before {
                     const idx = getRelativePeriodIndex(periodStr);
                     return idx === 0 ? 'Latest' : `-${idx}Q`;
                 }
+                const quarter = parseCalendarQuarter(periodStr);
+                if (quarter) return `Q${quarter.quarter} ${quarter.year}`;
                 if (!isComparisonDatePeriod(periodStr)) return String(periodStr || '');
                 return formatShortDate(parseComparisonDate(periodStr)) || String(periodStr || '');
             }
@@ -2585,7 +2622,7 @@ ul.task-list li.task-done::before {
                     return relativeIdx >= 0 && relativeIdx < company.periods.length ? relativeIdx : -1;
                 }
 
-                if (activePeriodType !== 'annual' && isComparisonDatePeriod(periodStr)) {
+                if (activePeriodType !== 'annual' && (isCalendarQuarterPeriod(periodStr) || isComparisonDatePeriod(periodStr))) {
                     const comparisonIdx = findComparisonPeriodIndex(company, periodStr);
                     if (comparisonIdx !== -1) return comparisonIdx;
                 }
@@ -2894,25 +2931,23 @@ const companyColorPalettes = new Proxy([], {
             }
 
             // ── File inputs ────────────────────────────────────────────────────────
-            fileInput.addEventListener('change', e => {
-                const file = e.target.files[0]; if (!file) return;
-                parseCSV(file, data => {
-                    const name = toName(file.name);
-                    if (companies.length === 0) addCompany(name, data);
-                    else {
-                        companies[0] = buildCompany(name, data);
-                        autoSelectCompatiblePeriodType(companies[0]);
-                        rebuildGlobal();
-                        renderAll();
-                    }
-                });
+            fileInput.addEventListener('change', async e => {
+                const files = Array.from(e.target.files || []);
                 e.target.value = '';
+                if (!files.length) return;
+
+                // Preserve the old toolbar behavior for a single file, while
+                // treating a multi-file selection as a bulk add operation.
+                await loadCSVFiles(files, {
+                    replaceFirst: companies.length > 0 && files.length === 1
+                });
             });
 
-            addCompanyInput.addEventListener('change', e => {
-                const file = e.target.files[0]; if (!file) return;
-                parseCSV(file, data => addCompany(toName(file.name), data));
+            addCompanyInput.addEventListener('change', async e => {
+                const files = Array.from(e.target.files || []);
                 e.target.value = '';
+                if (!files.length) return;
+                await loadCSVFiles(files);
             });
 
             // ── Drag & drop ────────────────────────────────────────────────────────
@@ -2931,16 +2966,13 @@ const companyColorPalettes = new Proxy([], {
                     addStrip?.classList.remove('drag-active');
                 }
             });
-            window.addEventListener('drop', e => {
+            window.addEventListener('drop', async e => {
                 toolbarDropZone?.classList.remove('bg-term-accent-sub', 'border-term-accent');
                 welcomeDropZone?.classList.remove('bg-term-accent-sub', 'border-term-accent', 'scale-105');
                 addStrip?.classList.remove('drag-active');
-                const file = e.dataTransfer.files[0]; if (!file) return;
-                parseCSV(file, data => {
-                    const name = toName(file.name);
-                    if (companies.length === 0) addCompany(name, data);
-                    else addCompany(name, data);
-                });
+                const files = Array.from(e.dataTransfer?.files || []);
+                if (!files.length) return;
+                await loadCSVFiles(files);
             });
 
             // ── Controls ───────────────────────────────────────────────────────────
@@ -3215,7 +3247,6 @@ async function loadFredSeries(seriesId, seriesTitle, unitsShort = '', autoSelect
     } else {
         selectedMetrics.delete(key); // Prevents it from sneaking on if previously selected
     }
-    rebuildChartPeriods();
     
     if (btn) btn.textContent = 'Add';
     document.getElementById('fredMenu').classList.add('hidden');
@@ -3743,9 +3774,122 @@ document.addEventListener('DOMContentLoaded', () => {
             function parseCSV(file, cb) {
                 Papa.parse(file, {
                     skipEmptyLines: true,
+                    worker: true,
                     complete: r => cb(r.data),
-                    error: err => { alert('Error parsing CSV.'); console.error(err); }
+                    error: err => { alert(`Error parsing ${file?.name || 'CSV'}.`); console.error(err); }
                 });
+            }
+
+            function parseCSVAsync(file) {
+                return new Promise((resolve, reject) => {
+                    Papa.parse(file, {
+                        skipEmptyLines: true,
+                        worker: true,
+                        complete: result => resolve(result.data),
+                        error: reject
+                    });
+                });
+            }
+
+            function isCSVFile(file) {
+                if (!file) return false;
+                return /\.csv$/i.test(file.name || '') || String(file.type || '').toLowerCase() === 'text/csv';
+            }
+
+            function setBulkLoadStatus(isLoading, loaded = 0, total = 0) {
+                const target = companies.length === 0 ? welcomeDropZone : addStrip;
+                if (!target) return;
+
+                if (isLoading) {
+                    target.dataset.bulkOriginalHtml = target.dataset.bulkOriginalHtml || target.innerHTML;
+                    target.style.pointerEvents = 'none';
+                    target.style.opacity = '0.72';
+                    target.innerHTML = `<div style="width:100%;text-align:center;font-size:12px;color:var(--term-text-dim);padding:8px 0;">Loading CSVs ${loaded}/${total}…</div>`;
+                } else if (target.dataset.bulkOriginalHtml) {
+                    target.innerHTML = target.dataset.bulkOriginalHtml;
+                    delete target.dataset.bulkOriginalHtml;
+                    target.style.pointerEvents = '';
+                    target.style.opacity = '';
+                }
+            }
+
+            async function loadCSVFiles(fileList, options = {}) {
+                const files = Array.from(fileList || []).filter(isCSVFile);
+                if (!files.length) {
+                    alert('No CSV files were found.');
+                    return;
+                }
+
+                const builtCompanies = [];
+                const failedFiles = [];
+                setBulkLoadStatus(true, 0, files.length);
+
+                try {
+                    // Parse sequentially so a large bulk import does not create a
+                    // burst of workers or re-render the dashboard after every file.
+                    for (let i = 0; i < files.length; i++) {
+                        const file = files[i];
+                        setBulkLoadStatus(true, i, files.length);
+                        try {
+                            const data = await parseCSVAsync(file);
+                            const company = buildCompany(toName(file.name), data);
+                            if (company) builtCompanies.push(company);
+                            else failedFiles.push(file.name);
+                        } catch (err) {
+                            failedFiles.push(file.name);
+                            console.error(`Failed to parse ${file.name}:`, err);
+                        }
+                        await new Promise(resolve => requestAnimationFrame(resolve));
+                    }
+
+                    if (!builtCompanies.length) {
+                        alert('None of the selected CSV files could be loaded.');
+                        return;
+                    }
+
+                    let loadedCompanies = builtCompanies;
+                    if (options.replaceFirst && companies.length > 0) {
+                        companies[0] = builtCompanies[0];
+                        loadedCompanies = [builtCompanies[0]];
+                    } else {
+                        companies.push(...builtCompanies);
+                    }
+
+                    mcCache = {};
+                    newsCacheKey = null;
+                    polymarketCacheKey = null;
+                    metricColorCache.clear();
+                    loadedCompanies.forEach(autoSelectCompatiblePeriodType);
+
+                    rebuildGlobal();
+                    updatePageTitle();
+                    welcomeMessage.classList.add('hidden');
+                    mainContent.classList.remove('hidden');
+                    mainContent.classList.add('flex');
+                    renderAll();
+
+                    // Start optional network enrichment after the single bulk render.
+                    loadedCompanies.forEach(company => {
+                        if (company?.name && tiingoApiKey) {
+                            loadTiingoDataForTicker(company.name).then(() => {
+                                if (showPriceLineOnMetrics) renderChart();
+                            });
+                        }
+                        loadEarningsReleaseDatesForCompany(company).then(() => {
+                            if (showPriceLineOnMetrics) renderChart();
+                        });
+                    });
+
+                    if (fredApiKey) {
+                        loadFredSeries('DGS10', '10-Year Treasury Constant Maturity Rate', '%', false);
+                    }
+
+                    if (failedFiles.length) {
+                        alert(`Loaded ${builtCompanies.length} CSV file(s). Failed: ${failedFiles.join(', ')}`);
+                    }
+                } finally {
+                    setBulkLoadStatus(false);
+                }
             }
 
             function buildCompany(name, data) {
@@ -3886,7 +4030,7 @@ document.addEventListener('DOMContentLoaded', () => {
             function rebuildGlobal() {
                 const pSet = new Set();
                 const alignByLatestQuarter = useLatestQuarterAlignment();
-                const alignByDate = !alignByLatestQuarter && useDateAlignedPeriods();
+                const alignByDate = useDateAlignedPeriods();
                 let maxRelativePeriods = 0;
                 allCategories.clear();
                 companies.forEach(c => { 
@@ -3916,49 +4060,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 } else {
                     globalPeriods = sortPeriods(Array.from(pSet));
                 }
-                rebuildChartPeriods();
-            }
-
-            // Tables can stay aligned by each company's latest reported quarter,
-            // while charts use the companies' real period-ending dates. The chart
-            // timeline follows the currently selected companies so a single-company
-            // chart does not inherit unrelated dates from other loaded files.
-            function rebuildChartPeriods() {
-                const fallbackPeriods = [...globalPeriods].reverse();
-
-                if (activePeriodType !== 'annual') {
-                    const selectedCompanyIndexes = new Set();
-                    selectedMetrics.forEach(key => {
-                        const ci = Number(String(key).split(':')[0]);
-                        if (Number.isInteger(ci) && companies[ci]) selectedCompanyIndexes.add(ci);
-                    });
-
-                    const sourceCompanies = selectedCompanyIndexes.size > 0
-                        ? Array.from(selectedCompanyIndexes).map(ci => companies[ci]).filter(Boolean)
-                        : companies.filter(c => c && !companyIsAnnualOnly(c));
-
-                    if (sourceCompanies.length > 0 && sourceCompanies.every(companyHasComparisonDates)) {
-                        const dateKeys = new Set();
-                        sourceCompanies.forEach(company => {
-                            company.periods.forEach((_, index) => {
-                                const key = comparisonDateKey(company.exactDates?.[index]);
-                                if (key) dateKeys.add(key);
-                            });
-                        });
-
-                        if (dateKeys.size > 0) {
-                            chartPeriods = Array.from(dateKeys).sort((a, b) => {
-                                const da = parseComparisonDate(a);
-                                const db = parseComparisonDate(b);
-                                return da - db;
-                            });
-                            initSlider();
-                            return;
-                        }
-                    }
-                }
-
-                chartPeriods = fallbackPeriods;
+                chartPeriods = [...globalPeriods].reverse();
                 initSlider();
             }
 
@@ -4168,7 +4270,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     dispPeriods.forEach(p => {
                         const d = getExactDateForDisplay(company, p);
                         const sourcePeriod = getSourcePeriodLabelForDisplay(company, p);
-                        let primaryLabel = String(p || '');
+                        let primaryLabel = formatDisplayPeriodLabel(p);
                         let secondaryHtml = '';
 
                         if (latestQuarterAlignedHeaders && isRelativePeriod(p)) {
@@ -4176,10 +4278,14 @@ document.addEventListener('DOMContentLoaded', () => {
                             if (d && sourcePeriod) {
                                 secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${esc(sourcePeriod)}</div>`;
                             }
-                        } else if (dateAlignedHeaders && isComparisonDatePeriod(p)) {
-                            primaryLabel = d ? formatShortDate(d) : formatDisplayPeriodLabel(p);
-                            if (sourcePeriod) {
-                                secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${esc(sourcePeriod)}</div>`;
+                        } else if (dateAlignedHeaders && (isCalendarQuarterPeriod(p) || isComparisonDatePeriod(p))) {
+                            // The shared header is the global calendar quarter. Keep the
+                            // company's exact period end and fiscal label as context below.
+                            const details = [];
+                            if (d) details.push(formatShortDate(d));
+                            if (sourcePeriod && sourcePeriod !== p) details.push(sourcePeriod);
+                            if (details.length) {
+                                secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${esc(details.join(' · '))}</div>`;
                             }
                         } else if (d) {
                             secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${formatShortDate(d)}</div>`;
@@ -4279,7 +4385,6 @@ document.addEventListener('DOMContentLoaded', () => {
             showAverage: false   // Initialize Average toggle
         };
     }
-    rebuildChartPeriods();
     renderAllCards();
     renderActiveLegend();
     renderChart();
@@ -4288,7 +4393,6 @@ document.addEventListener('DOMContentLoaded', () => {
             function clearSelection() {
                 selectedMetrics.clear();
                 metricConfigs = {};
-                rebuildChartPeriods();
                 renderAllCards();
                 renderActiveLegend();
                 renderChart();
@@ -5294,8 +5398,8 @@ pill.querySelector('.avg-pill-btn').onclick = (e) => {
     if (row) {
         chartTitle.textContent = companies.length > 1 ? `${companies[ci].name} — ${row.label}` : row.label;
         // Construct a rolled-up values timeline array for accurate historical analytics calculation:
-        const transformedVals = chartPeriods.map(p => getPeriodValue(companies[ci], row, p));
-        renderStats({ values: transformedVals }, chartPeriods, ei);
+        const transformedVals = globalPeriods.map(p => getPeriodValue(companies[ci], row, p));
+        renderStats({ values: transformedVals }, globalPeriods, ei);
     }
 } else if (summedKeys.length === selectedMetrics.size && summedKeys.length > 0) {
                     // Show stats when ALL items are summed
@@ -5494,14 +5598,15 @@ pill.querySelector('.avg-pill-btn').onclick = (e) => {
                         pointHoverRadius: isBar ? 0 : (isFred ? 8 : 7),
                         fill: !isBar && chartType === 'area',
                         tension: 0.4,
-                        spanGaps: !isBar,
                         yAxisID: !dualY ? 'y' : yAxisAssignments[key],
                         stack: isPartSumStack ? 'sum_group' : (chartType === 'stacked' ? 'stack1' : `stack-${key}`),
                         barPercentage: 0.8,
                         categoryPercentage: 0.9,
                         order: 1,
                         isYoYMetric: isYoY,
-                        isPctMetric: isPercentageMetric(row.label)
+                        isPctMetric: isPercentageMetric(row.label),
+                        companyIndex: ci,
+                        sourceRowId: ri
                     });
 // Inside Pass 2: Build datasets loop, right after your datasets.push({ ... raw metric data ... }) configuration block
 const validDataPoints = data.filter(v => typeof v === 'number' && v !== null && !isNaN(v));
@@ -5577,7 +5682,9 @@ if (validDataPoints.length > 0 && !isPartSumStack) {
                                 pointBorderColor: color,
                                 pointRadius: 4,
                                 yAxisID: 'yPrice', // Dedicate a separate axis so metrics aren't squashed
-                                order: 0 // Plot on top of bar charts
+                                order: 0, // Plot on top of bar charts
+                                companyIndex: ci,
+                                isPriceDataset: true
                             });
                         }
                     });
@@ -5703,7 +5810,18 @@ if (validDataPoints.length > 0 && !isPartSumStack) {
                                             }
                                         }
 
-                                        return `${c.dataset.label}: ${valStr}`;
+                                        const valueLine = `${c.dataset.label}: ${valStr}`;
+                                        const ci = c.dataset.companyIndex;
+                                        if (Number.isInteger(ci) && companies[ci]) {
+                                            const globalPeriod = chartPeriods[si + c.dataIndex];
+                                            const exactDate = getExactDateForDisplay(companies[ci], globalPeriod);
+                                            const fiscalPeriod = getSourcePeriodLabelForDisplay(companies[ci], globalPeriod);
+                                            const details = [];
+                                            if (exactDate) details.push(`Period ended ${formatShortDate(exactDate)}`);
+                                            if (fiscalPeriod && fiscalPeriod !== globalPeriod) details.push(`Fiscal ${fiscalPeriod}`);
+                                            if (details.length) return [valueLine, `  ${details.join(' · ')}`];
+                                        }
+                                        return valueLine;
                                     }
                                 }
                             }
