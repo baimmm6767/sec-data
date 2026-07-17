@@ -2498,37 +2498,57 @@ ul.task-list li.task-done::before {
             }
 
             function companyHasComparisonDates(company) {
-                if (!company || companyIsAnnualOnly(company) || !Array.isArray(company.periods)) return false;
-                const validCount = Array.isArray(company.exactDates)
-                    ? company.exactDates.filter(d => d instanceof Date && !isNaN(d.getTime())).length
-                    : 0;
-                return validCount >= Math.min(4, company.periods.length);
+                if (!company || companyIsAnnualOnly(company) || !Array.isArray(company.exactDates)) return false;
+                return company.exactDates.some(d => d instanceof Date && !isNaN(d.getTime()));
             }
 
             function useDateAlignedPeriods() {
                 if (activePeriodType === 'annual' || companies.length === 0) return false;
-                const quarterlyCompanies = companies.filter(c => !companyIsAnnualOnly(c));
-                // Use calendar-quarter buckets whenever all quarterly companies have
-                // actual Period Ending dates. This also keeps a one-company workspace
-                // consistent with a later bulk-loaded comparison.
-                return quarterlyCompanies.length >= 1 && quarterlyCompanies.every(companyHasComparisonDates);
+                // Quarterly comparison is date-only. Company fiscal labels never
+                // determine the shared quarter or year.
+                return companies.some(c => !companyIsAnnualOnly(c) && companyHasComparisonDates(c));
+            }
+
+            function rebuildCompanyCalendarQuarterIndex(company) {
+                if (!company) return new Map();
+                const dates = Array.isArray(company.exactDates) ? company.exactDates : [];
+                const signature = dates.map(d => d instanceof Date && !isNaN(d.getTime()) ? d.getTime() : '').join('|');
+                if (company._calendarQuarterIndex instanceof Map && company._calendarQuarterSignature === signature) {
+                    return company._calendarQuarterIndex;
+                }
+
+                const indexMap = new Map();
+                const dateMap = new Map();
+                dates.forEach((dateObj, index) => {
+                    const quarterKey = calendarQuarterKeyFromDate(dateObj);
+                    if (!quarterKey) return;
+                    const priorDate = dateMap.get(quarterKey);
+                    // When multiple source columns fall in one calendar quarter,
+                    // keep the latest dated observation. Exact ties keep the first
+                    // source column, which is normally the newest SEC column.
+                    if (!priorDate || dateObj.getTime() > priorDate.getTime()) {
+                        indexMap.set(quarterKey, index);
+                        dateMap.set(quarterKey, dateObj);
+                    }
+                });
+
+                company._calendarQuarterIndex = indexMap;
+                company._calendarQuarterDate = dateMap;
+                company._calendarQuarterSignature = signature;
+                return indexMap;
             }
 
             function getComparisonPeriodKey(company, index) {
+                // Strictly derive the standardized quarter from the displayed date.
+                // Do not fall back to the company's fiscal-year/fiscal-quarter label.
                 const exactDate = company && Array.isArray(company.exactDates) ? company.exactDates[index] : null;
-                return calendarQuarterKeyFromDate(exactDate)
-                    || calendarQuarterKeyFromPeriod(company?.periods?.[index])
-                    || company?.periods?.[index]
-                    || null;
+                return calendarQuarterKeyFromDate(exactDate);
             }
 
             function findComparisonPeriodIndex(company, comparisonPeriod) {
-                if (!company || !Array.isArray(company.periods)) return -1;
-                if (!isCalendarQuarterPeriod(comparisonPeriod) && !isComparisonDatePeriod(comparisonPeriod)) return -1;
-                for (let i = 0; i < company.periods.length; i++) {
-                    if (getComparisonPeriodKey(company, i) === comparisonPeriod) return i;
-                }
-                return -1;
+                if (!company || !isCalendarQuarterPeriod(comparisonPeriod)) return -1;
+                const indexMap = rebuildCompanyCalendarQuarterIndex(company);
+                return indexMap.has(comparisonPeriod) ? indexMap.get(comparisonPeriod) : -1;
             }
 
             function formatDisplayPeriodLabel(periodStr) {
@@ -3907,8 +3927,11 @@ document.addEventListener('DOMContentLoaded', () => {
                 const rows = [];
                 let id = 0;
                 
-                // NEW: Capture exact period dates
-                let originalExactDates = [];
+                // Capture the date used for standardized calendar-quarter alignment.
+                // Prefer an explicit Filing Date row when present; otherwise use
+                // Period Ending, which is the date emitted by the SEC CSV pipeline.
+                let filingDates = [];
+                let periodEndingDates = [];
 
                 for (let i = 1; i < data.length; i++) {
                     const row = data[i];
@@ -3918,13 +3941,16 @@ document.addEventListener('DOMContentLoaded', () => {
                     const cat = (row[0] || '').trim();
                     const label = (row[1] || '').trim();
                     
-                    // FIX: Extract exact dates from 'Period Ending' row so fiscal offsets map to correct stock prices
-                    if (cat === '0_Period_Header' && label === 'Period Ending') {
-                        originalExactDates = row.slice(sc, sc + originalPerds.length).map(v => {
+                    // Extract only date-header rows for quarter alignment. Fiscal
+                    // labels remain internal and are not displayed or used to align.
+                    if (cat === '0_Period_Header' && /^(Filing Date|Filed Date|Period Ending)$/i.test(label)) {
+                        const parsedDates = row.slice(sc, sc + originalPerds.length).map(v => {
                             if (!v || v.trim() === '') return null;
                             const d = new Date(v.trim());
                             return isNaN(d.getTime()) ? null : d;
                         });
+                        if (/^(Filing Date|Filed Date)$/i.test(label)) filingDates = parsedDates;
+                        else periodEndingDates = parsedDates;
                         continue;
                     }
 
@@ -3956,10 +3982,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 });
                 
-                const exactDates = originalExactDates;
+                const exactDates = perds.map((_, i) => filingDates[i] || periodEndingDates[i] || null);
 
                 const isAnnualOnly = perds.length > 0 && perds.every(p => isAnnualPeriod(p));
-                return { name, parsedData: rows, periods: perds, categories: cats, exactDates: exactDates, earningsDates: [], isAnnualOnly: isAnnualOnly };
+                const company = { name, parsedData: rows, periods: perds, categories: cats, exactDates: exactDates, earningsDates: [], isAnnualOnly: isAnnualOnly };
+                rebuildCompanyCalendarQuarterIndex(company);
+                return company;
             }
 
             function addCompany(name, data) {
@@ -4251,18 +4279,22 @@ document.addEventListener('DOMContentLoaded', () => {
                     return mc && ms;
                 });
 
-                // Keep the chart on the shared global calendar-quarter axis, but
-                // trim future quarter buckets from each company's table. Loading a
-                // company with a later fiscal period (for example NVDA in calendar Q2)
-                // must not create an empty leading quarter for companies whose latest
-                // reported period still belongs to calendar Q1.
+                // Use the shared calendar-quarter axis, but only across this
+                // company's own dated history. This removes future leading buckets
+                // (and therefore empty "latest" columns) without filling or copying
+                // values. Genuine missing quarters inside the history remain gaps.
                 let companyTablePeriods = [...globalPeriods];
                 if (activePeriodType !== 'annual' && useDateAlignedPeriods()) {
-                    const latestAvailableIndex = companyTablePeriods.findIndex(period =>
-                        getSourcePeriodIndexForDisplay(company, period) !== -1
-                    );
-                    if (latestAvailableIndex > 0) {
-                        companyTablePeriods = companyTablePeriods.slice(latestAvailableIndex);
+                    const ownQuarterKeys = new Set(rebuildCompanyCalendarQuarterIndex(company).keys());
+                    const occupiedIndexes = companyTablePeriods
+                        .map((period, index) => ownQuarterKeys.has(period) ? index : -1)
+                        .filter(index => index !== -1);
+                    if (occupiedIndexes.length) {
+                        const newestIndex = Math.min(...occupiedIndexes);
+                        const oldestIndex = Math.max(...occupiedIndexes);
+                        companyTablePeriods = companyTablePeriods.slice(newestIndex, oldestIndex + 1);
+                    } else {
+                        companyTablePeriods = [];
                     }
                 }
                 const dispPeriods = tableSortOrder === 'newest'
@@ -4294,14 +4326,11 @@ document.addEventListener('DOMContentLoaded', () => {
                             if (d && sourcePeriod) {
                                 secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${esc(sourcePeriod)}</div>`;
                             }
-                        } else if (dateAlignedHeaders && (isCalendarQuarterPeriod(p) || isComparisonDatePeriod(p))) {
-                            // The shared header is the global calendar quarter. Keep the
-                            // company's exact period end and fiscal label as context below.
-                            const details = [];
-                            if (d) details.push(formatShortDate(d));
-                            if (sourcePeriod && sourcePeriod !== p) details.push(sourcePeriod);
-                            if (details.length) {
-                                secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${esc(details.join(' · '))}</div>`;
+                        } else if (dateAlignedHeaders && isCalendarQuarterPeriod(p)) {
+                            // Standardized quarter is the only period label. The second
+                            // line is the filing/period date; company fiscal labels are hidden.
+                            if (d) {
+                                secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${formatShortDate(d)}</div>`;
                             }
                         } else if (d) {
                             secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${formatShortDate(d)}</div>`;
@@ -5589,7 +5618,12 @@ pill.querySelector('.avg-pill-btn').onclick = (e) => {
                     const isYoY = metricConfigs[key].isYoY;
                     const chartType = metricConfigs[key].chartType;
 
-                    const data = chartPeriods.slice(si, ei + 1).map(gp => getCalculatedMetricValue(co, row, gp, key));
+                    const visibleChartPeriods = chartPeriods.slice(si, ei + 1);
+                    const data = visibleChartPeriods.map(gp => getCalculatedMetricValue(co, row, gp, key));
+                    const periodDateLabels = visibleChartPeriods.map(gp => {
+                        const d = getExactDateForDisplay(co, gp);
+                        return d ? formatShortDate(d) : '';
+                    });
 
                     const isBar = chartType === 'bar' || chartType === 'stacked';
                     const isFred = (ci === 9999 || ci === '9999');
@@ -5610,10 +5644,11 @@ pill.querySelector('.avg-pill-btn').onclick = (e) => {
                         pointHoverBackgroundColor: color, 
                         pointHoverBorderColor: pointBgColor,
                         pointStyle: isFred ? 'triangle' : 'circle',
-                        pointRadius: isBar ? 0 : (isFred ? 6 : 4), 
-                        pointHoverRadius: isBar ? 0 : (isFred ? 8 : 7),
+                        pointRadius: isBar ? 0 : (isFred ? 5 : 3), 
+                        pointHoverRadius: isBar ? 0 : (isFred ? 6 : 5),
+                        pointHitRadius: isBar ? 0 : 8,
                         fill: !isBar && chartType === 'area',
-                        tension: 0.4,
+                        tension: 0.25,
                         yAxisID: !dualY ? 'y' : yAxisAssignments[key],
                         stack: isPartSumStack ? 'sum_group' : (chartType === 'stacked' ? 'stack1' : `stack-${key}`),
                         barPercentage: 0.8,
@@ -5622,7 +5657,10 @@ pill.querySelector('.avg-pill-btn').onclick = (e) => {
                         isYoYMetric: isYoY,
                         isPctMetric: isPercentageMetric(row.label),
                         companyIndex: ci,
-                        sourceRowId: ri
+                        sourceRowId: ri,
+                        periodDateLabels,
+                        normalized: true,
+                        spanGaps: false
                     });
 // Inside Pass 2: Build datasets loop, right after your datasets.push({ ... raw metric data ... }) configuration block
 const validDataPoints = data.filter(v => typeof v === 'number' && v !== null && !isNaN(v));
@@ -5700,7 +5738,13 @@ if (validDataPoints.length > 0 && !isPartSumStack) {
                                 yAxisID: 'yPrice', // Dedicate a separate axis so metrics aren't squashed
                                 order: 0, // Plot on top of bar charts
                                 companyIndex: ci,
-                                isPriceDataset: true
+                                isPriceDataset: true,
+                                periodDateLabels: chartPeriods.slice(si, ei + 1).map(gp => {
+                                    const d = getExactDateForDisplay(co, gp);
+                                    return d ? formatShortDate(d) : '';
+                                }),
+                                normalized: true,
+                                spanGaps: false
                             });
                         }
                     });
@@ -5764,13 +5808,17 @@ if (validDataPoints.length > 0 && !isPartSumStack) {
                     };
                 }
 
+                const tooltipStackTotals = new Map();
+
                 const config = {
                     type: 'line', // Base type
                     data: { labels, datasets },
                     options: {
-                        animation: { duration: 500, easing: 'easeOutQuart' },
+                        animation: false,
+                        transitions: { active: { animation: { duration: 0 } } },
                         responsive: true, maintainAspectRatio: false,
-                        interaction: { mode: 'index', intersect: false },
+                        normalized: true,
+                        interaction: { mode: 'index', intersect: false, axis: 'x' },
                         plugins: {
                             legend: { display: false },
                             zoom: {
@@ -5814,12 +5862,16 @@ if (validDataPoints.length > 0 && !isPartSumStack) {
 
                                         // 3. BONUS: If it's part of a Stacked Sum, show its % contribution!
                                         if (c.dataset.stack === 'sum_group') {
-                                            let stackTotal = 0;
-                                            c.chart.data.datasets.forEach(ds => {
-                                                if (ds.stack === 'sum_group' && ds.data[c.dataIndex]) {
-                                                    stackTotal += ds.data[c.dataIndex];
-                                                }
-                                            });
+                                            const stackCacheKey = `${c.dataset.stack}:${c.dataIndex}`;
+                                            let stackTotal = tooltipStackTotals.get(stackCacheKey);
+                                            if (stackTotal === undefined) {
+                                                stackTotal = 0;
+                                                c.chart.data.datasets.forEach(ds => {
+                                                    const point = ds.stack === 'sum_group' ? ds.data[c.dataIndex] : null;
+                                                    if (typeof point === 'number' && !isNaN(point)) stackTotal += point;
+                                                });
+                                                tooltipStackTotals.set(stackCacheKey, stackTotal);
+                                            }
                                             if (stackTotal !== 0) {
                                                 const pctOfTotal = ((c.parsed.y / stackTotal) * 100).toFixed(1);
                                                 return `${c.dataset.label}: ${valStr} (${pctOfTotal}% of Total)`;
@@ -5827,17 +5879,10 @@ if (validDataPoints.length > 0 && !isPartSumStack) {
                                         }
 
                                         const valueLine = `${c.dataset.label}: ${valStr}`;
-                                        const ci = c.dataset.companyIndex;
-                                        if (Number.isInteger(ci) && companies[ci]) {
-                                            const globalPeriod = chartPeriods[si + c.dataIndex];
-                                            const exactDate = getExactDateForDisplay(companies[ci], globalPeriod);
-                                            const fiscalPeriod = getSourcePeriodLabelForDisplay(companies[ci], globalPeriod);
-                                            const details = [];
-                                            if (exactDate) details.push(`Period ended ${formatShortDate(exactDate)}`);
-                                            if (fiscalPeriod && fiscalPeriod !== globalPeriod) details.push(`Fiscal ${fiscalPeriod}`);
-                                            if (details.length) return [valueLine, `  ${details.join(' · ')}`];
-                                        }
-                                        return valueLine;
+                                        const dateLabel = Array.isArray(c.dataset.periodDateLabels)
+                                            ? c.dataset.periodDateLabels[c.dataIndex]
+                                            : '';
+                                        return dateLabel ? [valueLine, `  Date ${dateLabel}`] : valueLine;
                                     }
                                 }
                             }
@@ -16970,36 +17015,33 @@ document.addEventListener('DOMContentLoaded', () => {
     const geminiBtn = document.getElementById('geminiToggleBtn');
     const rightControls = document.querySelector('.fixed.bottom-4.right-4');
 
+    let edgeFrame = 0;
+    let lastMouseX = 0;
+    let lastMouseY = 0;
+    let geminiVisible = null;
+    let controlsVisible = null;
+
     window.addEventListener('mousemove', (e) => {
-        const viewportWidth = window.innerWidth;
-        const viewportHeight = window.innerHeight;
+        lastMouseX = e.clientX;
+        lastMouseY = e.clientY;
+        if (edgeFrame) return;
+        edgeFrame = requestAnimationFrame(() => {
+            edgeFrame = 0;
+            const viewportWidth = window.innerWidth;
+            const viewportHeight = window.innerHeight;
+            const nextGeminiVisible = lastMouseX <= EDGE_THRESHOLD || (viewportHeight - lastMouseY) <= EDGE_THRESHOLD;
+            const nextControlsVisible = (viewportWidth - lastMouseX) <= EDGE_THRESHOLD || (viewportHeight - lastMouseY) <= EDGE_THRESHOLD;
 
-        // Check proximity to Bottom-Left corner (for Gemini Button)
-        const nearLeftEdge = e.clientX <= EDGE_THRESHOLD;
-        const nearBottomEdgeForGemini = (viewportHeight - e.clientY) <= EDGE_THRESHOLD;
-        
-        // Check proximity to Bottom-Right corner (for 3 Controls Panel)
-        const nearRightEdge = (viewportWidth - e.clientX) <= EDGE_THRESHOLD;
-        const nearBottomEdgeForControls = (viewportHeight - e.clientY) <= EDGE_THRESHOLD;
-
-        // Trigger Gemini pop-up visibility if near left/bottom corner bounds
-        if (geminiBtn) {
-            if (nearLeftEdge || nearBottomEdgeForGemini) {
-                geminiBtn.classList.add('visible');
-            } else {
-                geminiBtn.classList.remove('visible');
+            if (geminiBtn && nextGeminiVisible !== geminiVisible) {
+                geminiVisible = nextGeminiVisible;
+                geminiBtn.classList.toggle('visible', nextGeminiVisible);
             }
-        }
-
-        // Trigger Right Panel visibility if near right/bottom corner bounds
-        if (rightControls) {
-            if (nearRightEdge || nearBottomEdgeForControls) {
-                rightControls.classList.add('visible');
-            } else {
-                rightControls.classList.remove('visible');
+            if (rightControls && nextControlsVisible !== controlsVisible) {
+                controlsVisible = nextControlsVisible;
+                rightControls.classList.toggle('visible', nextControlsVisible);
             }
-        }
-    });
+        });
+    }, { passive: true });
 })();
 
 function calculateInstitutionalTaxRate(co) {
