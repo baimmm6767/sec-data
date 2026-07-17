@@ -16,6 +16,8 @@ Convert SEC EDGAR filings into detailed, modelling-ready quarterly or annual fin
 
 > [!IMPORTANT]
 > The primary supported workflow is **quarterly financial statement extraction for U.S. domestic filers using 10-Q and 10-K filings**. Annual extraction and foreign private issuer support are experimental.
+>
+> The code is 100% AI generated. From the sec_data.py to the index.html there 0 manually written code!
 
 <p align="center">
   <img
