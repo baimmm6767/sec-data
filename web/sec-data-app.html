@@ -4251,7 +4251,23 @@ document.addEventListener('DOMContentLoaded', () => {
                     return mc && ms;
                 });
 
-                const dispPeriods = tableSortOrder === 'newest' ? globalPeriods : [...globalPeriods].reverse();
+                // Keep the chart on the shared global calendar-quarter axis, but
+                // trim future quarter buckets from each company's table. Loading a
+                // company with a later fiscal period (for example NVDA in calendar Q2)
+                // must not create an empty leading quarter for companies whose latest
+                // reported period still belongs to calendar Q1.
+                let companyTablePeriods = [...globalPeriods];
+                if (activePeriodType !== 'annual' && useDateAlignedPeriods()) {
+                    const latestAvailableIndex = companyTablePeriods.findIndex(period =>
+                        getSourcePeriodIndexForDisplay(company, period) !== -1
+                    );
+                    if (latestAvailableIndex > 0) {
+                        companyTablePeriods = companyTablePeriods.slice(latestAvailableIndex);
+                    }
+                }
+                const dispPeriods = tableSortOrder === 'newest'
+                    ? companyTablePeriods
+                    : [...companyTablePeriods].reverse();
 
                 if (filtered.length === 0) {
                     scrollArea.innerHTML = `<div class="p-6 text-center text-[13px] text-term-text-dimmer italic">No matching metrics</div>`;
