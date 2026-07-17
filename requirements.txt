@@ -1,6 +1,4 @@
-from pathlib import Path
-
-requirements = """# sec-data dependencies
+# sec-data dependencies
 # Recommended Python version: 3.10 or newer
 #
 # Install all repository dependencies with:
@@ -54,9 +52,3 @@ requests
 # The JavaScript libraries used by the optional HTML application are loaded
 # from CDNs in index.html and are therefore not installed through pip.
 # External data features in the HTML app may also require their own API keys.
-"""
-
-path = Path("/mnt/data/requirements_updated.txt")
-path.write_text(requirements, encoding="utf-8")
-print(path)
-print(requirements)
