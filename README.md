@@ -110,7 +110,7 @@ Generated files remain local and can be opened directly in spreadsheets, noteboo
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/ichsan1448-alt/sec-data.git
+git clone https://github.com/baimmm6767/sec-data.git
 cd sec-data
 ```
 
