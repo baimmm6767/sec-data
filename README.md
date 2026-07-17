@@ -19,7 +19,7 @@ Convert SEC EDGAR filings into detailed, modelling-ready quarterly or annual fin
 
 <p align="center">
   <img
-    src="[https://github.com/ichsan1448-alt/sec-data/blob/main/examples/cli-ui.png](https://github.com/ichsan1448-alt/sec-data/blob/main/examples/cli-ui.jpeg)"
+    src="https://github.com/ichsan1448-alt/sec-data/blob/main/examples/cli-ui.jpeg"
     alt="sec-data Python CLI extracting Netflix quarterly financial statements from SEC 10-K and 10-Q filings"
     width="100%"
   >
