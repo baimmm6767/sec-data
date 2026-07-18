@@ -15813,18 +15813,36 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     _num_cache: dict[tuple[str | None, str], pd.Series] = {}
     _nan_row = pd.Series(np.nan, index=pivoted.columns)
 
+    def _kpi_series_without_attrs(values):
+        """Return an isolated KPI row without inherited DataFrame attrs.
+
+        ``pivoted`` intentionally stores audit DataFrames in ``DataFrame.attrs``.
+        pandas propagates those attrs to Series selected with ``.loc``.  On long
+        time series, boolean Series assignment may internally format the mask;
+        formatting truncates/concatenates the Series and pandas then compares
+        the nested DataFrame attrs, raising ``ValueError: The truth value of a
+        DataFrame is ambiguous``.  KPI math needs the values/index only, while
+        audit readers still access ``pivoted.attrs`` directly, so stripping row
+        attrs here is lossless and prevents the pandas failure globally.
+        """
+        result = values.copy(deep=False)
+        result.attrs = {}
+        return result
+
     def get_row(name, preferred_cat=None):
         key = (preferred_cat, name)
         cached = _row_cache.get(key)
         if cached is not None:
             return cached
         if preferred_cat and (preferred_cat, name) in pivoted.index:
-            result = pivoted.loc[(preferred_cat, name)]
+            result = _kpi_series_without_attrs(
+                pivoted.loc[(preferred_cat, name)])
             _row_cache[key] = result
             return result
         for cat in ['1_Income_Statement', '2_Balance_Sheet', '3_Cash_Flow']:
             if (cat, name) in pivoted.index:
-                result = pivoted.loc[(cat, name)]
+                result = _kpi_series_without_attrs(
+                    pivoted.loc[(cat, name)])
                 _row_cache[key] = result
                 return result
         # Preserve the old behavior for absent rows: each get_row() call got a
@@ -15837,7 +15855,11 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
         key = (preferred_cat, name)
         base = _num_cache.get(key)
         if base is None:
-            base = pd.to_numeric(get_row(name, preferred_cat), errors='coerce')
+            base = pd.to_numeric(
+                get_row(name, preferred_cat), errors='coerce')
+            # Some pandas versions preserve attrs through ``to_numeric``;
+            # normalize explicitly so every cached numeric row is safe.
+            base = _kpi_series_without_attrs(base)
             _num_cache[key] = base
         result = base.copy() if mutable else base
         if fillna is not None:
@@ -16481,8 +16503,8 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     short_invest = get_row('Short-term Investments')
     ce_n = pd.to_numeric(cash_equiv, errors='coerce').fillna(0)
     si_n = pd.to_numeric(short_invest, errors='coerce').fillna(0)
-    total_cash = ce_n + si_n
-    total_cash[cash_equiv.isna() & short_invest.isna()] = np.nan
+    total_cash = (ce_n + si_n).where(
+        cash_equiv.notna() | short_invest.notna())
     if not total_cash.isna().all() and not total_debt.isna().all():
         # Missing debt facts are not proof of zero debt, just as missing cash
         # facts are not proof of zero cash.  Publish only on evidence for both.
