@@ -1872,6 +1872,56 @@ def fetch_xbrl(filing):
     return xbrl
 
 
+def _prefetch_and_learn_statement_concepts(
+        filings, max_workers=8, log_output=False):
+    """Build one deterministic face-statement concept map before extraction.
+
+    XBRL downloads/parsing remain parallel, but concept registration is replayed
+    in the caller's stable filing order.  Every later extraction worker therefore
+    snapshots the same complete map; output no longer depends on which worker
+    happened to learn a custom concept first.
+    """
+    ordered_filings = list(filings or [])
+    if not ordered_filings:
+        return 0, 0
+
+    xbrl_by_position = [None] * len(ordered_filings)
+
+    def _prefetch(position, filing):
+        try:
+            with _ExternalConsoleSilencer(enabled=not log_output):
+                return position, fetch_xbrl(filing), None
+        except Exception as exc:
+            return position, None, exc
+
+    worker_count = min(
+        max(1, int(max_workers or 1)), len(ordered_filings))
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(_prefetch, position, filing)
+            for position, filing in enumerate(ordered_filings)
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            position, xbrl, _exc = future.result()
+            xbrl_by_position[position] = xbrl
+
+    learned = 0
+    prepared = 0
+    for xbrl in xbrl_by_position:
+        if xbrl is None:
+            continue
+        prepared += 1
+        try:
+            if hasattr(xbrl, 'calculation_trees'):
+                resolve_custom_tags(xbrl.calculation_trees)
+            learned += int(learn_statement_concepts(xbrl) or 0)
+        except Exception as exc:
+            print(f"  Warning: deterministic concept pre-pass failed for one "
+                  f"filing ({type(exc).__name__}: {exc}).")
+    return prepared, learned
+
+
 @retry_sec_request(retries=5, delay=8)
 def _fetch_html_uncached(filing):
     return filing.html()
@@ -2543,9 +2593,9 @@ CONCEPT_MAP = {
     'Other Non-Current Assets': {'tags': ['OtherAssetsNoncurrent'], 'cat': '2_Balance_Sheet'},
     'Intangible Assets (Net)': {'tags': ['IntangibleAssetsNetExcludingGoodwill'], 'cat': '2_Balance_Sheet'},
     'Intangible Assets & Goodwill': {'tags': ['IntangibleAssetsNetIncludingGoodwill'], 'cat': '2_Balance_Sheet'},
-    'Receivables from Brokers & Dealers': {'tags': ['ReceivablesFromBrokerDealersAndClearingOrganizations', 'ReceivablesFromBrokersDealersAndClearingOrganizations', 'BrokerageReceivables', 'ReceivablesFromClearingOrganizations', 'OtherReceivablesFromBrokerDealersAndClearingOrganizations', 'IncreaseDecreaseInBrokerageReceivables'], 'cat': '2_Balance_Sheet'},
+    'Receivables from Brokers & Dealers': {'tags': ['ReceivablesFromBrokerDealersAndClearingOrganizations', 'ReceivablesFromBrokersDealersAndClearingOrganizations', 'BrokerageReceivables', 'ReceivablesFromClearingOrganizations', 'OtherReceivablesFromBrokerDealersAndClearingOrganizations'], 'cat': '2_Balance_Sheet'},
     'Customer Receivables': {'tags': ['CustomerReceivables', 'ReceivablesFromCustomers', 'CustomerAccountsReceivable', 'ReceivablesFromCustomerNet', 'ReceivablesFromAndPayablesToBrokerageClientsTextBlock'], 'cat': '2_Balance_Sheet'},
-    'Other Receivables': {'tags': ['OtherReceivables', 'OtherReceivablesNet', 'CustomerAndOtherReceivables', 'IncreaseDecreaseInOtherReceivables'], 'cat': '2_Balance_Sheet'},
+    'Other Receivables': {'tags': ['OtherReceivables', 'OtherReceivablesNet', 'CustomerAndOtherReceivables'], 'cat': '2_Balance_Sheet'},
     'Loans & Leases (Net)': {'tags': ['LoansAndLeasesReceivableNetOfAllowance', 'LoansAndLeasesReceivableNetReportedAmount', 'LoansReceivableNet', 'LoansAndLeasesReceivableNetOfDeferredIncome', 'LoansReceivableNetOfAllowance'], 'cat': '2_Balance_Sheet'},
     'Securities Borrowed': {'tags': ['SecuritiesBorrowed', 'SecuritiesBorrowedGross', 'SecuritiesBorrowedLiability'], 'cat': '2_Balance_Sheet'},
     'Securities Purchased under Agreements to Resell': {'tags': ['SecuritiesPurchasedUnderAgreementsToResell', 'SecuritiesPurchasedUnderAgreementsToResellGross', 'SecuritiesPurchasedUnderAgreementsToResellLiability'], 'cat': '2_Balance_Sheet'},
@@ -2567,7 +2617,7 @@ CONCEPT_MAP = {
     'Operating Lease Liability (Current)': {'tags': ['OperatingLeaseLiabilityCurrent'], 'cat': '2_Balance_Sheet'},
     'Finance Lease Liability (Current)': {'tags': ['FinanceLeaseLiabilityCurrent'], 'cat': '2_Balance_Sheet'},
     'Total Current Liabilities': {'tags': ['LiabilitiesCurrent'], 'cat': '2_Balance_Sheet'},
-    'Goodwill': {'tags': ['Goodwill', 'GoodwillAcquiredDuringPeriod'], 'cat': '2_Balance_Sheet'},
+    'Goodwill': {'tags': ['Goodwill'], 'cat': '2_Balance_Sheet'},
     'Long-term Debt': {'tags': ['LongTermDebtNoncurrent', 'LongTermDebt', 'LongTermDebtAndCapitalLeaseObligations'], 'cat': '2_Balance_Sheet'},
     'Senior Notes': {'tags': ['SeniorLongTermNotes', 'SeniorNotes'], 'cat': '2_Balance_Sheet'},
     'Convertible Debt': {'tags': ['ConvertibleDebtNoncurrent', 'ConvertibleLongTermNotesPayable'], 'cat': '2_Balance_Sheet'},
@@ -2612,6 +2662,7 @@ CONCEPT_MAP = {
     'Capital Expenditures (Intangibles)': {'tags': ['PaymentsToAcquireIntangibleAssets'], 'cat': '3_Cash_Flow'},
     'Capital Expenditures (Equipment & Buildings)': {'tags': ['PaymentsToAcquireOtherPropertyPlantAndEquipment', 'PaymentsToAcquireMachineryAndEquipment', 'PaymentsToAcquireBuildings', 'PaymentsToAcquireLandAndBuildingsAndImprovements', 'PaymentsForConstructionInProcess', 'PaymentsToDevelopRealEstate', 'CapitalExpendituresIncurredButNotYetPaid'], 'cat': '3_Cash_Flow'},
     'Acquisitions': {'tags': ['PaymentsToAcquireBusinessesNetOfCashAcquired', 'PaymentsToAcquireBusinessesGross', 'PaymentsToAcquireBusinessesAndIntangibles'], 'cat': '3_Cash_Flow'},
+    'Cash Acquired in Business Acquisitions': {'tags': ['CashCashEquivalentsAndSegregatedCashAcquiredInBusinessAcquisitions', 'CashCashEquivalentsAndSegregatedCashAcquiredInBusinessAcquisitionsAndAssetAcquisitions'], 'cat': '6_Disclosures'},
     'Divestitures': {'tags': ['ProceedsFromDivestitureOfBusinesses', 'ProceedsFromSalesOfBusinessesNetOfCashDivested', 'ProceedsFromDivestitureOfBusinessesNetOfCashDivested', 'ProceedsFromSaleOfBusiness', 'ProceedsFromDivestitures', 'ProceedsFromSaleOfSubsidiaries', 'ProceedsFromSaleOfBusinessesAndInterestsInAffiliates', 'ProceedsFromDivestitureOfBusinessesAndInterestsInAffiliates', 'ProceedsFromSaleOfBusinessSegment'], 'cat': '3_Cash_Flow'},
     'Purchases of Investments': {'tags': ['PaymentsToAcquireMarketableSecurities', 'PaymentsToAcquireAvailableForSaleSecurities', 'PaymentsToAcquireShortTermInvestments', 'PaymentsToAcquireOtherInvestments', 'PaymentsToAcquireInvestments', 'PaymentsToAcquireLongTermInvestments', 'PaymentsToAcquireAvailableForSaleSecuritiesDebt'], 'cat': '3_Cash_Flow'},
     'Proceeds from Investments': {'tags': ['ProceedsFromSaleAndMaturityOfMarketableSecurities', 'ProceedsFromSaleAndMaturityOfAvailableForSaleSecurities', 'ProceedsFromSaleAndMaturityOfOtherInvestments', 'ProceedsFromMaturitiesPrepaymentsAndCallsOfAvailableForSaleSecurities', 'ProceedsFromSaleOfMarketableSecurities', 'ProceedsFromMaturitiesOfMarketableSecurities', 'ProceedsFromSaleOfInvestments', 'ProceedsFromSaleAndMaturityOfInvestments', 'ProceedsFromSaleAndMaturityOfAvailableForSaleSecuritiesDebt'], 'cat': '3_Cash_Flow'},
@@ -2619,13 +2670,15 @@ CONCEPT_MAP = {
     'Investing Cash Flow': {'tags': ['NetCashProvidedByUsedInInvestingActivities', 'NetCashProvidedByUsedInInvestingActivitiesContinuingOperations', 'NetCashProvidedByUsedInInvestingActivitiesDiscontinuedOperations'], 'cat': '3_Cash_Flow'},
     'Short-term Debt Issued': {'tags': ['ProceedsFromIssuanceOfShortTermDebt', 'ProceedsFromShortTermDebt', 'ProceedsFromShortTermDebtMaturingInThreeMonthsOrLess', 'ProceedsFromIssuanceOfCommercialPaper'], 'cat': '3_Cash_Flow'},
     'Short-term Debt Repaid': {'tags': ['RepaymentsOfShortTermDebt', 'PaymentsForRepaymentsOfShortTermDebt', 'RepaymentsOfCommercialPaper'], 'cat': '3_Cash_Flow'},
+    'Lines of Credit Issued': {'tags': ['ProceedsFromLinesOfCredit'], 'cat': '3_Cash_Flow'},
+    'Lines of Credit Repaid': {'tags': ['RepaymentsOfLinesOfCredit'], 'cat': '3_Cash_Flow'},
     'Net Change in Short-term Debt': {'tags': ['NetCashProvidedByUsedInShortTermDebt', 'IncreaseDecreaseInShortTermDebt', 'IncreaseDecreaseInLinesOfCredit', 'ProceedsFromRepaymentsOfCommercialPaper', 'ProceedsFromRepaymentsOfShortTermDebtMaturingInMoreThanThreeMonths', 'ProceedsFromRepaymentsOfShortTermDebt'], 'cat': '3_Cash_Flow'},
     'Net Short-Term Debt Issued (Repaid)': {'tags': [], 'cat': '3_Cash_Flow'},
     'Long-term Debt Issued': {'tags': ['ProceedsFromIssuanceOfLongTermDebt', 'ProceedsFromIssuanceOfLongTermDebtAndCapitalSecuritiesNet', 'ProceedsFromLongTermLinesOfCredit', 'ProceedsFromIssuanceOfSeniorLongTermDebt', 'ProceedsFromIssuanceOfMediumTermNotes', 'ProceedsFromIssuanceOfOtherLongTermDebt', 'ProceedsFromIssuanceOfUnsecuredDebt', 'ProceedsFromIssuanceOfSecuredDebt', 'ProceedsFromIssuanceOfSubordinatedDebt'], 'cat': '3_Cash_Flow'},
     'Long-term Debt Repaid': {'tags': ['RepaymentsOfLongTermDebt', 'RepaymentsOfLongTermDebtAndCapitalSecurities', 'RepaymentsOfLongTermLinesOfCredit', 'RepaymentsOfSeniorDebt', 'RepaymentsOfMediumTermNotes', 'RepaymentsOfOtherLongTermDebt', 'RepaymentsOfUnsecuredDebt', 'RepaymentsOfSecuredDebt', 'RepaymentsOfSubordinatedDebt', 'FinanceLeasePrincipalPayments'], 'cat': '3_Cash_Flow'},
     'Net Long-Term Debt Issued (Repaid)': {'tags': [], 'cat': '3_Cash_Flow'},
-    'Total Debt Issued': {'tags': ['ProceedsFromIssuanceOfDebt', 'ProceedsFromDebtNetOfIssuanceCosts', 'ProceedsFromConvertibleDebt', 'ProceedsFromLinesOfCredit', 'ProceedsFromIssuanceOfUnsecuredDebt', 'ProceedsFromIssuanceOfSecuredDebt', 'ProceedsFromDebtMaturingInMoreThanThreeMonths', 'ProceedsFromNotesPayable', 'ProceedsFromIssuanceOfSubordinatedDebt'], 'cat': '3_Cash_Flow'}, 
-    'Total Debt Repaid': {'tags': ['RepaymentsOfDebt', 'RepaymentsOfConvertibleDebt', 'RepaymentsOfLinesOfCredit', 'RepaymentsOfUnsecuredDebt', 'RepaymentsOfSecuredDebt', 'RepaymentsOfNotesPayable', 'RepaymentsOfOtherDebt', 'RepaymentsOfDebtMaturingInMoreThanThreeMonths', 'RepaymentsOfSubordinatedDebt', 'RepaymentsOfDebtAndCapitalLeaseObligations'], 'cat': '3_Cash_Flow'},
+    'Total Debt Issued': {'tags': ['ProceedsFromIssuanceOfDebt', 'ProceedsFromDebtNetOfIssuanceCosts', 'ProceedsFromConvertibleDebt', 'ProceedsFromDebtMaturingInMoreThanThreeMonths', 'ProceedsFromNotesPayable'], 'cat': '3_Cash_Flow'}, 
+    'Total Debt Repaid': {'tags': ['RepaymentsOfDebt', 'RepaymentsOfConvertibleDebt', 'RepaymentsOfNotesPayable', 'RepaymentsOfOtherDebt', 'RepaymentsOfDebtMaturingInMoreThanThreeMonths', 'RepaymentsOfDebtAndCapitalLeaseObligations'], 'cat': '3_Cash_Flow'},
     'Total Net Debt Issued (Repaid)': {'tags': [], 'cat': '3_Cash_Flow'},
     'Cash Interest Paid': {'tags': ['InterestPaid', 'InterestPaidNet', 'InterestPaidNetOfCapitalizedInterest'], 'cat': '3_Cash_Flow'},
     'Share Repurchases': {'tags': ['PaymentsForRepurchaseOfCommonStock', 'StockRepurchasedDuringPeriodValue', 'StockRepurchasedAndRetiredDuringPeriodValue', 'TreasuryStockValueAcquiredCostMethod', 'TreasuryStockValueAcquiredParValueMethod', 'PaymentsForRepurchaseOfPreferredStock', 'PaymentsForRepurchaseOfEquity', 'StockRepurchasedAndRetiredDuringPeriodShares'], 'cat': '3_Cash_Flow'},
@@ -2643,6 +2696,24 @@ CONCEPT_MAP = {
     'RPO - Totals': {'tags': ['RevenueRemainingPerformanceObligation'], 'cat': '6_Disclosures'},
     'RPO - Next 12 Months': {'tags': ['RevenueRemainingPerformanceObligationExpectedTimingOfSatisfactionPeriod1'], 'cat': '6_Disclosures'},
     'RPO - Next 12 Months (%)': {'tags': ['RevenueRemainingPerformanceObligationPercentage'], 'cat': '6_Disclosures'},
+
+    # Accounts-receivable allowance rollforwards.  These concepts are three
+    # different measures, not interchangeable tags for one generic receivable
+    # disclosure.  Keeping a distinct metric prefix for each also prevents
+    # dimensional member rows (for example, Brokerage Related Receivables)
+    # from competing during quarterly concept selection.
+    'Allowance for Doubtful Accounts Receivable: Balance': {
+        'tags': ['AllowanceForDoubtfulAccountsReceivable'],
+        'cat': '6_Disclosures',
+    },
+    'Allowance for Doubtful Accounts Receivable: Recoveries': {
+        'tags': ['AllowanceForDoubtfulAccountsReceivableRecoveries'],
+        'cat': '6_Disclosures',
+    },
+    'Allowance for Doubtful Accounts Receivable: Write-offs': {
+        'tags': ['AllowanceForDoubtfulAccountsReceivableWriteOffs'],
+        'cat': '6_Disclosures',
+    },
 
     # 7. CONCENTRATION RISK (Standard Tags)
     'Customer Concentration %': {'tags': ['ConcentrationRiskPercentage1', 'ConcentrationRiskRevenue', 'ConcentrationRiskPercentage', 'ConcentrationRiskNumberOfMajorCustomers', 'ConcentrationRiskPercentageOfAccountsReceivable', 'ConcentrationRiskAccountsReceivable', 'ConcentrationRiskSupplierPercentage', 'ConcentrationRiskGeographicRegion', 'RevenueFromExternalCustomersByReportableSegment', 'MajorCustomerMember'], 'cat': '7_Concentration_Risk'},
@@ -4399,7 +4470,31 @@ STANDARD_TAG_MAP = {
     'DepreciationAndAmortization': 'Depreciation & Amortization',
 }
 
-NO_SUBTRACT = ['Shares Outstanding', 'EPS', 'Margin', 'Ratio', 'ROE', 'ROA', 'Percentage', 'Percent', '%', 'Useful Life', 'RPO', 'Per Share', 'per share', 'Per Basic', 'Per Diluted']
+NO_SUBTRACT = ['Shares Outstanding', 'EPS', 'Margin', 'Ratio', 'Rate', 'Yield',
+               'ROE', 'ROA', 'Percentage', 'Percent', '%', 'Useful Life',
+               'RPO', 'Per Share', 'per share', 'Per Basic', 'Per Diluted']
+
+
+def _is_nonadditive_output_label(label):
+    """Return True for rates, ratios, per-share data, and point estimates.
+
+    XBRL presentation labels are not consistently title-cased.  Token-aware,
+    case-insensitive matching prevents a sentence-case ``Effective tax rate``
+    from being de-cumulated, without treating words such as ``corporate`` as a
+    rate merely because they contain the letters ``rate``.
+    """
+    text = re.sub(r'\s+', ' ', str(label or '')).strip().casefold()
+    tokens = set(re.findall(r'[a-z0-9]+', text))
+    if '%' in text or {'eps', 'margin', 'ratio', 'rate', 'roe', 'roa',
+                       'percentage', 'percent', 'rpo'} & tokens:
+        return True
+    if 'shares outstanding' in text or 'useful life' in text:
+        return True
+    if re.search(r'\bper\s+(?:share|basic|diluted)\b', text):
+        return True
+    # ``yield`` alone is ambiguous (for example, "yield maintenance fee").
+    # Treat it as non-additive only when the label actually describes a yield.
+    return bool(re.search(r'\byield(?:\s+(?:rate|percent|percentage))?\s*$', text))
 
 SEGMENT_PREFIXES = [
     ('propertyplantandequipmentusefullife', 'Useful Life - PPE'),
@@ -4628,6 +4723,11 @@ CAT_ORDER = {
     '4a_Segments_Business':  3,
     '4b_Segments_Geographic_Regions': 4,
     '4c_Segments_Geographic_Countries': 4,
+    # Company-defined operating measures are deliberately kept outside the
+    # segment categories.  Segment sparsity/footing/cleanup rules are not valid
+    # for balances, user counts, per-user metrics, or episodic rollforward
+    # movements such as acquired assets.
+    '4e_Operating_Metrics':  4,
     '5_KPI_Metrics':         5,
     '6_Disclosures':         6,
     '6_Disclosures_Cross_Tabulated': 6,
@@ -4648,6 +4748,7 @@ SEGMENT_METRIC_ORDER = [
 
 # Segment category markers for easy filtering
 SEG_CATS = {'4a_Segments_Business', '4b_Segments_Geographic_Regions', '4c_Segments_Geographic_Countries', '4d_Segments_Cross_Tabulated'}
+OPERATING_METRICS_CATEGORY = '4e_Operating_Metrics'
 
 # Genuine segment metrics that are considered core business segments
 GENUINE_SEGMENT_METRICS = {
@@ -5181,7 +5282,7 @@ def _infer_html_scale(extracted, html_nums):
 # extraction loop iterates over a per-filing snapshot (see extract_from_filing).
 # ---------------------------------------------------------------------------
 
-_CONCEPT_LEARN_LOCK = threading.Lock()
+_CONCEPT_LEARN_LOCK = threading.RLock()
 
 # edgartools statement type -> our output category.
 # 'ComprehensiveIncome' is included because filers that combine the income
@@ -5598,6 +5699,21 @@ def learn_statement_concepts(xbrl) -> int:
     return learned
 
 
+def _learn_and_snapshot_statement_concepts(xbrl):
+    """Atomically update and snapshot the shared dynamic concept registry."""
+    with _CONCEPT_LEARN_LOCK:
+        if hasattr(xbrl, 'calculation_trees'):
+            resolve_custom_tags(xbrl.calculation_trees)
+        learned = learn_statement_concepts(xbrl)
+        tag_to_labels = {}
+        tag_rank_lookup = {}
+        for label, info in list(CONCEPT_MAP.items()):
+            for rank, tag in enumerate(info.get('tags', [])):
+                tag_to_labels.setdefault(tag, []).append(label)
+                tag_rank_lookup[(label, tag)] = rank
+    return learned, tag_to_labels, tag_rank_lookup
+
+
 def resolve_custom_tags(calc_trees):
     """
     Parses the calculation linkbase to find custom extension tags that roll up 
@@ -5621,11 +5737,21 @@ def resolve_custom_tags(calc_trees):
                 
                 # Only look at custom tags
                 if child_ns != 'us-gaap':
+                    # Curated mappings carry stronger semantic evidence than a
+                    # calculation-linkbase sign.  In particular, acquisition
+                    # cash balances can be positive children of investing cash
+                    # flow without being divestiture proceeds.
+                    if child_clean in _CONCEPT_TAG_TO_LABEL:
+                        continue
                     lbl_lower = child_clean.lower()
                     target_label = None
                     
                     if parent_clean in investing_parents:
-                        if 'property' in lbl_lower or 'equipment' in lbl_lower or 'capital' in lbl_lower:
+                        if ('cash' in lbl_lower and 'acquir' in lbl_lower
+                                and ('business' in lbl_lower
+                                     or 'acquisition' in lbl_lower)):
+                            target_label = 'Cash Acquired in Business Acquisitions'
+                        elif 'property' in lbl_lower or 'equipment' in lbl_lower or 'capital' in lbl_lower:
                             if node.weight < 0:
                                 target_label = 'Capital Expenditures'
                             else:
@@ -5827,11 +5953,12 @@ def _is_pure_geographic_label(label: str, is_geographic_axis: bool = False) -> b
 # is deliberately conservative and additive:
 #   * no ticker, industry, or metric-name registry;
 #   * exact current-period column binding from table headers;
-#   * monetary tables only;
+#   * monetary tables, plus explicitly unit-qualified operating measures;
 #   * source row labels are preserved;
 #   * at least two coherent rows are required;
 #   * existing XBRL facts always win (exact-key skip + TagRank 998).
-# It is not an operating-metrics extractor and does not scan free-form prose.
+# It does not scan free-form prose: non-monetary operating measures are admitted
+# only from strongly identified key-driver tables with row-level unit evidence.
 
 _GENERIC_BUSINESS_POSITIVE_CONTEXT_RE = tuple(re.compile(p, re.I) for p in (
     r'\brevenues?\s+by\s+(?:business|segment|product|service|market|geograph)',
@@ -5885,6 +6012,213 @@ _GENERIC_BUSINESS_NON_MONETARY_LABEL_RE = re.compile(
 
 _HTML_BUSINESS_CONCEPT = 'HTMLBusinessBreakdown'
 
+# ---------------------------------------------------------------------------
+# Period and unit semantics for already-admitted operating-measure tables
+# ---------------------------------------------------------------------------
+# This layer is intentionally bounded.  It does not scan narrative prose or use
+# ticker-specific registries.  It gives the conservative HTML table rescue
+# enough temporal and unit information to distinguish balances, flows, counts,
+# and per-unit measures without borrowing one row's scale for another row.
+_GB_BASIS_INSTANT_END = 'instant_end'
+_GB_BASIS_INSTANT_START = 'instant_start'
+_GB_BASIS_DURATION_FLOW = 'duration_flow'
+_GB_BASIS_AVERAGE = 'average'
+_GB_BASIS_RATIO = 'ratio'
+_GB_BASIS_UNKNOWN = 'unknown'
+
+_GB_BEGINNING_RE = re.compile(
+    r'\b(?:beginning|opening|start(?:ing)?)\b|\bat\s+the\s+beginning\b', re.I)
+_GB_ENDING_RE = re.compile(
+    r'\b(?:ending|closing)\b|\bat\s+(?:the\s+)?(?:end|period\s+end)\b|\bas\s+of\b', re.I)
+_GB_FLOW_RE = re.compile(
+    r'\b(?:deposits?|withdrawals?|inflows?|outflows?|gains?|losses?|additions?|'
+    r'acquisitions?|acquired|transfers?|disposals?|purchases?|sales?|'
+    r'transactions?|assessments?|processed|processing|volumes?|bookings?|'
+    r'shipments?|originations?|redemptions?|contributions?|distributions?|'
+    r'changes?|churned|resurrected|fees?|spend|payments?|issuances?|'
+    r'repurchases?)\b', re.I)
+_GB_AVERAGE_RE = re.compile(
+    r'\baverage\b|\bper\s+(?:user|customer|account|transaction|member|subscriber)\b|'
+    r'\b(?:monthly|daily|weekly)\s+active\s+users?\b|\b(?:arpu|mau|dau|wau)\b', re.I)
+_GB_RATIO_RE = re.compile(
+    # "margin balances" is a receivables description, not a profitability
+    # ratio.  Bare margin remains a ratio everywhere else.
+    r'\bmargin\b(?!\s+balances?\b)|\b(?:percentage|percent|rate|ratio|yield)\b|%', re.I)
+_GB_BALANCE_LIKE_RE = re.compile(
+    r'\b(?:balance|assets?|cash|securities|inventory|backlog|customers?|'
+    r'subscribers?|members?|accounts?|stores?|locations?|employees?|headcount|'
+    r'installed\s+base|outstanding|holdings?|receivables?|auc|aum|ncfa|'
+    r'funded\s+accounts?)\b', re.I)
+_GB_SNAPSHOT_HEADER_RE = re.compile(
+    r'\bas\s+of\b|\bat\s+(?:[A-Z][a-z]+\s+\d{1,2},?\s+)?\d{4}\b|'
+    r'\b(?:period|quarter|year)[- ]end\b', re.I)
+_GB_DURATION_HEADER_RE = re.compile(
+    r'\b(?:three|six|nine|twelve)\s+months?\s+ended\b|\bquarter\s+ended\b|'
+    r'\byears?\s+ended\b|\bfiscal\s+year\b|\byear\s+to\s+date\b|\bytd\b', re.I)
+_GB_SNAPSHOT_CONTEXT_RE = re.compile(
+    r'\b(?:components?|composition|breakdown)\s+of\s+.{0,120}'
+    r'\b(?:assets?|balances?|holdings?|inventory|backlog|portfolio|installed\s+base|'
+    r'customers?|subscribers?|members?|headcount)\b|'
+    r'\b(?:assets?|balances?|holdings?|inventory|backlog|portfolio)\s+by\s+(?:type|class|category)\b|'
+    r'\bas\s+of\s+(?:a\s+)?(?:stated\s+date|period\s+end)\b', re.I)
+
+# Row-local unit evidence.  These patterns describe broad financial/KPI
+# semantics, never issuer names or ticker-specific labels.  Explicit row scale
+# annotations always outrank a homogeneous-table fallback.
+_GB_SCALE_MARKER_RE = re.compile(
+    r'\bin\s+(thousands?|millions?|billions?)\b|'
+    r'\(\s*(?:\$|usd|u\.?s\.?\s+dollars?)?\s*(?:in\s+)?'
+    r'(thousands?|millions?|billions?)\s*\)',
+    re.I,
+)
+_GB_EXPLICIT_DOLLARS_RE = re.compile(
+    r'\bin\s+(?:u\.?s\.?\s+)?dollars?\b|\bdollars?\s+per\b', re.I)
+_GB_CURRENCY_PER_UNIT_RE = re.compile(
+    r'\b(?:arpu|arpa|arpc)\b|'
+    r'\b(?:revenue|sales|income|spend|fees?)\s+per\s+'
+    r'(?:user|customer|account|transaction|member|subscriber)\b', re.I)
+_GB_PER_UNIT_RE = re.compile(
+    r'\bper\s+(?:user|customer|account|transaction|member|subscriber)\b', re.I)
+_GB_MONEY_METRIC_RE = re.compile(
+    r'\b(?:revenue|sales|income|assets?|auc|aum|custody|deposits?|withdrawals?|'
+    r'cash|securities|balances?|receivables?|holdings?|spend|fees?|gains?|losses?|'
+    r'bookings?|payments?|acquired)\b', re.I)
+_GB_COUNT_METRIC_RE = re.compile(
+    r'\b(?:number|count)\s+of\b|'
+    r'\b(?:monthly|daily|weekly)\s+active\s+users?\b|'
+    r'\b(?:mau|dau|wau|ncfa)\b|\bfunded\s+accounts?\b|'
+    r'\b(?:user|customer|subscriber|member|employee)\s+count\b|'
+    r'\bheadcount\b|\btrips?\b|\bnights?\s+booked\b|'
+    r'\bunits?\s+(?:sold|shipped)\b', re.I)
+_GB_SIMPLE_COUNT_METRIC_RE = re.compile(
+    r'(?:beginning|ending|average|active)?\s*'
+    r'(?:users?|customers?|subscribers?|members?|accounts?|employees?|stores?|locations?)'
+    r'(?:\s+count)?(?:\s*\([^)]*\))?', re.I)
+_GB_TRAILING_FOOTNOTE_RE = re.compile(
+    r'\s*\((?:\d+|[ivxlcdm]{1,8})\)\s*$')
+_GB_TRAILING_UNIT_ANNOTATION_RE = re.compile(
+    r'\s*\(\s*(?:\$|usd|u\.?s\.?\s+dollars?)?\s*(?:in\s+)?'
+    r'(?:whole\s+)?(?:thousands?|millions?|billions?|dollars?)\s*\)\s*$', re.I)
+_GB_INVALID_OPERATING_ROW_LABEL_RE = re.compile(
+    r'^(?:average|total|other|operations?|revenue\s*\(expense\))$|'
+    r'^(?:three|six|nine|twelve)\s+months?\s+ended\b|'
+    r'^(?:january|february|march|april|may|june|july|august|september|'
+    r'october|november|december)\s+\d{1,2},?\s+\d{4}$', re.I)
+_GB_ACTIVITY_DRIVER_LABEL_RE = re.compile(
+    r'\b(?:assessments?|fees?|processing|processed|volumes?|transactions?|'
+    r'deposits?|withdrawals?|inflows?|outflows?|assets?|custody|auc|aum|'
+    r'accounts?|users?|customers?|subscribers?|members?|trips?|bookings?|'
+    r'payments?|spend|arpu|mau|dau|wau|ncfa|subscription\s+revenues?|'
+    r'proxy\s+revenues?|other\s+revenues?)\b', re.I)
+_GB_ACTIVITY_STRONG_DRIVER_RE = re.compile(
+    r'\b(?:assessments?|fees?|processing|processed|volumes?|transactions?|'
+    r'deposits?|withdrawals?|inflows?|outflows?|assets?|custody|auc|aum|'
+    r'accounts?|users?|customers?|subscribers?|members?|trips?|bookings?|'
+    r'payments?|spend|arpu|mau|dau|wau|ncfa)\b', re.I)
+_GB_ACTIVITY_ACCOUNTING_NOISE_RE = re.compile(
+    r'\b(?:expenses?|costs?|compensation|overhead|marketing|technology|'
+    r'development|software|cloud|provision|fair\s+value|net\s+income|'
+    r'net\s+loss|sbc|share[- ]based|interest\s+on|interest\s+revenues?)\b',
+    re.I)
+
+
+def _gb_operating_metric_family(label: str) -> str:
+    """Return a generic semantic family used only for source arbitration.
+
+    Beginning/ending/total variants of one rollforward become one family, and
+    gain/loss wording is neutralized.  The original display label is preserved
+    until a proven same-family alias is reconciled before pivoting.
+    """
+    text = re.sub(r'^Operating\s+Measure\s*-\s*', '', str(label or ''), flags=re.I)
+    # Normalize source footnotes and unit captions before forming the identity.
+    # The display/provenance path still retains the original raw source label.
+    text = _gb_row_label(text)
+    text = _GB_BEGINNING_RE.sub(' ', text)
+    text = _GB_ENDING_RE.sub(' ', text)
+    text = re.sub(r'^\s*total\s+', ' ', text, flags=re.I)
+    text = re.sub(
+        r'\bgains?\s*\(\s*losses?\s*\)|\blosses?\s*\(\s*gains?\s*\)',
+        ' gain loss ', text, flags=re.I)
+    text = re.sub(r'\b(?:gains?|losses?)\b', ' gain loss ', text, flags=re.I)
+    text = re.sub(r'\b(?:balance|amount)\b', ' ', text, flags=re.I)
+    return re.sub(r'[^a-z0-9]+', ' ', text.casefold()).strip()
+
+
+def _gb_neutral_gain_loss_label(label: str) -> str:
+    """Create a stable display label for alternating gain/loss row wording."""
+    text = str(label or '')
+    if not re.search(r'\b(?:gains?|losses?)\b', text, re.I):
+        return text
+    combined = re.compile(
+        r'\bgains?\s*\(\s*losses?\s*\)|'
+        r'\blosses?\s*\(\s*gains?\s*\)', re.I)
+    if combined.search(text):
+        return combined.sub('gains (losses)', text, count=1)
+    return re.sub(
+        r'\b(?:gains?|losses?)\b', 'gains (losses)', text,
+        count=1, flags=re.I)
+
+
+def _gb_operating_table_role(normalized: pd.DataFrame, value_header: str,
+                             context: str = '') -> str:
+    """Classify table geometry from generic accounting structure."""
+    labels = []
+    if normalized is not None and not normalized.empty:
+        labels = [_gb_row_label(v) for v in normalized.iloc[:, 0].tolist()]
+        labels = [v for v in labels if v]
+    has_begin = any(_GB_BEGINNING_RE.search(label) for label in labels)
+    has_end = any(_GB_ENDING_RE.search(label) for label in labels)
+    if has_begin and has_end:
+        return 'rollforward'
+    if _GB_SNAPSHOT_CONTEXT_RE.search(_gb_clean_text(context)):
+        return 'snapshot'
+    balance_total = any(
+        str(label).strip().casefold().startswith('total ')
+        and _GB_BALANCE_LIKE_RE.search(label)
+        for label in labels
+    )
+    explicit_flows = sum(bool(_GB_FLOW_RE.search(label)) for label in labels)
+    if balance_total and len(labels) >= 3 and explicit_flows == 0:
+        return 'snapshot'
+    if _GB_SNAPSHOT_HEADER_RE.search(str(value_header or '')):
+        return 'snapshot'
+    if _GB_DURATION_HEADER_RE.search(str(value_header or '')):
+        return 'activity'
+    return 'unknown'
+
+
+def _gb_infer_operating_row_semantics(label: str, value_header: str,
+                                      table_role: str, phase: str | None):
+    """Return ``(basis, confidence, next_phase)`` for one admitted money row."""
+    text = _gb_clean_text(label)
+    next_phase = phase
+    if _GB_AVERAGE_RE.search(text):
+        return _GB_BASIS_AVERAGE, 0.99, next_phase
+    if _GB_RATIO_RE.search(text):
+        return _GB_BASIS_RATIO, 0.99, next_phase
+    if _GB_BEGINNING_RE.search(text):
+        return _GB_BASIS_INSTANT_START, 0.995, 'movements'
+    if _GB_ENDING_RE.search(text):
+        return _GB_BASIS_INSTANT_END, 0.995, 'ending'
+    # A table proven to be a point-in-time composition overrides incidental
+    # words such as "sales" inside an asset-class name.
+    if table_role == 'snapshot':
+        return _GB_BASIS_INSTANT_END, 0.96, next_phase
+    if _GB_FLOW_RE.search(text):
+        return _GB_BASIS_DURATION_FLOW, 0.97, next_phase
+    if table_role == 'rollforward':
+        if phase == 'movements':
+            return _GB_BASIS_DURATION_FLOW, 0.90, next_phase
+        if phase == 'ending':
+            return _GB_BASIS_INSTANT_END, 0.90, next_phase
+    # Mixed KPI tables often put an ending balance beside period flows under a
+    # generic "Year Ended" header.  A balance-like row remains an instant.
+    if _GB_BALANCE_LIKE_RE.search(text):
+        return _GB_BASIS_INSTANT_END, 0.90, next_phase
+    if table_role == 'activity' or _GB_DURATION_HEADER_RE.search(str(value_header or '')):
+        return _GB_BASIS_DURATION_FLOW, 0.88, next_phase
+    return _GB_BASIS_UNKNOWN, 0.0, next_phase
+
 
 def _gb_clean_text(value) -> str:
     if value is None:
@@ -5916,7 +6250,10 @@ def _gb_parse_number(value):
         return None, raw
     if '%' in raw:
         return None, raw
-    negative = raw.startswith('(') and raw.endswith(')')
+    # SEC cells often render a currency decorator before the parentheses
+    # (``$(16.9)``) or in a neighboring column.  Parentheses enclosing the
+    # numeric token are authoritative regardless of a leading currency sign.
+    negative = '(' in raw and ')' in raw and raw.find('(') < raw.rfind(')')
     normalized = (raw.replace('$', '').replace('â‚¬', '').replace('Â£', '')
                   .replace(',', '').replace('(', '').replace(')', ''))
     normalized = re.sub(r'(?<=\d)[a-zA-Z]+$', '', normalized)
@@ -5928,6 +6265,13 @@ def _gb_parse_number(value):
     except (TypeError, ValueError):
         return None, raw
     return (-abs(parsed) if negative else parsed), raw
+
+
+def _gb_display_decimal_places(raw_value) -> int:
+    """Return decimal places shown in one rendered SEC numeric cell."""
+    text = _gb_clean_text(raw_value)
+    match = re.search(r'[-+]?\d[\d,]*\.(\d+)', text)
+    return len(match.group(1)) if match else 0
 
 
 def _gb_is_decorator_column(series: pd.Series) -> bool:
@@ -6025,19 +6369,129 @@ def _gb_normalize_table_grid(table: pd.DataFrame, current_year: int) -> pd.DataF
     return df
 
 
-def _gb_detect_scale(context: str, table: pd.DataFrame) -> float:
-    corpus = str(context or '') + ' ' + ' '.join(
-        _gb_flatten_column(column) for column in table.columns)
-    for row in table.head(5).itertuples(index=False, name=None):
-        corpus += ' ' + ' '.join(_gb_clean_text(value) for value in row)
-    lowered = corpus.lower()
-    if re.search(r'\bin\s+billions?\b', lowered):
-        return 1e9
-    if re.search(r'\bin\s+millions?\b', lowered):
-        return 1e6
-    if re.search(r'\bin\s+thousands?\b', lowered):
-        return 1e3
+def _gb_scale_markers(text: str) -> set[float]:
+    """Return every explicit thousands/millions/billions scale in ``text``."""
+    scales = set()
+    for match in _GB_SCALE_MARKER_RE.finditer(str(text or '')):
+        unit = next((group for group in match.groups() if group), '')
+        lowered = unit.casefold()
+        if lowered.startswith('billion'):
+            scales.add(1e9)
+        elif lowered.startswith('million'):
+            scales.add(1e6)
+        elif lowered.startswith('thousand'):
+            scales.add(1e3)
+    return scales
+
+
+def _gb_detect_scale(context: str, table: pd.DataFrame) -> float | None:
+    """Return a homogeneous table scale, or ``None`` for a mixed-unit table.
+
+    Table evidence outranks nearby prose.  Most importantly, conflicting table
+    markers do not resolve to the largest scale: callers must then require a
+    row-local annotation.  With no marker anywhere, displayed values are units.
+    """
+    table_parts = [_gb_flatten_column(column) for column in table.columns]
+    for row in table.head(40).itertuples(index=False, name=None):
+        table_parts.extend(_gb_clean_text(value) for value in row)
+    table_scales = _gb_scale_markers(' '.join(table_parts))
+    if len(table_scales) == 1:
+        return next(iter(table_scales))
+    if len(table_scales) > 1:
+        return None
+
+    context_scales = _gb_scale_markers(str(context or ''))
+    if len(context_scales) == 1:
+        return next(iter(context_scales))
+    if len(context_scales) > 1:
+        return None
     return 1.0
+
+
+def _gb_is_count_metric(label: str) -> bool:
+    text = _gb_clean_text(label)
+    return bool(
+        _GB_COUNT_METRIC_RE.search(text)
+        or _GB_SIMPLE_COUNT_METRIC_RE.fullmatch(text)
+    )
+
+
+def _gb_infer_operating_row_unit(raw_label: str, label: str, row_unit: str,
+                                 table_scale: float | None,
+                                 table_has_money: bool,
+                                 period_has_money: bool):
+    """Infer ``(kind, scale, confidence, evidence)`` for one key-driver row.
+
+    The inference is deliberately fail-closed.  A mixed-unit table (represented
+    by ``table_scale is None``) cannot lend a scale to an unannotated row, and a
+    count row cannot accept a detached currency decorator.  Percentages remain
+    excluded until their display-point versus decimal convention is explicit.
+    """
+    source_text = _gb_clean_text(raw_label)
+    clean_label = _gb_clean_text(label)
+    explicit_scales = _gb_scale_markers(source_text)
+    if len(explicit_scales) > 1:
+        return None
+    explicit_scale = next(iter(explicit_scales)) if explicit_scales else None
+    explicit_dollars = bool(_GB_EXPLICIT_DOLLARS_RE.search(source_text))
+
+    if row_unit == 'percent' or _GB_RATIO_RE.search(clean_label):
+        return None
+
+    if _GB_CURRENCY_PER_UNIT_RE.search(clean_label):
+        unit_kind = 'currency_per_unit'
+        semantic_evidence = 'currency-per-unit-label'
+    elif _GB_PER_UNIT_RE.search(clean_label):
+        unit_kind = 'per_unit'
+        semantic_evidence = 'per-unit-label'
+    elif _gb_is_count_metric(clean_label):
+        if row_unit == 'money':
+            return None
+        unit_kind = 'count'
+        semantic_evidence = 'count-label'
+    elif _GB_MONEY_METRIC_RE.search(clean_label) or row_unit == 'money':
+        unit_kind = 'money'
+        semantic_evidence = 'money-label' if _GB_MONEY_METRIC_RE.search(clean_label) else 'row-currency'
+    elif table_scale is not None and table_has_money and period_has_money:
+        # Homogeneous monetary tables often print a currency decorator on only
+        # the first row.  This fallback preserves that well-established layout.
+        unit_kind = 'money'
+        semantic_evidence = 'homogeneous-money-table'
+    else:
+        return None
+
+    if explicit_scale is not None:
+        scale = explicit_scale
+        scale_evidence = 'row-scale'
+        confidence = 0.99
+    elif explicit_dollars:
+        scale = 1.0
+        scale_evidence = 'row-dollars'
+        confidence = 0.99
+    elif unit_kind in {'currency_per_unit', 'per_unit'}:
+        # Per-unit measures are non-additive displayed units.  Never multiply
+        # them by a money caption inherited from another row.
+        scale = 1.0
+        scale_evidence = 'per-unit-unscaled'
+        confidence = 0.95 if row_unit == 'money' else 0.92
+    elif unit_kind == 'count':
+        if table_scale is None:
+            return None
+        # A monetary-table caption is not evidence that a count is also scaled.
+        if float(table_scale) != 1.0 and table_has_money:
+            return None
+        scale = float(table_scale)
+        scale_evidence = 'homogeneous-count-table'
+        confidence = 0.94
+    else:
+        if table_scale is None:
+            return None
+        scale = float(table_scale)
+        scale_evidence = 'homogeneous-money-scale'
+        confidence = 0.97 if row_unit == 'money' else 0.93
+
+    return unit_kind, float(scale), float(confidence), (
+        f'{semantic_evidence};{scale_evidence}')
 
 
 def _gb_has_money_evidence(context: str, table: pd.DataFrame) -> bool:
@@ -6222,8 +6676,19 @@ def _gb_duration_from_header(header: str, fallback: int) -> int:
 
 def _gb_row_label(value) -> str:
     text = _gb_clean_text(value)
-    text = re.sub(r'\s*\(\d+\)\s*$', '', text).strip()
+    # Markers can appear on either side of a unit annotation and may have no
+    # separating space (``Acquired assets(i)``).  Iterate so both orders clean
+    # up, while preserving meaningful suffixes such as ``(AUC)`` and ``(A)``.
+    previous = None
+    while text and text != previous:
+        previous = text
+        text = _GB_TRAILING_UNIT_ANNOTATION_RE.sub('', text).strip()
+        text = _GB_TRAILING_FOOTNOTE_RE.sub('', text).strip()
     text = re.sub(r'\s+[Â¹Â²Â³â´âµâ¶â·â¸â¹]+$', '', text).strip()
+    # A superscript may itself trail the unit caption; once it is stripped,
+    # make one final bounded pass over the now-exposed annotation/marker.
+    text = _GB_TRAILING_UNIT_ANNOTATION_RE.sub('', text).strip()
+    text = _GB_TRAILING_FOOTNOTE_RE.sub('', text).strip()
     return text
 
 
@@ -6250,7 +6715,8 @@ def _extract_generic_business_breakdown_from_table(
     eligible, default_prefix, base_confidence = _gb_context_class(context)
     if not eligible or table is None or table.empty or len(table.columns) < 2:
         return []
-    if not _gb_has_money_evidence(context, table):
+    table_has_money = _gb_has_money_evidence(context, table)
+    if not table_has_money and default_prefix != 'Operating Measure':
         return []
 
     normalized = _gb_normalize_table_grid(table, current_year)
@@ -6266,18 +6732,25 @@ def _extract_generic_business_breakdown_from_table(
     duration = _gb_duration_from_header(value_header, preferred_duration)
     # Detect unit scale from the original grid because td-only normalization
     # removes header/unit rows before candidate extraction.
-    scale = _gb_detect_scale(context, table)
+    table_scale = _gb_detect_scale(context, table)
     period_has_money = any(
         _gb_row_unit_evidence(row, value_positions) == 'money'
         for row in normalized.itertuples(index=False, name=None)
     )
+    operating_table_role = (
+        _gb_operating_table_role(normalized, value_header, context)
+        if default_prefix == 'Operating Measure' else None
+    )
+    rollforward_phase = None
     active = True
     active_prefix = default_prefix
     candidates = []
     seen_labels = set()
 
     for row in normalized.itertuples(index=False, name=None):
-        label = _gb_row_label(row[0])
+        raw_source_label = _gb_clean_text(row[0])
+        # Capture row scale before removing unit/footnote presentation syntax.
+        label = _gb_row_label(raw_source_label)
         if not label:
             continue
         lowered = label.lower()
@@ -6292,10 +6765,38 @@ def _extract_generic_business_breakdown_from_table(
 
         if not active or value_position >= len(row):
             continue
-        if (lowered.startswith('total ') or lowered.endswith(' - total')
-                or 'consolidated' in lowered):
+
+        period_basis = None
+        basis_confidence = None
+        metric_family = None
+        if active_prefix == 'Operating Measure':
+            if _GB_INVALID_OPERATING_ROW_LABEL_RE.search(label):
+                continue
+            period_basis, basis_confidence, rollforward_phase = (
+                _gb_infer_operating_row_semantics(
+                    label, value_header, operating_table_role, rollforward_phase
+                )
+            )
+            metric_family = _gb_operating_metric_family(label)
+            # Average/per-unit rows are safe once their row-local units are
+            # known and remain direct-period values downstream.  Percentages
+            # still fail closed because point-versus-decimal normalization is
+            # not inferable from every SEC table.
+            if period_basis == _GB_BASIS_RATIO:
+                continue
+
+        # Keep the original segment-total exclusion.  The only exception is an
+        # admitted operating-measure balance/rollforward total, where the total
+        # is the strongest year-end source for an ending snapshot.
+        is_operating_balance_total = (
+            active_prefix == 'Operating Measure'
+            and period_basis == _GB_BASIS_INSTANT_END
+            and bool(_GB_BALANCE_LIKE_RE.search(label))
+        )
+        if ((lowered.startswith('total ') or lowered.endswith(' - total'))
+                and not is_operating_balance_total):
             continue
-        if 'elimination' in lowered:
+        if 'consolidated' in lowered or 'elimination' in lowered:
             continue
         if any(term in lowered for term in _GENERIC_BUSINESS_CORE_ACCOUNTING_LABELS):
             continue
@@ -6306,21 +6807,33 @@ def _extract_generic_business_breakdown_from_table(
         # table scale to that row.
         if row_unit == 'percent':
             continue
-        # Recurring key-driver tables frequently mix dollars with counts.  For
-        # this broad context class, require currency evidence on the row itself
-        # instead of borrowing a "$ in millions" caption from another row.
-        non_monetary_label = bool(
-            _GENERIC_BUSINESS_NON_MONETARY_LABEL_RE.search(label)
-        )
-        if active_prefix == 'Operating Measure' and row_unit != 'money':
-            # SEC tables often print "$" only on the first monetary row.  A
-            # later row may inherit that unit only when the selected period has
-            # direct currency evidence elsewhere and the row label is not a
-            # count/ratio/usage metric.
-            if not period_has_money or non_monetary_label:
+
+        unit_confidence = None
+        unit_evidence = None
+        if active_prefix == 'Operating Measure':
+            unit_spec = _gb_infer_operating_row_unit(
+                raw_source_label, label, row_unit, table_scale,
+                table_has_money, period_has_money,
+            )
+            if unit_spec is None:
                 continue
-        if row_unit != 'money' and non_monetary_label:
-            continue
+            unit_kind, row_scale, unit_confidence, unit_evidence = unit_spec
+        else:
+            # Preserve the original monetary segment/revenue behavior.  A
+            # genuinely mixed scale is now rejected instead of choosing its
+            # largest annotation, while homogeneous MA-style tables are
+            # unchanged.
+            non_monetary_label = bool(
+                _GENERIC_BUSINESS_NON_MONETARY_LABEL_RE.search(label)
+            )
+            if row_unit != 'money' and non_monetary_label:
+                continue
+            if table_scale is None:
+                continue
+            unit_kind = 'money'
+            row_scale = float(table_scale)
+            unit_confidence = 0.99 if row_unit == 'money' else 0.96
+            unit_evidence = 'homogeneous-money-table'
 
         value, raw_value = _gb_coalesced_period_value(row, value_positions)
         if value is None:
@@ -6330,28 +6843,68 @@ def _extract_generic_business_breakdown_from_table(
         if normalized_label in seen_labels:
             continue
         seen_labels.add(normalized_label)
+        scaled_value = float(value) * float(row_scale)
+        nearest_integer = round(scaled_value)
+        if abs(scaled_value - nearest_integer) <= max(
+                1e-6, abs(scaled_value) * 1e-12):
+            scaled_value = float(nearest_integer)
         candidates.append({
             'SourceLabel': label,
+            'RawSourceLabel': raw_source_label,
             'Label': display_label,
-            'Value': float(value) * float(scale),
+            'Value': scaled_value,
             'RawValue': raw_value,
-            'Scale': float(scale),
+            'DisplayDecimals': _gb_display_decimal_places(raw_value),
+            'Scale': float(row_scale),
+            'UnitKind': unit_kind,
+            'UnitConfidence': float(unit_confidence),
+            'UnitEvidence': unit_evidence,
             'Prefix': active_prefix,
             'Confidence': float(base_confidence),
+            'PeriodBasis': period_basis,
+            'BasisConfidence': basis_confidence,
+            'TableRole': operating_table_role,
+            'MetricFamily': metric_family,
             'Duration': int(duration),
             'ValueHeader': value_header,
         })
+
+    if (default_prefix == 'Operating Measure'
+            and operating_table_role not in {'rollforward', 'snapshot'}):
+        # Homogeneous activity tables are admitted only when their row grammar
+        # is made up of operating drivers.  This keeps MA-style assessments /
+        # processing-fee tables, while rejecting expense-note tables that happen
+        # to sit after an earlier "key drivers" sentence.
+        labels = [str(candidate.get('SourceLabel') or '') for candidate in candidates]
+        if any(_GB_ACTIVITY_ACCOUNTING_NOISE_RE.search(label) for label in labels):
+            return []
+        if sum(bool(_GB_ACTIVITY_STRONG_DRIVER_RE.search(label))
+               for label in labels) < 2:
+            return []
+        candidates = [
+            candidate for candidate in candidates
+            if _GB_ACTIVITY_DRIVER_LABEL_RE.search(
+                str(candidate.get('SourceLabel') or ''))
+        ]
 
     # Multiple coherent rows are required.  This is the principal guard against
     # one-off nearby-number matches and unrelated accounting tables.
     return candidates if len(candidates) >= 2 else []
 
 
-def _gb_nearby_table_context(table_tag, max_chars: int = 1800) -> str:
-    """Collect nearby preceding block text without swallowing the whole filing."""
+def _gb_nearby_table_context(table_tag, max_chars: int = 2400) -> str:
+    """Collect the table's DOM section context, including its governing heading.
+
+    Large KPI sections commonly place a composition table between the heading
+    and a rollforward table.  A fixed 1,800-character window loses that heading
+    and rejects the second table.  This walker searches farther for the nearest
+    positive section anchor, while still bounding narrative text and stopping
+    at a conflicting section heading.
+    """
     pieces = []
     seen = set()
     total = 0
+    positive_anchor = ''
     caption = table_tag.find('caption') if hasattr(table_tag, 'find') else None
     if caption is not None:
         text = _gb_clean_text(caption.get_text(' ', strip=True))
@@ -6363,9 +6916,13 @@ def _gb_nearby_table_context(table_tag, max_chars: int = 1800) -> str:
     try:
         previous = table_tag.find_all_previous(
             ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div', 'strong', 'b'],
-            limit=36)
+            limit=120)
     except Exception:
         previous = []
+    bridge_heading_re = re.compile(
+        r'\b(?:rollforward|reconciliation|components?|composition|breakdown|'
+        r'assets?|balances?|holdings?|key\s+(?:drivers?|metrics)|'
+        r'operating\s+metrics|performance\s+metrics)\b', re.I)
     for node in previous:
         try:
             if node.find_parent('table') is not None:
@@ -6377,16 +6934,40 @@ def _gb_nearby_table_context(table_tag, max_chars: int = 1800) -> str:
             text = _gb_clean_text(node.get_text(' ', strip=True))
         except Exception:
             continue
-        if not text or text in seen or len(text) > 1200:
+        if not text or text in seen or len(text) > 1600:
+            continue
+        is_heading = node.name in {'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'strong', 'b'}
+        is_positive = _gb_has_positive_context(text)
+        if is_positive and len(text) <= 500:
+            positive_anchor = text
+            # The nearest qualifying heading governs the table.  Older content
+            # can only contaminate this scope.
+            seen.add(text)
+            pieces.append(text)
+            break
+        elif is_heading and len(text) <= 240:
+            if bridge_heading_re.search(text):
+                # A generic subheading such as "Components of total assets"
+                # may sit between a KPI heading and its second table.
+                seen.add(text)
+                pieces.append(text)
+                total += len(text)
+                continue
+            # Never cross a newer, unrelated heading while searching for a
+            # stale Key Metrics heading elsewhere in the filing.
+            break
+        if total >= max_chars:
+            # Keep walking only to encounter a governing heading; do not add
+            # more narrative text to the classification corpus.
             continue
         seen.add(text)
         pieces.append(text)
         total += len(text)
-        if total >= max_chars:
-            break
     # find_all_previous is nearest-first.  Keep nearest context first because
     # positive/negative gates are based on presence, not narrative ordering.
-    return _gb_clean_text(' '.join(pieces))[:max_chars]
+    # Prepend the anchor so truncation can never discard it.
+    ordered = ([positive_anchor] if positive_anchor else []) + pieces
+    return _gb_clean_text(' '.join(ordered))[:max_chars]
 
 
 def _extract_generic_business_breakdowns_from_textblocks(
@@ -6451,8 +7032,20 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 'Concept': 'HTMLBusinessBreakdown',
                 'FilingUrl': filing_url,
                 'SourceLabel': candidate.get('SourceLabel'),
+                'SourceRawLabel': candidate.get('RawSourceLabel'),
                 'SourceValueHeader': candidate.get('ValueHeader'),
+                'SourceRawValue': candidate.get('RawValue'),
+                'SourceDisplayDecimals': candidate.get('DisplayDecimals'),
                 'SourceConfidence': candidate.get('Confidence'),
+                'SourcePrefix': candidate.get('Prefix'),
+                'SourceUnitKind': candidate.get('UnitKind'),
+                'SourceUnitScale': candidate.get('Scale'),
+                'SourceUnitConfidence': candidate.get('UnitConfidence'),
+                'SourceUnitEvidence': candidate.get('UnitEvidence'),
+                'SourcePeriodBasis': candidate.get('PeriodBasis'),
+                'SourceBasisConfidence': candidate.get('BasisConfidence'),
+                'SourceTableRole': candidate.get('TableRole'),
+                'SourceMetricFamily': candidate.get('MetricFamily'),
                 'SourcePeriodRole': source_period_role,
                 'SourceTableFingerprint': source_table_fingerprint,
                 'SourceGeographicBasis': source_geographic_basis,
@@ -6568,6 +7161,1190 @@ def _gb_close_values(left, right) -> bool:
     return abs(left - right) <= max(1e-6, 1e-9 * max(abs(left), abs(right), 1.0))
 
 
+_GB_STATUS_REPORTED_VERIFIED = 'REPORTED_VERIFIED'
+_GB_STATUS_REPORTED_UNVERIFIED = 'REPORTED_UNVERIFIED'
+_GB_STATUS_DERIVED_VERIFIED = 'DERIVED_VERIFIED'
+_GB_STATUS_CONFLICT = 'CONFLICT'
+_GB_STATUS_QUARANTINED = 'QUARANTINED'
+
+
+def _gb_strip_trailing_footnote_marker(label: str) -> str:
+    """Remove only unambiguous SEC table footnote markers from a row label.
+
+    Roman-numeral/digit markers are presentation metadata, not metric identity.
+    Accounting text such as ``gains (losses)`` is intentionally untouched.
+    """
+    text = re.sub(r'\s+', ' ', str(label or '')).strip()
+    marker = re.compile(
+        r'(?:\s*\((?:[ivxlcdm]+|\d+)\)|\s*\[(?:[ivxlcdm]+|\d+)\]|'
+        r'\s*[\u00b9\u00b2\u00b3\u2070\u2074-\u2079]+)\s*$', re.I)
+    previous = None
+    while text and text != previous:
+        previous = text
+        text = marker.sub('', text).strip()
+    return text
+
+
+def _gb_numeric_or_default(value, default=0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return number if np.isfinite(number) else float(default)
+
+
+def _gb_reported_rounding_radius(row) -> float:
+    """Return the closed-interval rounding radius for a displayed HTML fact."""
+    value = _gb_numeric_or_default(row.get('Value'), 0.0)
+    scale = abs(_gb_numeric_or_default(row.get('SourceUnitScale'), 1.0)) or 1.0
+    decimals = row.get('SourceDisplayDecimals')
+    try:
+        decimals = int(decimals)
+    except (TypeError, ValueError):
+        decimals = None
+    if decimals is None:
+        raw = str(row.get('SourceRawValue') or row.get('SourceValueRaw') or '')
+        match = re.search(r'[-+]?\d[\d,]*\.(\d+)', raw)
+        decimals = len(match.group(1)) if match else 0
+    # A displayed 307.3 "in billions" represents [307.25, 307.35) billion.
+    displayed_radius = 0.5 * scale * (10.0 ** -max(decimals, 0))
+    return max(displayed_radius, 1e-6, abs(value) * 1e-12)
+
+
+def _gb_values_overlap(left_row, right_row) -> bool:
+    """Precision-aware duplicate comparison using displayed rounding intervals."""
+    left = _gb_numeric_or_default(left_row.get('Value'), np.nan)
+    right = _gb_numeric_or_default(right_row.get('Value'), np.nan)
+    if not (np.isfinite(left) and np.isfinite(right)):
+        return False
+    tolerance = _gb_reported_rounding_radius(left_row) + _gb_reported_rounding_radius(right_row)
+    return abs(left - right) <= tolerance
+
+
+# Operating-measure labels change much more often than audited XBRL concepts.
+# Keep the vocabulary deliberately small: these tokens are used only to propose
+# a candidate alias, and reported-value overlap must still prove the identity.
+_GB_ALIAS_PARTICIPANT_TOKENS = {
+    'user', 'customer', 'client', 'member', 'subscriber',
+}
+
+# Gross debt components are deliberately partitioned so a normalized total can
+# sum them exactly once.  Missing discrete-quarter values are normally treated
+# as absent activity, but that is unsafe when the same component has a non-zero
+# cumulative fact covering the quarter and the subtraction baseline is missing.
+# ``build_pivoted_data`` records those known-incomplete cells in DataFrame attrs;
+# the KPI/quality layers then refuse to publish an aggregate that would silently
+# replace the unknown component with zero.
+_DEBT_ISSUED_COMPONENT_LABELS = (
+    'Short-term Debt Issued',
+    'Long-term Debt Issued',
+    'Lines of Credit Issued',
+)
+_DEBT_REPAID_COMPONENT_LABELS = (
+    'Short-term Debt Repaid',
+    'Long-term Debt Repaid',
+    'Lines of Credit Repaid',
+)
+_DEBT_COMPONENT_LABELS = frozenset(
+    _DEBT_ISSUED_COMPONENT_LABELS + _DEBT_REPAID_COMPONENT_LABELS)
+_INCOMPLETE_DEBT_COMPONENT_PERIODS_ATTR = (
+    'incomplete_debt_component_periods')
+_ADDITIVE_CAPEX_DETAIL_PERIODS_ATTR = 'additive_capex_detail_periods'
+_ADDITIVE_CAPEX_TOTALS_ATTR = 'verified_additive_capex_totals'
+_QUALITY_EVIDENCE_ATTRS = (
+    _INCOMPLETE_DEBT_COMPONENT_PERIODS_ATTR,
+    _ADDITIVE_CAPEX_DETAIL_PERIODS_ATTR,
+    _ADDITIVE_CAPEX_TOTALS_ATTR,
+)
+_GB_ALIAS_DOMAIN_TOKENS = {
+    'account', 'assessment', 'asset', 'balance', 'booking', 'cash', 'count',
+    'custody', 'deposit', 'fee', 'holding', 'member', 'payment', 'receivable',
+    'revenue', 'security', 'subscriber', 'transaction', 'user', 'customer',
+    'volume',
+}
+_GB_ALIAS_STOP_TOKENS = {
+    'a', 'an', 'and', 'at', 'by', 'for', 'from', 'in', 'of', 'on', 'or',
+    'primarily', 'approximately', 'the', 'to',
+}
+_GB_ALIAS_SINGULAR = {
+    'accounts': 'account', 'assessments': 'assessment', 'assets': 'asset',
+    'balances': 'balance', 'bookings': 'booking', 'clients': 'client',
+    'cryptocurrencies': 'cryptocurrency', 'customers': 'customer',
+    'deposits': 'deposit', 'fees': 'fee', 'gains': 'gain',
+    'holdings': 'holding', 'losses': 'loss', 'members': 'member',
+    'payments': 'payment', 'receivables': 'receivable', 'revenues': 'revenue',
+    'securities': 'security', 'subscribers': 'subscriber',
+    'transactions': 'transaction', 'users': 'user', 'volumes': 'volume',
+}
+_GB_ALIAS_CONTRADICTION_GROUPS = (
+    ({'gross'}, {'net'}),
+    ({'domestic'}, {'international', 'foreign', 'crossborder'}),
+    ({'current', 'shortterm'}, {'noncurrent', 'longterm'}),
+    ({'active'}, {'inactive'}),
+    ({'paid'}, {'unpaid'}),
+    ({'cash'}, {'noncash'}),
+    ({'organic'}, {'acquired'}),
+    ({'debit'}, {'credit'}),
+)
+
+
+def _gb_alias_singular_token(token: str) -> str:
+    token = str(token or '').casefold()
+    if token in _GB_ALIAS_SINGULAR:
+        return _GB_ALIAS_SINGULAR[token]
+    if len(token) > 4 and token.endswith('ies'):
+        return token[:-3] + 'y'
+    if len(token) > 4 and token.endswith('s') and not token.endswith(('ss', 'us')):
+        return token[:-1]
+    return token
+
+
+def _gb_operating_alias_acronyms(labels) -> dict[str, tuple[str, ...]]:
+    """Learn only acronyms explicitly declared by the issuer in a row label."""
+    result = {}
+    for label in labels:
+        text = re.sub(r'^Operating\s+Measure\s*-\s*', '', str(label or ''), flags=re.I)
+        for match in re.finditer(r'\(([A-Z][A-Z0-9]{1,9})\)', text):
+            acronym = match.group(1).casefold()
+            words = re.findall(r'[A-Za-z0-9]+', text[:match.start()])
+            expansion = None
+            # Match the nearest trailing words whose initials spell the acronym.
+            for start in range(max(0, len(words) - len(acronym) - 4), len(words)):
+                candidate = words[start:]
+                initials = ''.join(word[0] for word in candidate).casefold()
+                if initials == acronym:
+                    expansion = tuple(_gb_alias_singular_token(word) for word in candidate)
+                    break
+            if expansion and len(expansion) >= 2:
+                result[acronym] = expansion
+    return result
+
+
+def _gb_operating_alias_tokens(label: str, acronyms: dict[str, tuple[str, ...]],
+                               participants: bool = False) -> tuple[str, ...]:
+    text = re.sub(r'^Operating\s+Measure\s*-\s*', '', str(label or ''), flags=re.I)
+    text = _gb_strip_trailing_footnote_marker(text)
+    text = re.sub(r'\bcross[\s-]+border\b', ' crossborder ', text, flags=re.I)
+    text = re.sub(r'\bshort[\s-]+term\b', ' shortterm ', text, flags=re.I)
+    text = re.sub(r'\blong[\s-]+term\b', ' longterm ', text, flags=re.I)
+    text = re.sub(r'\bnon[\s-]+cash\b', ' noncash ', text, flags=re.I)
+    text = re.sub(r'\bnon[\s-]+current\b', ' noncurrent ', text, flags=re.I)
+    text = re.sub(
+        r'\bgains?\s*\(\s*losses?\s*\)|\blosses?\s*\(\s*gains?\s*\)',
+        ' gainloss ', text, flags=re.I)
+    # Parenthetical prose is an explanatory qualifier.  Declared acronyms are
+    # expanded from the unparenthesized acronym used by the companion label.
+    text = re.sub(r'\([^)]*\)', ' ', text)
+    text = _GB_BEGINNING_RE.sub(' ', text)
+    text = _GB_ENDING_RE.sub(' ', text)
+    text = re.sub(r'\btotal\b', ' ', text, flags=re.I)
+    raw_tokens = re.findall(r'[a-z0-9]+', text.casefold())
+    expanded = []
+    for token in raw_tokens:
+        if token in acronyms:
+            expanded.extend(acronyms[token])
+        else:
+            expanded.append(_gb_alias_singular_token(token))
+    normalized = []
+    for token in expanded:
+        if token in _GB_ALIAS_STOP_TOKENS:
+            continue
+        if token in {'gain', 'loss'}:
+            token = 'gainloss'
+        if participants and token in _GB_ALIAS_PARTICIPANT_TOKENS:
+            token = 'participant'
+        normalized.append(token)
+    return tuple(normalized)
+
+
+def _gb_operating_alias_relation(left_label: str, right_label: str,
+                                 acronyms: dict[str, tuple[str, ...]]):
+    """Return a bounded semantic relation; reported values remain the proof."""
+    left = _gb_operating_alias_tokens(left_label, acronyms)
+    right = _gb_operating_alias_tokens(right_label, acronyms)
+    if not left or not right:
+        return None
+    left_set, right_set = set(left), set(right)
+
+    for left_group, right_group in _GB_ALIAS_CONTRADICTION_GROUPS:
+        if ((left_set & left_group and right_set & right_group)
+                or (left_set & right_group and right_set & left_group)):
+            return 'restrictive_modifier_conflict'
+
+    left_raw = re.findall(r'[a-z0-9]+', str(left_label or '').casefold())
+    right_raw = re.findall(r'[a-z0-9]+', str(right_label or '').casefold())
+    acronym_used = any(token in acronyms for token in left_raw + right_raw)
+    gain_loss_alternation = (
+        left == right
+        and bool(re.search(r'\b(?:gains?|losses?)\b', left_label, re.I))
+        and bool(re.search(r'\b(?:gains?|losses?)\b', right_label, re.I))
+        and not _normalize_label_key(left_label) == _normalize_label_key(right_label)
+    )
+    if left == right:
+        if gain_loss_alternation:
+            return 'gain_loss_alternation'
+        if acronym_used:
+            return 'declared_acronym'
+        left_no_paren = re.sub(r'\([^)]*\)', ' ', str(left_label or ''))
+        right_no_paren = re.sub(r'\([^)]*\)', ' ', str(right_label or ''))
+        if _normalize_label_key(left_no_paren) == _normalize_label_key(right_no_paren):
+            return 'explanatory_qualifier'
+        return 'lexical_identity'
+
+    left_part = _gb_operating_alias_tokens(left_label, acronyms, participants=True)
+    right_part = _gb_operating_alias_tokens(right_label, acronyms, participants=True)
+    if left_part == right_part and 'participant' in left_part:
+        substantive = set(left_part) - {'participant'}
+        if substantive:
+            return 'participant_synonym'
+
+    # A material noun added with "and" is normally a scope expansion, not a
+    # rename (for example, Options -> Options and futures).
+    if left_set < right_set or right_set < left_set:
+        return 'scope_expansion'
+
+    # A weak rename candidate is admitted only when both labels share a KPI
+    # domain noun.  It later needs at least three exact, distinct overlaps.
+    if left_set & right_set & _GB_ALIAS_DOMAIN_TOKENS:
+        left_has_participant = bool(left_set & _GB_ALIAS_PARTICIPANT_TOKENS)
+        right_has_participant = bool(right_set & _GB_ALIAS_PARTICIPANT_TOKENS)
+        if left_has_participant != right_has_participant:
+            return None
+        return 'value_proven_lineage'
+    return None
+
+
+def _gb_operating_alias_period_key(row):
+    basis = str(row.get('SourcePeriodBasis') or _GB_BASIS_UNKNOWN)
+    try:
+        fy = int(float(row.get('FY')))
+    except (TypeError, ValueError):
+        fy = str(row.get('FY') or '')
+    quarter = str(row.get('Q') or '')
+    end = pd.to_datetime(row.get('End'), errors='coerce')
+    end_key = end.strftime('%Y-%m-%d') if pd.notna(end) else str(row.get('End') or '')
+    if basis in {_GB_BASIS_INSTANT_END, _GB_BASIS_INSTANT_START}:
+        return fy, quarter, end_key, basis
+    return fy, quarter, _gb_fact_period_key(row)[2], end_key, basis
+
+
+def _gb_alias_has_reported_precision(row) -> bool:
+    try:
+        scale = float(row.get('SourceUnitScale'))
+        decimals = int(float(row.get('SourceDisplayDecimals')))
+    except (TypeError, ValueError):
+        return False
+    return np.isfinite(scale) and scale > 0 and decimals >= 0
+
+
+def _gb_alias_values_match(left_row, right_row) -> bool:
+    # A missing decimal count must not turn a billion-scale row into an implicit
+    # +/- $500 million interval.  Fall back to strict normalized-value equality.
+    if (_gb_alias_has_reported_precision(left_row)
+            and _gb_alias_has_reported_precision(right_row)):
+        return _gb_values_overlap(left_row, right_row)
+    return _gb_close_values(left_row.get('Value'), right_row.get('Value'))
+
+
+def _gb_alias_row_precision(row) -> float:
+    if not _gb_alias_has_reported_precision(row):
+        return float('inf')
+    return _gb_reported_rounding_radius(row)
+
+
+def _gb_alias_best_period_rows(frame: pd.DataFrame) -> dict:
+    result = {}
+    if frame is None or frame.empty:
+        return result
+    eligible = frame.copy()
+    if 'IsCalculated' in eligible.columns:
+        eligible = eligible[~eligible['IsCalculated'].fillna(False).astype(bool)]
+    if 'SourceConflict' in eligible.columns:
+        eligible = eligible[~eligible['SourceConflict'].fillna(False).astype(bool)]
+    if 'SourceVerificationStatus' in eligible.columns:
+        eligible = eligible[~eligible['SourceVerificationStatus'].isin(
+            {_GB_STATUS_CONFLICT, _GB_STATUS_QUARANTINED})]
+    for _, row in eligible.iterrows():
+        key = _gb_operating_alias_period_key(row)
+        filed = pd.to_datetime(row.get('Filed'), errors='coerce')
+        filed_score = int(filed.value) if pd.notna(filed) else -1
+        verified = str(row.get('SourceVerificationStatus') or '') in {
+            _GB_STATUS_REPORTED_VERIFIED, _GB_STATUS_DERIVED_VERIFIED}
+        score = (
+            -_gb_alias_row_precision(row),
+            int(verified),
+            _gb_numeric_or_default(row.get('SourceTrustScore'), 0.0),
+            filed_score,
+        )
+        if key not in result or score > result[key][0]:
+            result[key] = (score, row.copy())
+    return {key: value[1] for key, value in result.items()}
+
+
+def _gb_operating_alias_pair_evidence(left_rows: pd.DataFrame,
+                                      right_rows: pd.DataFrame) -> dict:
+    left_periods = _gb_alias_best_period_rows(left_rows)
+    right_periods = _gb_alias_best_period_rows(right_rows)
+    overlaps = sorted(set(left_periods) & set(right_periods), key=str)
+    matching = exact = conflicts = 0
+    distinct_values = set()
+    supporting_sources = set()
+    matching_periods = []
+    conflicting_periods = []
+    for period in overlaps:
+        left = left_periods[period]
+        right = right_periods[period]
+        if _gb_alias_values_match(left, right):
+            matching += 1
+            matching_periods.append(str(period))
+            if _gb_close_values(left.get('Value'), right.get('Value')):
+                exact += 1
+            try:
+                distinct_values.add(round((float(left['Value']) + float(right['Value'])) / 2.0, 6))
+            except (TypeError, ValueError):
+                pass
+            left_accession = str(left.get('Accession') or '')
+            right_accession = str(right.get('Accession') or '')
+            if left_accession and right_accession:
+                supporting_sources.add((left_accession, right_accession))
+        else:
+            conflicts += 1
+            conflicting_periods.append(str(period))
+
+    def _source_tables(frame):
+        tables = set()
+        if {'Accession', 'SourceTableFingerprint'}.issubset(frame.columns):
+            for accession, fingerprint in zip(
+                    frame['Accession'].fillna('').astype(str),
+                    frame['SourceTableFingerprint'].fillna('').astype(str)):
+                if accession and fingerprint:
+                    tables.add((accession, fingerprint))
+        return tables
+
+    return {
+        'overlap': len(overlaps),
+        'matching': matching,
+        'exact': exact,
+        'conflicts': conflicts,
+        'distinct': len(distinct_values),
+        'supporting_sources': len(supporting_sources),
+        'matching_periods': '|'.join(matching_periods),
+        'conflicting_periods': '|'.join(conflicting_periods),
+        'same_source_table': bool(_source_tables(left_rows) & _source_tables(right_rows)),
+    }
+
+
+def _gb_operating_alias_canonical_label(labels, rows_by_label, basis) -> str:
+    def _score(label):
+        rows = rows_by_label[label]
+        filed = pd.to_datetime(rows.get('Filed', pd.Series(dtype=object)), errors='coerce')
+        end = pd.to_datetime(rows.get('End', pd.Series(dtype=object)), errors='coerce')
+        latest_filed = int(filed.max().value) if filed.notna().any() else -1
+        latest_end = int(end.max().value) if end.notna().any() else -1
+        coverage = len(_gb_alias_best_period_rows(rows))
+        role_bonus = int(
+            (basis == _GB_BASIS_INSTANT_END and bool(_GB_ENDING_RE.search(label)))
+            or (basis == _GB_BASIS_INSTANT_START and bool(_GB_BEGINNING_RE.search(label)))
+        )
+        tokens = _gb_operating_alias_tokens(label, {})
+        phrase_bonus = int(len(tokens) > 1)
+        return latest_filed, latest_end, role_bonus, coverage, phrase_bonus, len(label), label.casefold()
+    return max(sorted(labels), key=_score)
+
+
+def _gb_consolidate_operating_metric_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """Stitch only source-proven operating-measure rename lineages.
+
+    A label match proposes an alias; compatible units/basis and matching direct
+    reported values prove it.  Missing quarters are filled only by relabeling an
+    existing source fact.  No interpolation, backfill, or value derivation occurs.
+    """
+    required = {'Category', 'Label', 'Concept', 'SourcePrefix', 'Value',
+                'SourcePeriodBasis', 'SourceUnitKind'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    mask = (
+        out['Category'].eq(OPERATING_METRICS_CATEGORY)
+        & out['Concept'].eq(_HTML_BUSINESS_CONCEPT)
+        & out['SourcePrefix'].eq('Operating Measure')
+    )
+    if not mask.any():
+        return out
+
+    if 'SourceOriginalLabel' not in out.columns:
+        out['SourceOriginalLabel'] = pd.Series(None, index=out.index, dtype=object)
+    out.loc[mask & out['SourceOriginalLabel'].isna(), 'SourceOriginalLabel'] = out.loc[mask, 'Label']
+    for column in ('SourceAliasVerified', 'SourceAliasPreferred'):
+        if column not in out.columns:
+            out[column] = False
+    for column in ('SourceAliasGroupId', 'SourceAliasCanonicalLabel',
+                   'SourceAliasRule', 'SourceAliasEvidence'):
+        if column not in out.columns:
+            out[column] = pd.Series(None, index=out.index, dtype=object)
+    for column in ('SourceAliasOverlapPeriods', 'SourceAliasExactPeriods',
+                   'SourceAliasConflictPeriods'):
+        if column not in out.columns:
+            out[column] = np.nan
+    if 'SourceCanonicalizedFrom' not in out.columns:
+        out['SourceCanonicalizedFrom'] = pd.Series(None, index=out.index, dtype=object)
+
+    operating = out.loc[mask].copy()
+    labels = sorted(operating['Label'].dropna().astype(str).unique())
+    acronyms = _gb_operating_alias_acronyms(labels)
+    decisions = []
+    accepted_edges = []
+    evidence_cache = {}
+    rows_by_label = {label: operating[operating['Label'].eq(label)].copy() for label in labels}
+
+    # Hard identity aspects are grouping keys, not soft scores.
+    hard_groups = defaultdict(list)
+    for label, rows in rows_by_label.items():
+        for (basis, unit_kind, dimension), part in rows.groupby(
+                ['SourcePeriodBasis', 'SourceUnitKind',
+                 rows.get('DimensionSignature', pd.Series('', index=rows.index)).fillna('').astype(str)],
+                dropna=False, sort=False):
+            basis = str(basis or '')
+            unit_kind = str(unit_kind or '')
+            if not basis or basis == _GB_BASIS_UNKNOWN or not unit_kind:
+                continue
+            hard_groups[(basis, unit_kind, str(dimension or ''))].append((label, part.copy()))
+
+    relation_rank = {
+        'declared_acronym': 5, 'explanatory_qualifier': 5,
+        'lexical_identity': 4, 'gain_loss_alternation': 4,
+        'participant_synonym': 3, 'value_proven_lineage': 2,
+    }
+    for (basis, unit_kind, dimension), entries in hard_groups.items():
+        # One label can enter a hard group once; combine defensively if a malformed
+        # input repeats it under the same aspects.
+        grouped_entries = {}
+        for label, part in entries:
+            grouped_entries[label] = pd.concat(
+                [grouped_entries[label], part]) if label in grouped_entries else part
+        group_labels = sorted(grouped_entries)
+        for left_pos, left_label in enumerate(group_labels):
+            for right_label in group_labels[left_pos + 1:]:
+                relation = _gb_operating_alias_relation(left_label, right_label, acronyms)
+                if relation is None:
+                    continue
+                evidence = _gb_operating_alias_pair_evidence(
+                    grouped_entries[left_label], grouped_entries[right_label])
+                evidence_cache[(left_label, right_label, basis, unit_kind, dimension)] = evidence
+                decision = 'REJECTED'
+                reason = 'insufficient_independent_overlap'
+                approved = False
+                if evidence['conflicts']:
+                    reason = 'conflicting_reported_overlap'
+                elif evidence['same_source_table']:
+                    reason = 'distinct_rows_coexist_in_same_source_table'
+                elif relation in {'restrictive_modifier_conflict', 'scope_expansion'}:
+                    reason = relation
+                elif relation == 'gain_loss_alternation':
+                    approved = True
+                elif relation in {'declared_acronym', 'explanatory_qualifier', 'lexical_identity'}:
+                    approved = evidence['matching'] >= 1 and evidence['distinct'] >= 1
+                elif relation == 'participant_synonym':
+                    approved = (
+                        evidence['matching'] >= 2 and evidence['distinct'] >= 2
+                        and evidence['supporting_sources'] >= 2)
+                elif relation == 'value_proven_lineage':
+                    approved = (
+                        evidence['matching'] >= 3 and evidence['exact'] >= 3
+                        and evidence['distinct'] >= 3)
+                if approved:
+                    decision = 'MERGED'
+                    reason = 'all_comparable_reported_periods_match'
+                    accepted_edges.append({
+                        'left': left_label, 'right': right_label, 'basis': basis,
+                        'unit_kind': unit_kind, 'dimension': dimension,
+                        'relation': relation, 'evidence': evidence,
+                        'rank': relation_rank.get(relation, 0),
+                    })
+                decisions.append({
+                    'CanonicalLabel': '', 'LeftLabel': left_label,
+                    'RightLabel': right_label, 'Decision': decision,
+                    'Rule': relation, 'PeriodBasis': basis, 'UnitKind': unit_kind,
+                    'DimensionSignature': dimension,
+                    'OverlapPeriods': evidence['overlap'],
+                    'MatchingPeriods': evidence['matching'],
+                    'ExactPeriods': evidence['exact'],
+                    'ConflictingPeriods': evidence['conflicts'],
+                    'DistinctMatchingValues': evidence['distinct'],
+                    'IndependentSourcePairs': evidence['supporting_sources'],
+                    'SameSourceTable': evidence['same_source_table'],
+                    'MatchingPeriodKeys': evidence['matching_periods'],
+                    'ConflictingPeriodKeys': evidence['conflicting_periods'],
+                    'Reason': reason,
+                })
+
+    parent = {label: label for label in labels}
+
+    def _find(label):
+        while parent[label] != label:
+            parent[label] = parent[parent[label]]
+            label = parent[label]
+        return label
+
+    def _members(root):
+        return {label for label in labels if _find(label) == root}
+
+    # Strongest evidence is considered first.  Before joining two components,
+    # every already-overlapping cross-pair must be conflict-free.  This permits
+    # a declared acronym -> proven rename chain but blocks A~B~C when A conflicts C.
+    accepted_edges.sort(key=lambda edge: (
+        edge['rank'], edge['evidence']['matching'], edge['evidence']['exact'],
+        edge['left'], edge['right']), reverse=True)
+    for edge in accepted_edges:
+        left_root, right_root = _find(edge['left']), _find(edge['right'])
+        if left_root == right_root:
+            continue
+        left_members, right_members = _members(left_root), _members(right_root)
+        blocked = False
+        for left_label in left_members:
+            for right_label in right_members:
+                left_rows = rows_by_label[left_label]
+                right_rows = rows_by_label[right_label]
+                # The edge's hard group already proves basis/unit/dimension for
+                # its endpoints.  Cross-component rows must share at least one
+                # compatible hard aspect; otherwise the clusters stay separate.
+                compatible_pairs = []
+                for (left_basis, left_unit), left_part in left_rows.groupby(
+                        ['SourcePeriodBasis', 'SourceUnitKind'], dropna=False):
+                    right_part = right_rows[
+                        right_rows['SourcePeriodBasis'].eq(left_basis)
+                        & right_rows['SourceUnitKind'].eq(left_unit)]
+                    if not right_part.empty:
+                        compatible_pairs.append((left_part, right_part))
+                if not compatible_pairs:
+                    blocked = True
+                    break
+                if any(_gb_operating_alias_pair_evidence(lp, rp)['conflicts']
+                       for lp, rp in compatible_pairs):
+                    blocked = True
+                    break
+            if blocked:
+                break
+        if blocked:
+            for decision in decisions:
+                if (decision['LeftLabel'], decision['RightLabel']) == (
+                        edge['left'], edge['right']) and decision['Decision'] == 'MERGED':
+                    decision['Decision'] = 'REJECTED'
+                    decision['Reason'] = 'transitive_cluster_conflict'
+            continue
+        parent[right_root] = left_root
+
+    components = defaultdict(set)
+    for label in labels:
+        components[_find(label)].add(label)
+
+    merged_clusters = 0
+    for component_labels in components.values():
+        if len(component_labels) < 2:
+            continue
+        component_rows = operating[operating['Label'].isin(component_labels)]
+        basis_values = component_rows['SourcePeriodBasis'].dropna().astype(str).unique()
+        if len(basis_values) != 1:
+            continue
+        basis = basis_values[0]
+        canonical = _gb_operating_alias_canonical_label(
+            component_labels, rows_by_label, basis)
+        cluster_edges = [edge for edge in accepted_edges
+                         if edge['left'] in component_labels and edge['right'] in component_labels]
+        if any(edge['relation'] == 'gain_loss_alternation' for edge in cluster_edges):
+            combined_labels = [
+                label for label in component_labels
+                if re.search(
+                    r'\bgains?\s*\(\s*losses?\s*\)|'
+                    r'\blosses?\s*\(\s*gains?\s*\)', label, re.I)
+            ]
+            if combined_labels:
+                canonical = _gb_operating_alias_canonical_label(
+                    combined_labels, rows_by_label, basis)
+            else:
+                canonical = _gb_neutral_gain_loss_label(canonical)
+        group_id = hashlib.sha1('|'.join(sorted(component_labels)).encode('utf-8')).hexdigest()[:12]
+        evidence_text = '; '.join(sorted({
+            f"{edge['relation']}:{edge['evidence']['matching']}/"
+            f"{edge['evidence']['overlap']} overlaps"
+            for edge in cluster_edges
+        }))
+        max_overlap = max((edge['evidence']['matching'] for edge in cluster_edges), default=0)
+        max_exact = max((edge['evidence']['exact'] for edge in cluster_edges), default=0)
+        component_idx = component_rows.index
+        out.loc[component_idx, 'SourceAliasVerified'] = True
+        out.loc[component_idx, 'SourceAliasGroupId'] = group_id
+        out.loc[component_idx, 'SourceAliasCanonicalLabel'] = canonical
+        out.loc[component_idx, 'SourceAliasRule'] = '+'.join(sorted({edge['relation'] for edge in cluster_edges}))
+        out.loc[component_idx, 'SourceAliasEvidence'] = evidence_text
+        out.loc[component_idx, 'SourceAliasOverlapPeriods'] = max_overlap
+        out.loc[component_idx, 'SourceAliasExactPeriods'] = max_exact
+        out.loc[component_idx, 'SourceAliasConflictPeriods'] = 0
+        if 'SourceSemanticVerified' in out.columns:
+            out.loc[component_idx, 'SourceSemanticVerified'] = True
+        if 'SourceTrustScore' in out.columns:
+            current_trust = pd.to_numeric(out.loc[component_idx, 'SourceTrustScore'], errors='coerce').fillna(0.0)
+            out.loc[component_idx, 'SourceTrustScore'] = (current_trust + 0.04).clip(upper=1.0)
+
+        changed_idx = component_rows.index[~component_rows['Label'].eq(canonical)]
+        if len(changed_idx):
+            existing = out.loc[changed_idx, 'SourceCanonicalizedFrom']
+            out.loc[changed_idx, 'SourceCanonicalizedFrom'] = existing.where(
+                existing.notna() & existing.astype(str).str.strip().ne(''),
+                out.loc[changed_idx, 'Label'])
+            out.loc[changed_idx, 'Label'] = canonical
+        canonical_family = _gb_operating_metric_family(canonical)
+        out.loc[component_idx, 'SourceMetricFamily'] = canonical_family
+
+        # Select the most precise compatible direct source for each merged
+        # period.  Later dedup/quarter selection uses this explicit preference.
+        by_period = defaultdict(list)
+        for idx in component_idx:
+            by_period[_gb_operating_alias_period_key(out.loc[idx])].append(idx)
+        for period_indices in by_period.values():
+            def _preference(idx):
+                row = out.loc[idx]
+                filed = pd.to_datetime(row.get('Filed'), errors='coerce')
+                filed_score = int(filed.value) if pd.notna(filed) else -1
+                status = str(row.get('SourceVerificationStatus') or '')
+                return (
+                    int(not bool(row.get('SourceConflict', False))),
+                    int(not bool(row.get('IsCalculated', False))),
+                    -_gb_alias_row_precision(row),
+                    int(status in {_GB_STATUS_REPORTED_VERIFIED, _GB_STATUS_DERIVED_VERIFIED}),
+                    _gb_numeric_or_default(row.get('SourceTrustScore'), 0.0),
+                    filed_score,
+                )
+            preferred = max(period_indices, key=_preference)
+            out.loc[period_indices, 'SourceAliasPreferred'] = False
+            out.at[preferred, 'SourceAliasPreferred'] = True
+
+        for decision in decisions:
+            if (decision['Decision'] == 'MERGED'
+                    and decision['LeftLabel'] in component_labels
+                    and decision['RightLabel'] in component_labels):
+                decision['CanonicalLabel'] = canonical
+        merged_clusters += 1
+
+    if decisions:
+        out.attrs['operating_alias_audit'] = pd.DataFrame(decisions).sort_values(
+            ['Decision', 'CanonicalLabel', 'LeftLabel', 'RightLabel'], kind='stable'
+        ).reset_index(drop=True)
+    if merged_clusters:
+        changed = int(mask.sum() - out.loc[mask, 'Label'].nunique())
+        print(f"  [Operating Alias] Consolidated {merged_clusters} source-proven "
+              f"metric lineage(s); retained every source-backed period.")
+    return out
+
+
+def _gb_prepare_operating_measure_facts(df: pd.DataFrame) -> pd.DataFrame:
+    """Type, reconcile, verify, and score company-defined operating measures.
+
+    The verifier is deliberately company-agnostic.  It uses source-declared
+    units, table grammar, repeated values across filings, and accounting
+    equations.  It never upgrades a value merely because it looks plausible.
+    """
+    required = {'Concept', 'SourcePrefix', 'Label', 'Value'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    is_html_operating = (
+        out['Concept'].eq(_HTML_BUSINESS_CONCEPT)
+        & out['SourcePrefix'].eq('Operating Measure')
+    )
+
+    # Revalidate whole activity tables here as well as at extraction time.  It
+    # makes old caches safe after parser upgrades and prevents one surviving
+    # row from an otherwise rejected accounting-note table from leaking into
+    # the pivot.
+    activity_rows = out.loc[is_html_operating].copy()
+    table_keys = [key for key in ('Accession', 'SourceTableFingerprint')
+                  if key in activity_rows.columns]
+    rejected_activity_indices = []
+    if table_keys:
+        for _, table_group in activity_rows.groupby(
+                table_keys, dropna=False, sort=False):
+            roles = set(table_group.get(
+                'SourceTableRole', pd.Series('', index=table_group.index)
+            ).fillna('').astype(str))
+            if roles & {'rollforward', 'snapshot'}:
+                continue
+            source_labels = table_group.get(
+                'SourceLabel', table_group['Label']).fillna('').astype(str)
+            if (source_labels.map(
+                    lambda label: bool(_GB_ACTIVITY_ACCOUNTING_NOISE_RE.search(label))).any()
+                    or source_labels.map(
+                        lambda label: bool(_GB_ACTIVITY_STRONG_DRIVER_RE.search(label))).sum() < 2
+                    or source_labels.map(
+                        lambda label: bool(_GB_ACTIVITY_DRIVER_LABEL_RE.search(label))).sum() < 2):
+                rejected_activity_indices.extend(table_group.index.tolist())
+    if rejected_activity_indices:
+        out = out.drop(index=rejected_activity_indices)
+        is_html_operating = (
+            out['Concept'].eq(_HTML_BUSINESS_CONCEPT)
+            & out['SourcePrefix'].eq('Operating Measure')
+        )
+
+    if not is_html_operating.any():
+        return out
+
+    # Verification metadata belongs to company-defined operating measures.
+    # Preserve any provenance already attached to every other fact instead of
+    # silently replacing the selection inputs used by the three statements,
+    # segments, disclosures, and concentration tables.
+    for column in (
+            'SourceTrustScore', 'SourceRollforwardResidual',
+            'SourceRollforwardErrorPct'):
+        if column not in out.columns:
+            out[column] = np.nan
+    for column in (
+            'SourceVerificationStatus', 'SourceConflict',
+            'SourceSemanticVerified', 'SourceRollforwardVerified',
+            'SourceCompositionVerified'):
+        if column not in out.columns:
+            out[column] = pd.Series(None, index=out.index, dtype=object)
+        elif out[column].dtype != object:
+            out[column] = out[column].astype(object)
+
+    if 'IsCalculated' in out.columns:
+        calculated = out.loc[is_html_operating, 'IsCalculated'].fillna(False).astype(bool)
+    else:
+        calculated = pd.Series(False, index=out.index[is_html_operating])
+    out.loc[is_html_operating, 'SourceTrustScore'] = np.where(
+        calculated, 0.68, 0.90).astype(float)
+    out.loc[is_html_operating, 'SourceVerificationStatus'] = np.where(
+        calculated, _GB_STATUS_DERIVED_VERIFIED,
+        _GB_STATUS_REPORTED_UNVERIFIED)
+    out.loc[is_html_operating, 'SourceConflict'] = False
+    out.loc[is_html_operating, 'SourceSemanticVerified'] = False
+    out.loc[is_html_operating, 'SourceRollforwardVerified'] = False
+    out.loc[is_html_operating, 'SourceCompositionVerified'] = False
+    out.loc[is_html_operating, 'SourceRollforwardResidual'] = np.nan
+    out.loc[is_html_operating, 'SourceRollforwardErrorPct'] = np.nan
+
+    # Operating measures have different algebra from reportable segments and
+    # must never be subjected to segment sparsity or subtotal cleanup.
+    out.loc[is_html_operating, 'Category'] = OPERATING_METRICS_CATEGORY
+    cleaned_labels = out.loc[is_html_operating, 'Label'].map(_gb_strip_trailing_footnote_marker)
+    out.loc[is_html_operating, 'Label'] = cleaned_labels
+    out.loc[is_html_operating, 'SourceMetricFamily'] = cleaned_labels.map(
+        _gb_operating_metric_family)
+
+    # Remove binary floating tails introduced by multiplying displayed table
+    # values by their scale; this does not round genuinely fractional metrics.
+    numeric_values = pd.to_numeric(out.loc[is_html_operating, 'Value'], errors='coerce')
+    nearest = numeric_values.round(0)
+    tail_mask = (numeric_values - nearest).abs() <= np.maximum(
+        1e-6, numeric_values.abs() * 1e-12)
+    out.loc[numeric_values.index[tail_mask], 'Value'] = nearest[tail_mask]
+
+    operating = out.loc[is_html_operating].copy()
+    if 'SourcePeriodBasis' not in operating.columns:
+        operating['SourcePeriodBasis'] = _GB_BASIS_UNKNOWN
+        out['SourcePeriodBasis'] = out.get('SourcePeriodBasis', _GB_BASIS_UNKNOWN)
+
+    # Promote implicit "activity" rows to snapshots only after the same family
+    # agrees with an explicit ending/snapshot row in at least two distinct
+    # periods.  This corrects tables headed "Three Months Ended" whose rows are
+    # nevertheless point-in-time balances, without touching explicit flows.
+    for family, family_group in operating.groupby('SourceMetricFamily', sort=False):
+        if not str(family or '').strip():
+            continue
+        instant = family_group[
+            family_group['SourcePeriodBasis'].eq(_GB_BASIS_INSTANT_END)]
+        suspect = family_group[
+            family_group['SourcePeriodBasis'].eq(_GB_BASIS_DURATION_FLOW)
+            & ~family_group['Label'].astype(str).map(lambda value: bool(_GB_FLOW_RE.search(value)))
+        ]
+        if instant.empty or suspect.empty:
+            continue
+        matched_periods = set()
+        for suspect_idx, suspect_row in suspect.iterrows():
+            peers = instant
+            for key in ('FY', 'Q', 'End'):
+                if key in peers.columns and key in suspect_row.index and pd.notna(suspect_row.get(key)):
+                    peers = peers[peers[key].astype(str).eq(str(suspect_row.get(key)))]
+            if any(_gb_values_overlap(suspect_row, peer) for _, peer in peers.iterrows()):
+                matched_periods.add((str(suspect_row.get('FY')), str(suspect_row.get('Q'))))
+        if len(matched_periods) >= 2:
+            promoted_idx = suspect.index
+            out.loc[promoted_idx, 'SourcePeriodBasis'] = _GB_BASIS_INSTANT_END
+            out.loc[promoted_idx, 'SourceBasisConfidence'] = np.maximum(
+                pd.to_numeric(out.loc[promoted_idx, 'SourceBasisConfidence'], errors='coerce').fillna(0.0),
+                0.985,
+            )
+            out.loc[promoted_idx, 'SourceSemanticVerified'] = True
+
+    operating = out.loc[is_html_operating].copy()
+
+    # Detect non-overlapping duplicates within the same semantic fact identity.
+    conflict_keys = [key for key in (
+        'SourceMetricFamily', 'SourcePeriodBasis', 'FY', 'Q', 'End', 'Duration',
+        'SourceUnitKind', 'SourceUnitSignature') if key in operating.columns]
+    if conflict_keys:
+        for _, candidates in operating.groupby(conflict_keys, dropna=False, sort=False):
+            if len(candidates) < 2:
+                continue
+            rows = [row for _, row in candidates.iterrows()]
+            anchor = rows[0]
+            if any(not _gb_values_overlap(anchor, row) for row in rows[1:]):
+                out.loc[candidates.index, 'SourceConflict'] = True
+
+    # Verify rollforward tables: opening + each distinct signed movement = closing.
+    roll_keys = [key for key in ('Accession', 'SourceTableFingerprint', 'FY', 'Q')
+                 if key in operating.columns]
+    if roll_keys:
+        for _, table_group in operating.groupby(roll_keys, dropna=False, sort=False):
+            starts = table_group[table_group['SourcePeriodBasis'].eq(_GB_BASIS_INSTANT_START)]
+            endings = table_group[table_group['SourcePeriodBasis'].eq(_GB_BASIS_INSTANT_END)]
+            movements = table_group[table_group['SourcePeriodBasis'].eq(_GB_BASIS_DURATION_FLOW)]
+            if starts.empty or endings.empty or movements.empty:
+                continue
+            verified_any = False
+            best_residual = None
+            best_scale = None
+            for family, ending_family in endings.groupby('SourceMetricFamily', sort=False):
+                opening_family = starts[starts['SourceMetricFamily'].eq(family)]
+                if opening_family.empty:
+                    continue
+                opening = opening_family.sort_values('SourceBasisConfidence', ascending=False).iloc[0]
+                closing = ending_family.sort_values('SourceBasisConfidence', ascending=False).iloc[0]
+                # Repeated comparative parses are one source, not extra movements.
+                dedup_columns = [key for key in ('SourceMetricFamily', 'Label', 'Value')
+                                 if key in movements.columns]
+                unique_movements = movements.drop_duplicates(dedup_columns, keep='first')
+                expected = float(opening['Value']) + pd.to_numeric(
+                    unique_movements['Value'], errors='coerce').dropna().sum()
+                residual = float(closing['Value']) - expected
+                tolerance = (
+                    _gb_reported_rounding_radius(opening)
+                    + _gb_reported_rounding_radius(closing)
+                    + sum(_gb_reported_rounding_radius(row)
+                          for _, row in unique_movements.iterrows())
+                )
+                scale = max(abs(float(opening['Value'])), abs(float(closing['Value'])), 1.0)
+                if best_residual is None or abs(residual) < abs(best_residual):
+                    best_residual, best_scale = residual, scale
+                if abs(residual) <= tolerance:
+                    verified_any = True
+            if best_residual is not None:
+                out.loc[table_group.index, 'SourceRollforwardResidual'] = best_residual
+                out.loc[table_group.index, 'SourceRollforwardErrorPct'] = (
+                    abs(best_residual) / max(best_scale or 1.0, 1.0) * 100.0)
+            if verified_any:
+                out.loc[table_group.index, 'SourceRollforwardVerified'] = True
+
+    # Verify point-in-time composition tables when one total and at least two
+    # components are present.  A failed/incomplete equation remains visible in
+    # the audit sidecar and is never silently labelled verified.
+    operating = out.loc[is_html_operating].copy()
+    snapshot_keys = [key for key in ('Accession', 'SourceTableFingerprint', 'FY', 'Q')
+                     if key in operating.columns]
+    if snapshot_keys:
+        for _, table_group in operating.groupby(snapshot_keys, dropna=False, sort=False):
+            snapshots = table_group[
+                table_group['SourcePeriodBasis'].eq(_GB_BASIS_INSTANT_END)]
+            if len(snapshots) < 3:
+                continue
+            total_mask = snapshots['Label'].astype(str).str.contains(
+                r'\b(?:total|ending|closing)\b', case=False, regex=True)
+            totals = snapshots[total_mask]
+            if totals.empty:
+                continue
+            total = totals.loc[pd.to_numeric(totals['Value'], errors='coerce').abs().idxmax()]
+            components = snapshots.drop(index=totals.index).drop_duplicates(
+                [key for key in ('SourceMetricFamily', 'Value') if key in snapshots.columns],
+                keep='first')
+            if len(components) < 2:
+                continue
+            component_sum = pd.to_numeric(components['Value'], errors='coerce').dropna().sum()
+            residual = float(total['Value']) - float(component_sum)
+            tolerance = _gb_reported_rounding_radius(total) + sum(
+                _gb_reported_rounding_radius(row) for _, row in components.iterrows())
+            if abs(residual) <= tolerance:
+                out.loc[table_group.index, 'SourceCompositionVerified'] = True
+
+    # Transparent quality status and a bounded trust score.  Equation failure
+    # lowers confidence; an actual duplicate conflict is a hard blocker.
+    op_idx = out.index[is_html_operating]
+    source_conf = pd.to_numeric(out.get(
+        'SourceConfidence', pd.Series(0.82, index=out.index)).loc[op_idx],
+        errors='coerce').fillna(0.82)
+    basis_conf = pd.to_numeric(out.get(
+        'SourceBasisConfidence', pd.Series(0.0, index=out.index)).loc[op_idx],
+        errors='coerce').fillna(0.0)
+    if 'SourceUnitConfidence' in out.columns:
+        unit_conf = pd.to_numeric(out.loc[op_idx, 'SourceUnitConfidence'], errors='coerce').fillna(0.0)
+    else:
+        unit_conf = out.loc[op_idx].get(
+            'SourceUnitKind', pd.Series('', index=op_idx)).fillna('').astype(str).str.strip().ne('').astype(float) * 0.8
+    trust = (0.45 * source_conf + 0.35 * basis_conf + 0.20 * unit_conf).clip(0.0, 1.0)
+    trust += out.loc[op_idx, 'SourceSemanticVerified'].astype(float) * 0.04
+    equation_verified = (
+        out.loc[op_idx, 'SourceRollforwardVerified'].astype(bool)
+        | out.loc[op_idx, 'SourceCompositionVerified'].astype(bool))
+    trust += equation_verified.astype(float) * 0.08
+    trust = trust.clip(0.0, 1.0)
+    conflicts = out.loc[op_idx, 'SourceConflict'].astype(bool)
+    trust.loc[conflicts] = np.minimum(trust.loc[conflicts], 0.35)
+    out.loc[op_idx, 'SourceTrustScore'] = trust
+    out.loc[op_idx, 'SourceVerificationStatus'] = _GB_STATUS_REPORTED_UNVERIFIED
+    out.loc[equation_verified.index[equation_verified], 'SourceVerificationStatus'] = _GB_STATUS_REPORTED_VERIFIED
+    out.loc[conflicts.index[conflicts], 'SourceVerificationStatus'] = _GB_STATUS_CONFLICT
+    return out
+
+
+def _gb_fact_audit_from_selected_rows(final_df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Build a human-auditable ledger for every selected output cell."""
+    if final_df is None or final_df.empty:
+        return pd.DataFrame()
+    audit = final_df.copy()
+    audit.insert(0, 'Ticker', str(ticker or '').upper())
+    preferred = [
+        'Ticker', 'Category', 'Label', 'Period', 'Value', 'SourceReportedValue',
+        'SourceVerificationStatus', 'SourceTrustScore', 'SourceConflict',
+        'SourceSemanticVerified', 'SourceRollforwardVerified',
+        'SourceCompositionVerified', 'SourceRollforwardResidual',
+        'SourceRollforwardErrorPct', 'SourceDerivation', 'SourcePeriodBasis',
+        'SourcePeriodRole', 'SourceUnitKind', 'SourceUnitScale',
+        'SourceUnitSignature', 'SourceUnitEvidence', 'SourceUnitConfidence',
+        'SourceDisplayDecimals', 'SourceRawValue', 'Concept', 'FY', 'Q',
+        'Start', 'End', 'Duration', 'DimensionSignature', 'DimCount', 'Form',
+        'Filed', 'Accession', 'FilingUrl', 'SourceTableFingerprint',
+        'SourceLabel', 'SourceValueHeader', 'SourceTableRole',
+        'SourceMetricFamily', 'SourceOriginalLabel', 'SourceCanonicalizedFrom',
+        'SourceAliasVerified', 'SourceAliasPreferred', 'SourceAliasGroupId',
+        'SourceAliasCanonicalLabel', 'SourceAliasRule', 'SourceAliasEvidence',
+        'SourceAliasOverlapPeriods', 'SourceAliasExactPeriods',
+        'SourceAliasConflictPeriods', 'IsCalculated', 'TagRank',
+    ]
+    columns = [column for column in preferred if column in audit.columns]
+    extras = [column for column in audit.columns if column not in columns
+              and not str(column).startswith('_')]
+    return audit[columns + extras].sort_values(
+        [column for column in ('Category', 'Label', 'Period', 'Filed')
+         if column in audit.columns],
+        ascending=[True, True, False, False][:
+            len([column for column in ('Category', 'Label', 'Period', 'Filed')
+                 if column in audit.columns])],
+        kind='stable',
+    ).reset_index(drop=True)
+
+
+def _source_period_dates_from_audit(audit: pd.DataFrame) -> dict[str, str]:
+    """Recover display dates introduced by operating-measure source rows."""
+    result = {}
+    required = {'Category', 'Period', 'End'}
+    if audit is None or audit.empty or not required.issubset(audit.columns):
+        return result
+    work = audit.loc[
+        audit['Category'].eq(OPERATING_METRICS_CATEGORY),
+        ['Period', 'End'],
+    ].copy()
+    if work.empty:
+        return result
+    work['_EndDate'] = pd.to_datetime(work['End'], errors='coerce')
+    work = work[work['_EndDate'].notna()]
+    for period, group in work.groupby('Period', sort=False):
+        if not re.fullmatch(r'\d{4}-Q[1-4]', str(period)):
+            continue
+        # The mode handles repeated source facts; latest date breaks a rare tie.
+        counts = group['_EndDate'].value_counts()
+        if counts.empty:
+            continue
+        max_count = counts.max()
+        chosen = max(date for date, count in counts.items() if count == max_count)
+        result[str(period)] = chosen.strftime('%m/%d/%y')
+    return result
+
+
+def _gb_add_operating_integrity_checks(
+        pivot: pd.DataFrame, audit: pd.DataFrame) -> pd.DataFrame:
+    """Publish transparent per-period operating-measure quality diagnostics."""
+    if pivot is None or pivot.empty or audit is None or audit.empty:
+        return pivot
+    if not {'Category', 'Period'}.issubset(audit.columns):
+        return pivot
+    operating = audit[audit['Category'].eq(OPERATING_METRICS_CATEGORY)].copy()
+    if operating.empty:
+        return pivot
+    result = pivot.copy()
+    for period, period_rows in operating.groupby('Period', sort=False):
+        if period not in result.columns:
+            continue
+        statuses = period_rows.get(
+            'SourceVerificationStatus',
+            pd.Series(_GB_STATUS_REPORTED_UNVERIFIED, index=period_rows.index),
+        ).fillna(_GB_STATUS_REPORTED_UNVERIFIED).astype(str)
+        conflicts = statuses.eq(_GB_STATUS_CONFLICT) | period_rows.get(
+            'SourceConflict', pd.Series(False, index=period_rows.index)
+        ).fillna(False).astype(bool)
+        verified = statuses.isin({
+            _GB_STATUS_REPORTED_VERIFIED, _GB_STATUS_DERIVED_VERIFIED})
+        trust = pd.to_numeric(period_rows.get(
+            'SourceTrustScore', pd.Series(np.nan, index=period_rows.index)),
+            errors='coerce')
+        equation_attempted = period_rows.get(
+            'SourceRollforwardErrorPct', pd.Series(np.nan, index=period_rows.index)
+        ).notna()
+        if conflicts.any():
+            verified_flag = 0.0
+        elif verified.any():
+            verified_flag = 1.0
+        elif equation_attempted.any():
+            verified_flag = 0.0
+        else:
+            verified_flag = np.nan
+        result.at[('8_Integrity_Checks', 'Metric: Operating Measures Verified'), period] = verified_flag
+        result.at[('8_Integrity_Checks', 'Metric: Operating Measure Rows Sourced'), period] = float(len(period_rows))
+        result.at[('8_Integrity_Checks', 'Metric: Operating Measure Equation Coverage %'), period] = (
+            float(verified.sum()) / max(len(period_rows), 1) * 100.0)
+        result.at[('8_Integrity_Checks', 'Metric: Operating Measure Source Confidence %'), period] = (
+            float(trust.mean() * 100.0) if trust.notna().any() else np.nan)
+        result.at[('8_Integrity_Checks', 'Metric: Operating Measure Conflicts'), period] = float(conflicts.sum())
+        errors = pd.to_numeric(period_rows.get(
+            'SourceRollforwardErrorPct', pd.Series(np.nan, index=period_rows.index)),
+            errors='coerce').dropna()
+        if not errors.empty:
+            result.at[('8_Integrity_Checks', 'Metric: Operating Measure Rollforward Error %'), period] = float(errors.max())
+    return result
+
+
+def _eligible_output_source_periods(df: pd.DataFrame) -> set[tuple[int, str]]:
+    """Return fiscal quarters anchored by at least one direct, real-period fact."""
+    periods = set()
+    if df is None or df.empty or not {'FY', 'Q'}.issubset(df.columns):
+        return periods
+    direct = df.copy()
+    if 'IsCalculated' in direct.columns:
+        direct = direct[~direct['IsCalculated'].fillna(False).astype(bool)]
+    if {'Concept', 'DimCount'}.issubset(direct.columns):
+        cover = (
+            direct['Concept'].eq('EntityCommonStockSharesOutstanding')
+            & pd.to_numeric(direct['DimCount'], errors='coerce').fillna(0).gt(0)
+        )
+        direct = direct[~cover]
+    if 'End' in direct.columns:
+        direct = direct[pd.to_datetime(direct['End'], errors='coerce').notna()]
+    for fy, quarter in zip(direct['FY'], direct['Q']):
+        try:
+            quarter = str(quarter)
+            if quarter in {'Q1', 'Q2', 'Q3', 'Q4'}:
+                periods.add((int(fy), quarter))
+        except (TypeError, ValueError):
+            continue
+    return periods
+
+
+
+def _gb_reconcile_operating_metric_identities(df: pd.DataFrame) -> pd.DataFrame:
+    """Backward-compatible entry point for the evidence-based alias system."""
+    return _gb_consolidate_operating_metric_aliases(df)
+
+
+def _gb_group_operating_period_basis(group: pd.DataFrame):
+    """Resolve one high-confidence basis for an HTML operating series."""
+    required = {'Concept', 'SourcePrefix', 'SourcePeriodBasis'}
+    if group is None or group.empty or not required.issubset(group.columns):
+        return None
+    subset = group[
+        group['Concept'].eq(_HTML_BUSINESS_CONCEPT)
+        & group['SourcePrefix'].eq('Operating Measure')
+        & group['SourcePeriodBasis'].notna()
+    ].copy()
+    if subset.empty:
+        return None
+    subset = subset[~subset['SourcePeriodBasis'].isin({'', _GB_BASIS_UNKNOWN})]
+    if subset.empty:
+        return _GB_BASIS_UNKNOWN
+    if 'SourceBasisConfidence' in subset.columns:
+        subset['_GBConf'] = pd.to_numeric(
+            subset['SourceBasisConfidence'], errors='coerce').fillna(0.0)
+    else:
+        subset['_GBConf'] = 0.0
+    summary = subset.groupby('SourcePeriodBasis').agg(
+        count=('SourcePeriodBasis', 'size'), confidence=('_GBConf', 'max'))
+    summary = summary.sort_values(['count', 'confidence'], ascending=[False, False])
+    top_basis = str(summary.index[0])
+    top_count = int(summary.iloc[0]['count'])
+    top_conf = float(summary.iloc[0]['confidence'])
+    if len(summary) == 1:
+        return top_basis if top_conf >= 0.80 else _GB_BASIS_UNKNOWN
+    second_count = int(summary.iloc[1]['count'])
+    second_conf = float(summary.iloc[1]['confidence'])
+    # Explicit high-confidence evidence may resolve a minority low-confidence
+    # conflict; otherwise fail closed and keep direct quarterly facts only.
+    if top_conf >= 0.97 and (top_count > second_count or top_conf - second_conf >= 0.15):
+        return top_basis
+    return _GB_BASIS_UNKNOWN
+
+
+def _gb_group_metric_family(group: pd.DataFrame):
+    if group is None or group.empty or 'SourceMetricFamily' not in group.columns:
+        return None
+    values = {
+        re.sub(r'[^a-z0-9]+', ' ', str(value).casefold()).strip()
+        for value in group['SourceMetricFamily'].dropna().tolist()
+        if str(value).strip()
+    }
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _gb_previous_quarter(fy, q_label):
+    try:
+        fy = int(fy)
+    except (TypeError, ValueError):
+        return None
+    return {
+        'Q1': (fy - 1, 'Q4'),
+        'Q2': (fy, 'Q1'),
+        'Q3': (fy, 'Q2'),
+        'Q4': (fy, 'Q3'),
+    }.get(str(q_label))
+
+
+def _gb_previous_operating_end_fact(df: pd.DataFrame, category: str,
+                                    family: str, fy, q_label):
+    """Return the preceding quarter's directly sourced ending balance."""
+    previous = _gb_previous_quarter(fy, q_label)
+    required = {'Category', 'SourcePeriodBasis', 'SourceMetricFamily',
+                'FY', 'Q', 'Value'}
+    if previous is None or df is None or df.empty or not required.issubset(df.columns):
+        return None
+    prev_fy, prev_q = previous
+    normalized_family = re.sub(r'[^a-z0-9]+', ' ', str(family).casefold()).strip()
+    families = df['SourceMetricFamily'].fillna('').astype(str).map(
+        lambda value: re.sub(r'[^a-z0-9]+', ' ', value.casefold()).strip())
+    mask = (
+        df['Category'].eq(category)
+        & df['SourcePeriodBasis'].eq(_GB_BASIS_INSTANT_END)
+        & families.eq(normalized_family)
+        & pd.to_numeric(df['FY'], errors='coerce').eq(int(prev_fy))
+        & df['Q'].astype(str).eq(prev_q)
+    )
+    candidates = df.loc[mask].copy()
+    if candidates.empty:
+        return None
+    sort_cols, ascending = [], []
+    if '_Filed_dt' in candidates.columns:
+        sort_cols.append('_Filed_dt'); ascending.append(False)
+    if 'SourceBasisConfidence' in candidates.columns:
+        candidates['_GBConf'] = pd.to_numeric(
+            candidates['SourceBasisConfidence'], errors='coerce').fillna(0.0)
+        sort_cols.append('_GBConf'); ascending.append(False)
+    if 'IsCalculated' in candidates.columns:
+        sort_cols.append('IsCalculated'); ascending.append(True)
+    if 'TagRank' in candidates.columns:
+        sort_cols.append('TagRank'); ascending.append(True)
+    if sort_cols:
+        candidates = candidates.sort_values(sort_cols, ascending=ascending)
+    row = candidates.iloc[0].copy()
+    value = pd.to_numeric(pd.Series([row.get('Value')]), errors='coerce').iloc[0]
+    if pd.isna(value):
+        return None
+    return float(value), row
+
+
 def _gb_clean_member_footnote(member: str) -> str:
     text = re.sub(r'\s+', ' ', str(member or '')).strip()
     # SEC table footnote markers are often flattened into labels as a trailing
@@ -6585,6 +8362,12 @@ def _gb_normalized_display_parts(label: str):
 def _gb_route_html_business_fact(fact: dict) -> dict:
     """Route proven geographic HTML revenue members before segment cleanup."""
     routed = dict(fact)
+    if routed.get('SourcePrefix') == 'Operating Measure':
+        routed['Category'] = OPERATING_METRICS_CATEGORY
+        routed['Label'] = _gb_strip_trailing_footnote_marker(routed.get('Label'))
+        routed['SourceMetricFamily'] = _gb_operating_metric_family(
+            routed.get('Label'))
+        return routed
     metric, member = _split_segment_display_label(routed.get('Label'))
     member = _gb_clean_member_footnote(member)
     if not member or _normalize_label_key(metric) != 'revenue':
@@ -6870,6 +8653,7 @@ def _reconcile_html_business_breakdown_facts(all_facts):
         '1_Income_Statement', '4a_Segments_Business',
         '4b_Segments_Geographic_Regions',
         '4c_Segments_Geographic_Countries', '4d_Segments_Cross_Tabulated',
+        OPERATING_METRICS_CATEGORY,
     }
     for fact in all_facts:
         if fact.get('Concept') == _HTML_BUSINESS_CONCEPT:
@@ -7014,6 +8798,16 @@ def extract_from_filing(filing, ye_month, ticker=None, use_arelle=False):
         return _extract_from_filing_impl(filing, ye_month, ticker=ticker, use_arelle=use_arelle)
 
 
+def _fact_period_matches_statement_category(category, start_dt):
+    """Reject duration/activity facts from balance-sheet line items.
+
+    A balance sheet reports an instant.  Cash-flow changes, acquisition activity,
+    and other duration facts can have deceptively similar concept names, but they
+    are not ending balances and must never compete with instant facts.
+    """
+    return category != '2_Balance_Sheet' or pd.isna(start_dt)
+
+
 def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
     # Resolve lazy filing metadata once and retain the original fallback path.
     _filing_meta = _get_filing_local_metadata(filing)
@@ -7042,7 +8836,6 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
             facts_df = xbrl.facts.to_dataframe()
         _profile_count("xbrl_fact_rows", len(facts_df))
         if hasattr(xbrl, 'calculation_trees'):
-            resolve_custom_tags(xbrl.calculation_trees)
             with _ProfileTimer("augment_facts_with_calculations"):
                 facts_df = augment_facts_with_calculations(facts_df, xbrl.calculation_trees)
     except Exception as e:
@@ -7053,23 +8846,21 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
     #     presentation linkbase, so no face line item is ever dropped. ---
     try:
         with _ProfileTimer("learn_statement_concepts"):
-            _n_learned = learn_statement_concepts(xbrl)
+            (_n_learned, _tag_to_labels,
+             _tag_rank_lookup) = _learn_and_snapshot_statement_concepts(xbrl)
         if _n_learned:
             print(f"  [FaceStmt] Registered/merged {_n_learned} face-statement concept(s)")
     except Exception as _e:
         print(f"  Warning: face-statement concept learning failed: {_e}")
-
-    # Per-filing snapshot of CONCEPT_MAP as a reverse map (tag -> [labels]).
-    # 1) O(1) lookup per fact instead of scanning every label per row.
-    # 2) Thread-safe: learners in parallel workers add NEW keys to
-    #    CONCEPT_MAP; iterating the live dict per row could raise
-    #    'dictionary changed size during iteration'.
-    _tag_to_labels = {}
-    _tag_rank_lookup = {}
-    for _lbl, _info in list(CONCEPT_MAP.items()):
-        for _rank, _t in enumerate(_info.get('tags', [])):
-            _tag_to_labels.setdefault(_t, []).append(_lbl)
-            _tag_rank_lookup[(_lbl, _t)] = _rank
+        # Fail closed with a consistent snapshot even if one filing's dynamic
+        # learning path raised unexpectedly.
+        with _CONCEPT_LEARN_LOCK:
+            _tag_to_labels = {}
+            _tag_rank_lookup = {}
+            for _lbl, _info in list(CONCEPT_MAP.items()):
+                for _rank, _t in enumerate(_info.get('tags', [])):
+                    _tag_to_labels.setdefault(_t, []).append(_lbl)
+                    _tag_rank_lookup[(_lbl, _t)] = _rank
 
     extracted = []
     with _ProfileTimer("extract_prepare_columns"):
@@ -7313,6 +9104,8 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
         for target_label in target_labels:
             info = CONCEPT_MAP[target_label]
             if is_consolidated_fact:
+                if not _fact_period_matches_statement_category(info['cat'], _start_dt):
+                    continue
                 rank = _tag_rank_lookup.get((target_label, concept), 999)
                 if end_str is None:
                     end_str = end_dt.strftime('%Y-%m-%d')
@@ -9151,6 +10944,23 @@ def _neutralize_taxonomy_poisoning(df):
         bv = abs(g_best['Value']) if pd.notna(g_best['Value']) else 0.0
         if bv <= 0:
             continue
+        # This guard is for undimensioned statement-face facts.  A dimensional
+        # disclosure can legitimately use a more specific, higher-rank concept
+        # under the same member; dropping it caused broad interest income to
+        # replace securities-lending interest.
+        if (not g['Category'].isin({
+                '1_Income_Statement', '2_Balance_Sheet', '3_Cash_Flow'}).all()
+                or not pd.to_numeric(
+                    g.get('DimCount', pd.Series(0, index=g.index)),
+                    errors='coerce').fillna(0).eq(0).all()):
+            continue
+
+        # Preserve cumulative candidates.  A lower-valued annual/YTD concept
+        # can be the exact scope needed to pair with the filer-used YTD/annual
+        # concept; deleting it here forces a later cross-scope subtraction.
+        # Direct-quarter component poisoning remains covered by this guard.
+        if float(_key[2]) >= 150:
+            continue
         losers = g[(g['TagRank'] > min_rank)
                    & (g['Concept'] != g_best['Concept'])
                    & (g['Value'].abs() < 0.6 * bv)]
@@ -9239,6 +11049,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     if df.empty: return pd.DataFrame()
     df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
     df = df.dropna(subset=['Value'])
+    df = _gb_prepare_operating_measure_facts(df)
     def normalize_segment_label(label):
         parts = label.split(' - ')
         if len(parts) > 1:
@@ -9267,6 +11078,13 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df = _detect_and_merge_renamed_segments(df)
     df = _merge_concurrent_member_variants(df)
     df = _consolidate_geographic_alias_facts(df)
+    df = _gb_reconcile_operating_metric_identities(df)
+    # Keep the audit separately.  A DataFrame stored inside ``DataFrame.attrs``
+    # makes pandas concat attempt element-wise DataFrame equality when it
+    # reconciles attrs from the operating/non-operating slices, which raises
+    # ``ValueError: truth value of a DataFrame is ambiguous``.
+    _operating_alias_audit = df.attrs.pop(
+        'operating_alias_audit', pd.DataFrame())
 
     df['_End_dt'] = pd.to_datetime(df['End'], errors='coerce')
     df['_Filed_dt'] = pd.to_datetime(df['Filed'], errors='coerce')
@@ -9281,7 +11099,44 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df.loc[is_seg & df['DimCount'].eq(0), '_DimSort'] = 100
     
     df = _neutralize_taxonomy_poisoning(df)
-    df = df.sort_values(['Label', 'End', 'Duration', '_Filed_dt', '_IsCalcSort', 'TagRank', '_DimSort'], ascending=[True, True, True, False, True, True, True])
+    df['_TrustSort'] = pd.to_numeric(
+        df.get('SourceTrustScore', pd.Series(0.0, index=df.index)), errors='coerce'
+    ).fillna(0.0)
+    df['_AliasPreferredSort'] = df.get(
+        'SourceAliasPreferred', pd.Series(False, index=df.index)
+    ).fillna(False).astype(bool).astype('int8')
+
+    def _operating_fact_mask(frame):
+        category = frame.get(
+            'Category', pd.Series('', index=frame.index)).fillna('').astype(str)
+        source_prefix = frame.get(
+            'SourcePrefix', pd.Series('', index=frame.index)).fillna('').astype(str)
+        return category.eq(OPERATING_METRICS_CATEGORY) | source_prefix.eq(
+            'Operating Measure')
+
+    def _sort_fact_candidates(frame):
+        """Use trust arbitration only for operating-measure candidates.
+
+        All other categories retain the historical ordering that produced the
+        trusted statements, segment tables, and disclosures.
+        """
+        operating_mask = _operating_fact_mask(frame)
+        non_operating = frame.loc[~operating_mask].sort_values(
+            ['Label', 'End', 'Duration', '_Filed_dt', '_IsCalcSort',
+             'TagRank', '_DimSort'],
+            ascending=[True, True, True, False, True, True, True])
+        operating = frame.loc[operating_mask].sort_values(
+            ['Category', 'Label', 'End', 'Duration', '_AliasPreferredSort',
+             '_TrustSort', '_Filed_dt', '_IsCalcSort', 'TagRank', '_DimSort'],
+            ascending=[True, True, True, True, False, False, False, True,
+                       True, True])
+        if non_operating.empty:
+            return operating
+        if operating.empty:
+            return non_operating
+        return pd.concat([non_operating, operating], axis=0)
+
+    df = _sort_fact_candidates(df)
 
     if 'Depreciation & Amortization' in df['Label'].values:
         total_tags = {
@@ -9382,9 +11237,11 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                     # data merely because its taxonomy name is not yet classified.
                     new_da_rows.append(f_group.sort_values(['_Filed_dt', 'TagRank'], ascending=[False, True]).iloc[0])
         df = pd.concat([df[~da_mask], pd.DataFrame(new_da_rows)])
-        df = df.sort_values(['Label', 'End', 'Duration', '_Filed_dt', '_IsCalcSort', 'TagRank', '_DimSort'], ascending=[True, True, True, False, True, True, True])
+        df = _sort_fact_candidates(df)
 
-    df = df.drop(columns=[c for c in ['_End_dt', '_FilingDelay', '_DimSort', '_IsCalcSort'] if c in df.columns])
+    df = df.drop(columns=[c for c in [
+        '_End_dt', '_FilingDelay', '_DimSort', '_IsCalcSort',
+        '_AliasPreferredSort'] if c in df.columns])
     df = _presplit_segment_era_facts(df)
 
     # =========================================================================
@@ -9413,6 +11270,24 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         key: sorted(set(float(v) for v in values))
         for key, values in df.loc[_cf_ann_mask].groupby(['Label', 'FY'], sort=False)['Value']
     }
+    _cf_annual_by_concept = {
+        key: sorted(set(float(v) for v in values))
+        for key, values in df.loc[_cf_ann_mask].groupby(
+            ['Label', 'FY', 'Concept'], sort=False, dropna=False)['Value']
+    }
+    _cf_annual_rows_by_concept = {}
+    for key, annual_rows in df.loc[_cf_ann_mask].groupby(
+            ['Label', 'FY', 'Concept'], sort=False, dropna=False):
+        records = []
+        seen_values = set()
+        for _, annual_row in annual_rows.sort_values(
+                '_Filed_dt', ascending=False).iterrows():
+            annual_value = float(annual_row['Value'])
+            if annual_value in seen_values:
+                continue
+            seen_values.add(annual_value)
+            records.append((annual_value, annual_row.copy()))
+        _cf_annual_rows_by_concept[key] = records
 
     # (A-IS) Snapshot ALL annual income-statement REVENUE values before dedup.
     # A later restatement that moves a business to discontinued operations
@@ -9435,6 +11310,35 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     _is_annual_all = {
         key: sorted(set(float(v) for v in values))
         for key, values in df.loc[_is_ann_mask].groupby(['Label', 'FY'], sort=False)['Value']
+    }
+    _is_annual_rows = {}
+    for key, annual_rows in df.loc[_is_ann_mask].groupby(
+            ['Label', 'FY'], sort=False):
+        records = []
+        seen_values = set()
+        for _, annual_row in annual_rows.sort_values(
+                '_Filed_dt', ascending=False).iterrows():
+            annual_value = float(annual_row['Value'])
+            if annual_value in seen_values:
+                continue
+            seen_values.add(annual_value)
+            records.append((annual_value, annual_row.copy()))
+        _is_annual_rows[key] = records
+
+    # Preserve annual restatement variants for every category before the
+    # latest-filed dedup below collapses them.  Exact-concept YTD/annual
+    # subtraction may trust a filed YTD over mismatched direct quarters, but it
+    # must not combine that YTD with a materially restated annual context.
+    _all_ann_mask = (
+        (df['Duration'] >= 315)
+        & (df['Duration'] <= 415)
+        & (df['Q'] == 'Q4')
+    )
+    _annual_values_by_concept = {
+        key: sorted(set(float(v) for v in values))
+        for key, values in df.loc[_all_ann_mask].groupby(
+            ['Category', 'Label', 'FY', 'Concept'],
+            sort=False, dropna=False)['Value']
     }
     # (B) Circularity-aware dedup
     # Step 1: Compute per-quarter-deduplicated quarterly sums.
@@ -9501,8 +11405,25 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     if _rows_to_drop:
         df = df.drop(index=_rows_to_drop)
 
-    # CRITICAL: Keep 'first' after sorting by _Filed_dt DESCENDING ensures Latest Filing Wins (Restatement Priority)
-    df = df.drop_duplicates(subset=['Label', 'End', 'Duration'], keep='first')
+    # Operating measures need their source-declared unit, period basis, and
+    # dimensional aspects preserved until verification.  The established
+    # Label/End/Duration identity remains authoritative for every other output
+    # section so this feature cannot change statement or disclosure winners.
+    _dedup_aspects = [key for key in (
+        'Category', 'Label', 'End', 'Duration', 'FY', 'Q', 'SourcePeriodBasis',
+        'SourceUnitKind', 'SourceUnitSignature', 'DimensionSignature', 'Concept')
+        if key in df.columns]
+    _operating_mask = _operating_fact_mask(df)
+    _non_operating_source = df.loc[~_operating_mask]
+    # Distinct concepts are derivation candidates, not duplicate output rows.
+    # Preserve them internally for direct quarters as well as cumulative facts:
+    # an exact-concept H1-Q1 calculation may otherwise lose the Q1 candidate
+    # simply because a later filing supplied a same-label zero under another tag.
+    _non_operating_facts = _non_operating_source.drop_duplicates(
+        subset=['Label', 'End', 'Duration', 'Concept'], keep='first')
+    _operating_facts = df.loc[_operating_mask].drop_duplicates(
+        subset=_dedup_aspects, keep='first')
+    df = pd.concat([_non_operating_facts, _operating_facts], axis=0)
 
     # --- Pre-pivot Label Unification ---
     # Merge renamed segments/line-items BEFORE the derivation loop. This ensures that
@@ -9587,7 +11508,30 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         
     df['Label'] = df['Label'].apply(_apply_rename)
 
+    # Preserve the complete historical fiscal-period set for the established
+    # quarterly derivation pipeline.  Operating continuity uses a narrower
+    # direct-source set below, but that validation must never suppress a
+    # statement, segment, disclosure, or derived Q4 quarter globally.
+    _source_periods = set()
+    if {'FY', 'Q'}.issubset(df.columns):
+        for _fy, _q in zip(df['FY'], df['Q']):
+            try:
+                _quarter = str(_q)
+                if _quarter in {'Q1', 'Q2', 'Q3', 'Q4'}:
+                    _source_periods.add((int(_fy), _quarter))
+            except (TypeError, ValueError):
+                continue
+    _operating_source_periods = _eligible_output_source_periods(
+        df.loc[_operating_fact_mask(df)])
+
+    # Historically non-operating facts sharing a label were reconciled in one
+    # Label/FY group.  Keep that behavior, while separating operating metrics
+    # by category so their stronger aspect-aware arbitration remains isolated.
+    df['_OperatingGroupCategory'] = np.where(
+        _operating_fact_mask(df), df['Category'].fillna('').astype(str), '')
+
     final_rows = []
+    _incomplete_debt_component_periods = set()
 
     # These three helpers and their per-group caches were previously
     # redefined on every loop iteration.  Defined once here, they capture
@@ -9606,6 +11550,20 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         _resolved = resolve_concept_to_label(_concept)
         _concept_resolve_cache[_concept] = _resolved
         return _resolved
+
+    def _exact_subtraction_concept(row):
+        """Return a concrete concept suitable for cumulative subtraction."""
+        if row is None:
+            return None
+        concept = row.get('Concept')
+        if concept is None or pd.isna(concept):
+            return None
+        concept = str(concept).strip()
+        if not concept or concept in {
+            'Calculated', 'HTMLFallback', 'HTMLFallback_Annual',
+        }:
+            return None
+        return concept
 
     def _duration_candidates(q_label, target_dur, max_distance):
         _key = (q_label, target_dur, max_distance)
@@ -9626,7 +11584,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         _duration_filter_cache[_key] = m
         return m
 
-    def get_best_val(q_label, target_dur, max_distance=40, exclude_val=None, concept_filter=None):
+    def get_best_val(q_label, target_dur, max_distance=40, exclude_val=None,
+                     concept_filter=None, exact_concept=False):
         """
             Find the best-matching fact for (q_label, ~target_dur).
 
@@ -9635,7 +11594,9 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             concept aliases during repeated YTD/Q4 derivation probes.
             """
         _exclude_key = None if exclude_val is None else float(exclude_val)
-        _cache_key = (q_label, target_dur, max_distance, _exclude_key, concept_filter)
+        _cache_key = (
+            q_label, target_dur, max_distance, _exclude_key,
+            concept_filter, bool(exact_concept))
         cached_best = _best_val_cache.get(_cache_key)
         if cached_best is not None:
             if cached_best is False:
@@ -9647,7 +11608,12 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             _best_val_cache[_cache_key] = False
             return None
 
-        if concept_filter is not None:
+        if concept_filter is not None and exact_concept:
+            m = m[m['Concept'].eq(concept_filter)]
+            if m.empty:
+                _best_val_cache[_cache_key] = False
+                return None
+        elif concept_filter is not None:
             filter_label = _resolve_concept_cached(concept_filter)
             if filter_label is not None:
                 # Semantic match: accept any concept resolving to same label
@@ -9666,29 +11632,413 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 _best_val_cache[_cache_key] = False
                 return None
 
-        m = m.sort_values(['Dist', '_Filed_dt', 'IsCalculated', 'TagRank'], ascending=[True, False, True, True])
+        # A disputed operating-measure cell is not silently selected.  Prefer a
+        # clean candidate when one exists; otherwise leave the output period
+        # blank and retain the conflict in the quality ledger.
+        if cat == OPERATING_METRICS_CATEGORY and 'SourceConflict' in m.columns:
+            clean = m[~m['SourceConflict'].fillna(False).astype(bool)]
+            if clean.empty:
+                _best_val_cache[_cache_key] = False
+                return None
+            m = clean
+
+        _selection_sort = ['Dist']
+        _selection_ascending = [True]
+        if cat == OPERATING_METRICS_CATEGORY:
+            if 'SourceAliasPreferred' in m.columns:
+                _selection_sort.append('SourceAliasPreferred'); _selection_ascending.append(False)
+            if 'SourceConflict' in m.columns:
+                _selection_sort.append('SourceConflict'); _selection_ascending.append(True)
+            if 'SourceTrustScore' in m.columns:
+                _selection_sort.append('SourceTrustScore'); _selection_ascending.append(False)
+        _selection_sort.extend(['_Filed_dt', 'IsCalculated', 'TagRank'])
+        _selection_ascending.extend([False, True, True])
+        m = m.sort_values(_selection_sort, ascending=_selection_ascending)
         result = (float(m.iloc[0]['Value']), m.iloc[0].copy())
         _best_val_cache[_cache_key] = result
         return result[0], result[1].copy()
-    for (label, fy), group in df.groupby(['Label', 'FY']):
+
+    _CUMULATIVE_ASPECT_FIELDS = (
+        'DimCount', 'DimensionSignature', 'SourceUnitSignature',
+        'SourceUnitKind', 'Unit',
+    )
+
+    def _normalized_aspect_value(value):
+        if value is None or (not isinstance(value, (dict, list, tuple, set))
+                             and pd.isna(value)):
+            return ''
+        if isinstance(value, dict):
+            return json.dumps(value, sort_keys=True, default=str)
+        if isinstance(value, (list, tuple, set)):
+            return json.dumps(sorted(str(item) for item in value))
+        return str(value).strip().casefold()
+
+    def _cumulative_aspects_compatible(left_row, right_row):
+        if left_row is None or right_row is None:
+            return False
+        for field in _CUMULATIVE_ASPECT_FIELDS:
+            left = _normalized_aspect_value(left_row.get(field))
+            right = _normalized_aspect_value(right_row.get(field))
+            if left and right and left != right:
+                return False
+        return True
+
+    def _cumulative_pair_compatible(ytd_row, annual_row):
+        if not _cumulative_aspects_compatible(ytd_row, annual_row):
+            return False
+        ytd_start = pd.to_datetime(ytd_row.get('Start'), errors='coerce')
+        annual_start = pd.to_datetime(annual_row.get('Start'), errors='coerce')
+        return not (
+            pd.notna(ytd_start) and pd.notna(annual_start)
+            and ytd_start.normalize() != annual_start.normalize()
+        )
+
+    def _concepts_have_value_proven_equivalence(left_concept, right_concept):
+        """Require at least two cross-year, aspect-matched exact overlaps."""
+        if (left_concept is None or right_concept is None
+                or left_concept == right_concept):
+            return left_concept == right_concept and left_concept is not None
+
+        family = df[
+            df['Category'].eq(cat) & df['Label'].eq(label)
+            & df['Concept'].isin([left_concept, right_concept])
+        ].copy()
+        left = family[family['Concept'].eq(left_concept)].copy()
+        right = family[family['Concept'].eq(right_concept)].copy()
+        if left.empty or right.empty:
+            return False
+
+        def _context_map(rows):
+            result = {}
+            rows = rows.sort_values('_Filed_dt', ascending=False)
+            for _, source_row in rows.iterrows():
+                context = (
+                    source_row.get('FY'), str(source_row.get('Q') or ''),
+                    str(source_row.get('Start') or ''),
+                    str(source_row.get('End') or ''),
+                    pd.to_numeric(pd.Series([source_row.get('Duration')]),
+                                  errors='coerce').iloc[0],
+                    *(
+                        _normalized_aspect_value(source_row.get(field))
+                        for field in _CUMULATIVE_ASPECT_FIELDS
+                    ),
+                )
+                if context not in result:
+                    result[context] = float(source_row['Value'])
+            return result
+
+        left_values = _context_map(left)
+        right_values = _context_map(right)
+        overlap = sorted(set(left_values).intersection(right_values), key=str)
+        if len(overlap) < 2:
+            return False
+        nonzero_matches = 0
+        for context in overlap:
+            left_value = left_values[context]
+            right_value = right_values[context]
+            scale = max(abs(left_value), abs(right_value))
+            if abs(left_value - right_value) > scale * 0.001 + 1.0:
+                return False
+            if scale > 1.0:
+                nonzero_matches += 1
+        return nonzero_matches >= 2
+
+    def _best_cumulative_pair():
+        """Choose a YTD9/annual pair with exact or value-proven scope."""
+        ytd_candidates = _duration_candidates('Q3', 273, 40)
+        annual_candidates = _duration_candidates('Q4', 365, 50)
+        if ytd_candidates.empty or annual_candidates.empty:
+            return None, None, None, None, False
+
+        ytd_concepts = {
+            _exact_subtraction_concept(row)
+            for _, row in ytd_candidates.iterrows()
+        }
+        annual_concepts = {
+            _exact_subtraction_concept(row)
+            for _, row in annual_candidates.iterrows()
+        }
+        ytd_concepts.discard(None)
+        annual_concepts.discard(None)
+
+        pairs = []
+
+        def _annual_context_has_conflicting_values(annual_value,
+                                                   annual_concept):
+            """Detect materially different restatements of one annual context."""
+            selected_value = float(annual_value[0])
+            peers = _annual_values_by_concept.get(
+                (cat, label, fy, annual_concept), [])
+            for peer_value in peers:
+                scale = max(abs(float(selected_value)), abs(peer_value), 1.0)
+                if abs(float(selected_value) - peer_value) > scale * 0.001 + 1.0:
+                    return True
+            return False
+
+        def _pair_diagnostics(ytd_value, annual_value,
+                              ytd_concept, annual_concept,
+                              allow_exact_direct_mismatch=False):
+            ytd_row, annual_row = ytd_value[1], annual_value[1]
+            if not _cumulative_pair_compatible(ytd_row, annual_row):
+                return None
+            family_concepts = [ytd_concept]
+            if annual_concept != ytd_concept:
+                family_concepts.append(annual_concept)
+            direct_values = {}
+            for quarter in ('Q1', 'Q2', 'Q3'):
+                for concept in family_concepts:
+                    direct = get_best_val(
+                        quarter, 91, 40, concept_filter=concept,
+                        exact_concept=True)
+                    if (direct is not None
+                            and _cumulative_aspects_compatible(
+                                direct[1], ytd_row)):
+                        direct_values[quarter] = direct
+                        break
+            coverage = len(direct_values)
+            if coverage == 3:
+                direct_sum = sum(value[0] for value in direct_values.values())
+                scale = max(abs(float(ytd_value[0])), abs(direct_sum), 1.0)
+                if abs(direct_sum - float(ytd_value[0])) > scale * 0.001 + 1.0:
+                    # A filed same-concept YTD fact remains stronger than a
+                    # synthetic sum assembled across filing vintages.  Keep the
+                    # exact annual/YTD pair as a lower-priority candidate unless
+                    # the selected annual context was itself materially
+                    # restated; in that case the YTD may be on the old basis.
+                    if (not allow_exact_direct_mismatch
+                            or _annual_context_has_conflicting_values(
+                                annual_value, annual_concept)):
+                        return None
+                    reconciliation_tier = 1
+                else:
+                    reconciliation_tier = 0
+            else:
+                reconciliation_tier = 1
+            return reconciliation_tier, coverage
+
+        for concept in sorted(ytd_concepts & annual_concepts):
+            ytd_value = get_best_val(
+                'Q3', 273, 40, concept_filter=concept, exact_concept=True)
+            annual_value = get_best_val(
+                'Q4', 365, 50, concept_filter=concept, exact_concept=True)
+            if ytd_value is not None and annual_value is not None:
+                diagnostics = _pair_diagnostics(
+                    ytd_value, annual_value, concept, concept,
+                    allow_exact_direct_mismatch=True)
+                if diagnostics is not None:
+                    pairs.append((
+                        ytd_value, annual_value, concept, concept, False,
+                        diagnostics[0], diagnostics[1]))
+
+        # If no exact concept spans both periods, accept an alias only after a
+        # same-period, same-duration, non-zero overlap proves 100% equivalence.
+        if not pairs:
+            for ytd_concept in sorted(ytd_concepts):
+                for annual_concept in sorted(annual_concepts):
+                    if not _concepts_have_value_proven_equivalence(
+                            ytd_concept, annual_concept):
+                        continue
+                    ytd_value = get_best_val(
+                        'Q3', 273, 40, concept_filter=ytd_concept,
+                        exact_concept=True)
+                    annual_value = get_best_val(
+                        'Q4', 365, 50, concept_filter=annual_concept,
+                        exact_concept=True)
+                    if ytd_value is not None and annual_value is not None:
+                        diagnostics = _pair_diagnostics(
+                            ytd_value, annual_value,
+                            ytd_concept, annual_concept)
+                        if diagnostics is not None:
+                            pairs.append((
+                                ytd_value, annual_value,
+                                ytd_concept, annual_concept, True,
+                                diagnostics[0], diagnostics[1]))
+
+        if not pairs:
+            return None, None, None, None, False
+
+        def pair_score(item):
+            (ytd_value, annual_value, _, _, alias_verified,
+             reconciliation_tier, coverage) = item
+            ytd_row, annual_row = ytd_value[1], annual_value[1]
+            ytd_filed = pd.to_datetime(
+                ytd_row.get('_Filed_dt'), errors='coerce')
+            annual_filed = pd.to_datetime(
+                annual_row.get('_Filed_dt'), errors='coerce')
+            filed_values = [
+                value.value for value in (ytd_filed, annual_filed)
+                if pd.notna(value)
+            ]
+            filed_floor = min(filed_values) if filed_values else 0
+            return (
+                reconciliation_tier,
+                -coverage,
+                int(alias_verified),
+                abs(float(ytd_row.get('Duration', 273)) - 273)
+                + abs(float(annual_row.get('Duration', 365)) - 365),
+                -filed_floor,
+                int(bool(ytd_row.get('IsCalculated', False)))
+                + int(bool(annual_row.get('IsCalculated', False))),
+                float(ytd_row.get('TagRank', 999))
+                + float(annual_row.get('TagRank', 999)),
+            )
+
+        selected = min(pairs, key=pair_score)
+        return (
+            selected[0], selected[1], selected[2], selected[3], selected[4])
+
+    def _source_date(row, field):
+        if row is None:
+            return pd.NaT
+        return pd.to_datetime(row.get(field), errors='coerce')
+
+    def _valid_discrete_bounds(start, end):
+        start = pd.to_datetime(start, errors='coerce')
+        end = pd.to_datetime(end, errors='coerce')
+        if pd.isna(start) or pd.isna(end) or end < start:
+            return None
+        duration = int((end - start).days)
+        if not 45 <= duration <= 125:
+            return None
+        return start, end
+
+    def _head_remainder_bounds(total_row, tail_row):
+        """Bounds for cumulative total minus a directly filed tail quarter."""
+        if not _cumulative_aspects_compatible(total_row, tail_row):
+            return None
+        total_start = _source_date(total_row, 'Start')
+        total_end = _source_date(total_row, 'End')
+        tail_start = _source_date(tail_row, 'Start')
+        tail_end = _source_date(tail_row, 'End')
+        if (pd.isna(total_start) or pd.isna(total_end)
+                or pd.isna(tail_start) or pd.isna(tail_end)
+                or tail_end.normalize() != total_end.normalize()
+                or tail_start <= total_start):
+            return None
+        return _valid_discrete_bounds(
+            total_start, tail_start - pd.Timedelta(days=1))
+
+    def _tail_remainder_bounds(total_row, baseline_row):
+        """Bounds for cumulative total minus an earlier cumulative baseline."""
+        if not _cumulative_pair_compatible(baseline_row, total_row):
+            return None
+        total_start = _source_date(total_row, 'Start')
+        total_end = _source_date(total_row, 'End')
+        baseline_start = _source_date(baseline_row, 'Start')
+        baseline_end = _source_date(baseline_row, 'End')
+        if (pd.isna(total_start) or pd.isna(total_end)
+                or pd.isna(baseline_start) or pd.isna(baseline_end)
+                or baseline_start.normalize() != total_start.normalize()
+                or baseline_end >= total_end):
+            return None
+        return _valid_discrete_bounds(
+            baseline_end + pd.Timedelta(days=1), total_end)
+
+    def _synthetic_q123_bounds(annual_row, quarter_rows):
+        if any(quarter_rows.get(qn) is None for qn in ('Q1', 'Q2', 'Q3')):
+            return None
+        rows = [quarter_rows[qn] for qn in ('Q1', 'Q2', 'Q3')]
+        if any(not _cumulative_aspects_compatible(row, annual_row)
+               for row in rows):
+            return None
+        bounds = [
+            _valid_discrete_bounds(
+                _source_date(row, 'Start'), _source_date(row, 'End'))
+            for row in rows
+        ]
+        if any(bound is None for bound in bounds):
+            return None
+        annual_start = _source_date(annual_row, 'Start')
+        annual_end = _source_date(annual_row, 'End')
+        def _nearly_contiguous(left_end, right_start):
+            expected_start = left_end + pd.Timedelta(days=1)
+            return abs((right_start - expected_start).days) <= 2
+        if (pd.isna(annual_start) or pd.isna(annual_end)
+                or bounds[0][0].normalize() != annual_start.normalize()
+                or not _nearly_contiguous(bounds[0][1], bounds[1][0])
+                or not _nearly_contiguous(bounds[1][1], bounds[2][0])):
+            return None
+        return _valid_discrete_bounds(
+            bounds[2][1] + pd.Timedelta(days=1), annual_end)
+
+    def _derived_source_row(template, fiscal_year, quarter, value,
+                            derivation, start=None, end=None, operands=None):
+        """Create auditable provenance for a mathematically derived quarter."""
+        row = template.copy()
+        operands = operands or {}
+        row['FY'] = fiscal_year
+        row['Q'] = quarter
+        row['Value'] = value
+        row['IsCalculated'] = True
+        row['SourceReportedValue'] = np.nan
+        row['SourceDerivation'] = derivation
+        row['SourceDerivationFormula'] = operands.get('Expression', derivation)
+        row['SourcePeriodRole'] = 'derived_discrete'
+        valid_bounds = False
+        if start is not None and end is not None:
+            start_dt = pd.to_datetime(start, errors='coerce')
+            end_dt = pd.to_datetime(end, errors='coerce')
+            if pd.notna(start_dt) and pd.notna(end_dt) and end_dt >= start_dt:
+                row['Start'] = start_dt.strftime('%Y-%m-%d')
+                row['End'] = end_dt.strftime('%Y-%m-%d')
+                row['Duration'] = int((end_dt - start_dt).days)
+                valid_bounds = True
+        if not valid_bounds:
+            # Never leave the cumulative operand's dates on a derived discrete
+            # quarter when its exact bounds could not be established.
+            row['Start'] = np.nan
+            row['End'] = np.nan
+            row['Duration'] = np.nan
+        for key, operand in operands.items():
+            row[f'SourceDerivation{key}'] = operand
+        return row
+
+    for (_group_category, label, fy), group in df.groupby(
+            ['_OperatingGroupCategory', 'Label', 'FY']):
+        cat = (_group_category if _group_category
+               else group['Category'].iloc[0])
         _q_group_cache.clear()
         _duration_filter_cache.clear()
         _concept_resolve_cache.clear()
         _best_val_cache.clear()
-        cat = group['Category'].iloc[0]
-        is_bs, is_avg = cat == '2_Balance_Sheet', any(kw in label for kw in NO_SUBTRACT)
+        operating_period_basis = _gb_group_operating_period_basis(group)
+        is_operating_average = operating_period_basis in {
+            _GB_BASIS_AVERAGE, _GB_BASIS_RATIO,
+        }
+        is_operating_nonadditive = operating_period_basis in {
+            _GB_BASIS_INSTANT_END, _GB_BASIS_INSTANT_START,
+            _GB_BASIS_AVERAGE, _GB_BASIS_RATIO, _GB_BASIS_UNKNOWN,
+        }
+        is_bs = cat == '2_Balance_Sheet'
+        is_avg = _is_nonadditive_output_label(label) or is_operating_average
         is_segment_cat = cat in SEG_CATS
         final_q_vals, best_rows = {'Q1': None, 'Q2': None, 'Q3': None, 'Q4': None}, {}
         
 
         if is_bs or 'Useful Life' in label or 'RPO' in label:
             q_src = {qn: get_best_val(qn, 0, 15) for qn in ['Q1', 'Q2', 'Q3', 'Q4']}
+        elif operating_period_basis == _GB_BASIS_INSTANT_END:
+            # HTML snapshot facts retain the table header's nominal duration,
+            # but semantically they are point-in-time balances.  Use direct
+            # quarter values and the final annual year-end snapshot for Q4.
+            q_src = {qn: get_best_val(qn, 91, 40) for qn in ['Q1', 'Q2', 'Q3']}
+            q4_val = get_best_val('Q4', 365, 50)
+            if q4_val is None:
+                q4_val = get_best_val('Q4', 91, 40)
+            q_src['Q4'] = q4_val
+        elif operating_period_basis == _GB_BASIS_INSTANT_START:
+            # A 365-day beginning balance is the beginning of the fiscal year,
+            # not Q4.  Direct quarter facts are selected first; continuity may
+            # fill a missing value only for a quarter already present in source.
+            q_src = {qn: get_best_val(qn, 91, 40) for qn in ['Q1', 'Q2', 'Q3', 'Q4']}
+        elif operating_period_basis == _GB_BASIS_UNKNOWN:
+            q_src = {qn: get_best_val(qn, 91, 40) for qn in ['Q1', 'Q2', 'Q3', 'Q4']}
         elif is_avg:
             # For Shares/EPS, allow annual (365d) duration if Q4 specific (90d) is missing
             q_src = {qn: get_best_val(qn, 91, 40) for qn in ['Q1', 'Q2', 'Q3']}
             q4_val = get_best_val('Q4', 91, 40)
             # North Star: Never use Annual (365d) total for a discrete Q4 EPS.
-            if q4_val is None and 'EPS' not in label:
+            if q4_val is None and 'EPS' not in label and not is_operating_average:
                 q4_val = get_best_val('Q4', 365, 50)  # 50d tolerance for 52/53-week filers
             q_src['Q4'] = q4_val
         else:
@@ -9706,59 +12056,155 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         #   is replaced with the derived value (Annual âˆ’ Q1 âˆ’ Q2 âˆ’ Q3).
         _q4_directly_filed = (q_src.get('Q4') is not None)
         _q4_derived_flag   = False
+        _q4_provenance_use_synthetic_baseline = False
 
         ytd6 = get_best_val('Q2', 182, 40)
         ytd9 = get_best_val('Q3', 273, 40)
+        # Even when no safe annual/YTD pair exists, an exact YTD9 and exact H1
+        # can still prove Q3.  Preserve that source separately; it must never be
+        # promoted into a Q4 cross-concept subtraction baseline.
+        standalone_ytd9 = ytd9
         ytd12 = get_best_val('Q4', 365, 50)  # 50d tolerance for 52/53-week filers
+
+        # When both nine-month and annual facts exist, keep the subtraction on
+        # one exact XBRL concept.  Same-label concepts can represent different
+        # scopes (for example, securities-lending interest vs total interest).
+        _subtraction_concept = None
+        _subtraction_annual_concept = None
+        _subtraction_alias_verified = False
+        if (ytd9 is not None and not is_avg
+                and not is_operating_nonadditive):
+            (matching_ytd9, matching_ytd12, _subtraction_concept,
+             _subtraction_annual_concept,
+             _subtraction_alias_verified) = _best_cumulative_pair()
+            # Arithmetic across two different XBRL concepts is not evidence.
+            # Preserve any directly filed Q4, but fail closed on derivation.
+            ytd9 = matching_ytd9
+            ytd12 = matching_ytd12
+
+            if _subtraction_concept is not None:
+                exact_ytd6 = get_best_val(
+                    'Q2', 182, 40,
+                    concept_filter=_subtraction_concept,
+                    exact_concept=True,
+                )
+                if (exact_ytd6 is not None and ytd9 is not None
+                        and _cumulative_aspects_compatible(
+                            exact_ytd6[1], ytd9[1])):
+                    ytd6 = exact_ytd6
+                else:
+                    ytd6 = None
+                # Keep the visible Q1-Q3 series on the same proven concept
+                # family as its cumulative subtraction baseline.
+                for qn in ('Q1', 'Q2', 'Q3'):
+                    exact_quarter = None
+                    for family_concept in dict.fromkeys([
+                            _subtraction_concept,
+                            (_subtraction_annual_concept
+                             if _subtraction_alias_verified else None)]):
+                        if family_concept is None:
+                            continue
+                        candidate = get_best_val(
+                            qn, 91, 40,
+                            concept_filter=family_concept,
+                            exact_concept=True,
+                        )
+                        if (candidate is not None and ytd9 is not None
+                                and _cumulative_aspects_compatible(
+                                    candidate[1], ytd9[1])):
+                            exact_quarter = candidate
+                            break
+                    if exact_quarter is not None:
+                        q_src[qn] = exact_quarter
+                        q_vals[qn] = exact_quarter[0]
+                        best_rows[qn] = exact_quarter[1]
 
         v6_ytd  = ytd6[0]  if ytd6  else None
         v9_ytd  = ytd9[0]  if ytd9  else None
         v12_ytd = ytd12[0] if ytd12 else None
 
-        if not is_bs and 'Useful Life' not in label and not is_avg:
+        if (not is_bs and 'Useful Life' not in label and not is_avg
+                and not is_operating_nonadditive):
             # Derive Q1 from YTD6 if missing
             if q_vals['Q1'] is None and ytd6 is not None:
-                q2_qt_same_tag = get_best_val('Q2', 91, 40, concept_filter=ytd6[1].get('Concept'))
-                if q2_qt_same_tag is not None:
+                q2_qt_same_tag = get_best_val(
+                    'Q2', 91, 40,
+                    concept_filter=ytd6[1].get('Concept'), exact_concept=True)
+                q1_bounds = (
+                    _head_remainder_bounds(ytd6[1], q2_qt_same_tag[1])
+                    if q2_qt_same_tag is not None else None)
+                if q2_qt_same_tag is not None and q1_bounds is not None:
                     q_vals['Q1'] = ytd6[0] - q2_qt_same_tag[0]
-                    if best_rows['Q1'] is None: best_rows['Q1'] = best_rows['Q2'].copy() if best_rows['Q2'] is not None else ytd6[1].copy()
-                elif q_vals['Q2'] is not None:
-                    q_vals['Q1'] = ytd6[0] - q_vals['Q2']
-                    if best_rows['Q1'] is None: best_rows['Q1'] = best_rows['Q2'].copy() if best_rows['Q2'] is not None else ytd6[1].copy()
-
-            ALWAYS_POS = {'Capital Expenditures', 'Depreciation', 'Amortization', 'Stock-Based Compensation', 'Share Repurchases', 'Dividends Paid', 'Taxes Paid on Stock Awards', 'Total Debt Repaid', 'Short-term Debt Repaid', 'Long-term Debt Repaid', 'Purchases of Investments', 'Acquisitions'}
+                    best_rows['Q1'] = _derived_source_row(
+                        ytd6[1], fy, 'Q1', q_vals['Q1'],
+                        'exact_concept_ytd6_minus_q2',
+                        start=q1_bounds[0], end=q1_bounds[1],
+                        operands={
+                            'Expression': f"{ytd6[0]} - {q2_qt_same_tag[0]} = {q_vals['Q1']}",
+                            'YTDValue': ytd6[0],
+                            'YTDConcept': ytd6[1].get('Concept'),
+                            'YTDAccession': ytd6[1].get('Accession'),
+                            'QuarterValue': q2_qt_same_tag[0],
+                            'QuarterConcept': q2_qt_same_tag[1].get('Concept'),
+                            'QuarterAccession': q2_qt_same_tag[1].get('Accession'),
+                        },
+                    )
 
             # Derive Q2 from YTD6 if missing
             if q_vals['Q2'] is None and ytd6 is not None:
-                q1_qt_same_tag = get_best_val('Q1', 91, 40, concept_filter=ytd6[1].get('Concept'))
-                if q1_qt_same_tag is not None:
+                q1_qt_same_tag = get_best_val(
+                    'Q1', 91, 40,
+                    concept_filter=ytd6[1].get('Concept'), exact_concept=True)
+                q2_bounds = (
+                    _tail_remainder_bounds(ytd6[1], q1_qt_same_tag[1])
+                    if q1_qt_same_tag is not None else None)
+                if q1_qt_same_tag is not None and q2_bounds is not None:
                     q_vals['Q2'] = ytd6[0] - q1_qt_same_tag[0]
-                    if best_rows['Q2'] is None: best_rows['Q2'] = ytd6[1].copy()
-                elif q_vals['Q1'] is not None:
-                    q_vals['Q2'] = ytd6[0] - q_vals['Q1']
-                    if best_rows['Q2'] is None: best_rows['Q2'] = ytd6[1].copy()
-                elif cat == '3_Cash_Flow' and not is_segment_cat:
-                    derived_q2 = ytd6[0]  # Assuming Q1 is 0
-                    if derived_q2 >= 0 or label not in ALWAYS_POS:
-                        q_vals['Q2'] = derived_q2
-                        if best_rows['Q2'] is None: best_rows['Q2'] = ytd6[1].copy()
+                    best_rows['Q2'] = _derived_source_row(
+                        ytd6[1], fy, 'Q2', q_vals['Q2'],
+                        'exact_concept_ytd6_minus_q1',
+                        start=q2_bounds[0], end=q2_bounds[1],
+                        operands={
+                            'Expression': f"{ytd6[0]} - {q1_qt_same_tag[0]} = {q_vals['Q2']}",
+                            'YTDValue': ytd6[0],
+                            'YTDConcept': ytd6[1].get('Concept'),
+                            'YTDAccession': ytd6[1].get('Accession'),
+                            'QuarterValue': q1_qt_same_tag[0],
+                            'QuarterConcept': q1_qt_same_tag[1].get('Concept'),
+                            'QuarterAccession': q1_qt_same_tag[1].get('Accession'),
+                        },
+                    )
+                # A six-month YTD fact is not a discrete Q2 fact.  If Q1 is
+                # absent, there is no defensible subtraction baseline; leave
+                # Q2 blank instead of silently assuming Q1 was zero.
 
             # Derive Q3 from YTD9 if missing
-            if q_vals['Q3'] is None and ytd9 is not None:
-                ytd6_same_tag = get_best_val('Q2', 182, 40, concept_filter=ytd9[1].get('Concept'))
-                if ytd6_same_tag is not None:
-                    q_vals['Q3'] = ytd9[0] - ytd6_same_tag[0]
-                    if best_rows['Q3'] is None: best_rows['Q3'] = ytd9[1].copy()
-                elif v6_ytd is not None:
-                    q_vals['Q3'] = ytd9[0] - v6_ytd
-                    if best_rows['Q3'] is None: best_rows['Q3'] = ytd9[1].copy()
-                elif cat == '3_Cash_Flow' and not is_segment_cat:
-                    _q1 = q_vals['Q1'] if q_vals['Q1'] is not None else 0.0
-                    _q2 = q_vals['Q2'] if q_vals['Q2'] is not None else 0.0
-                    derived_q3 = ytd9[0] - (_q1 + _q2)
-                    if derived_q3 >= 0 or label not in ALWAYS_POS:
-                        q_vals['Q3'] = derived_q3
-                        if best_rows['Q3'] is None: best_rows['Q3'] = ytd9[1].copy()
+            q3_ytd = ytd9 if ytd9 is not None else standalone_ytd9
+            if q_vals['Q3'] is None and q3_ytd is not None:
+                ytd6_same_tag = get_best_val(
+                    'Q2', 182, 40,
+                    concept_filter=q3_ytd[1].get('Concept'), exact_concept=True)
+                q3_bounds = (
+                    _tail_remainder_bounds(q3_ytd[1], ytd6_same_tag[1])
+                    if ytd6_same_tag is not None else None)
+                if ytd6_same_tag is not None and q3_bounds is not None:
+                    q_vals['Q3'] = q3_ytd[0] - ytd6_same_tag[0]
+                    best_rows['Q3'] = _derived_source_row(
+                        q3_ytd[1], fy, 'Q3', q_vals['Q3'],
+                        'exact_concept_ytd9_minus_ytd6',
+                        start=q3_bounds[0], end=q3_bounds[1],
+                        operands={
+                            'Expression': f"{q3_ytd[0]} - {ytd6_same_tag[0]} = {q_vals['Q3']}",
+                            'YTDValue': q3_ytd[0],
+                            'YTDConcept': q3_ytd[1].get('Concept'),
+                            'YTDAccession': q3_ytd[1].get('Accession'),
+                            'BaselineValue': ytd6_same_tag[0],
+                            'BaselineConcept': ytd6_same_tag[1].get('Concept'),
+                            'BaselineAccession': ytd6_same_tag[1].get('Accession'),
+                        },
+                    )
+                # Likewise, a nine-month YTD fact cannot become Q3 unless a
+                # real H1 or complete Q1+Q2 baseline exists.
 
             _v9_synthetic = None
             if (
@@ -9767,49 +12213,52 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 and q_vals['Q2'] is not None
                 and q_vals['Q3'] is not None
             ):
-                _v9_synthetic = q_vals['Q1'] + q_vals['Q2'] + q_vals['Q3']
-            elif cat == '3_Cash_Flow' and not is_segment_cat and v9_ytd is None:
-                _q1 = q_vals['Q1'] if q_vals['Q1'] is not None else 0.0
-                _q2 = q_vals['Q2'] if q_vals['Q2'] is not None else 0.0
-                _q3 = q_vals['Q3'] if q_vals['Q3'] is not None else 0.0
-                _v9_synthetic = _q1 + _q2 + _q3
+                _quarter_concept_list = [
+                    _exact_subtraction_concept(best_rows.get(qn))
+                    for qn in ('Q1', 'Q2', 'Q3')
+                ]
+                _quarter_concepts = set(_quarter_concept_list)
+                if None not in _quarter_concepts and len(_quarter_concepts) == 1:
+                    _subtraction_concept = _quarter_concept_list[0]
+                    matching_ytd12 = get_best_val(
+                        'Q4', 365, 50,
+                        concept_filter=_subtraction_concept,
+                        exact_concept=True,
+                    )
+                    if matching_ytd12 is not None:
+                        ytd12 = matching_ytd12
+                        v12_ytd = matching_ytd12[0]
+                        _v9_synthetic = (
+                            q_vals['Q1'] + q_vals['Q2'] + q_vals['Q3'])
+            # Never synthesize a nine-month baseline by replacing missing
+            # quarters with zero.  Doing so turns an annual-only cash-flow
+            # fact into a fake discrete Q4 value.
 
-            # --- SOLIDIFIED CASH FLOW Q2/Q3 FALLBACK SUBTRACTION ---
-            if cat == '3_Cash_Flow' and not is_segment_cat:
-                # Fallback for Q2: If Q2 is missing but YTD6 and Q1 are known
-                if q_vals['Q2'] is None and v6_ytd is not None and q_vals['Q1'] is not None:
-                    derived_q2 = v6_ytd - q_vals['Q1']
-                    if derived_q2 >= 0 or label not in ALWAYS_POS:
-                        q_vals['Q2'] = derived_q2
-                        if best_rows['Q2'] is None:
-                            best_rows['Q2'] = (ytd6[1] if ytd6 else (best_rows['Q1'].copy() if best_rows['Q1'] is not None else None))
-                
-                # Fallback for Q3: If Q3 is missing but YTD9 and YTD6 are known
-                if q_vals['Q3'] is None and v9_ytd is not None and v6_ytd is not None:
-                    derived_q3 = v9_ytd - v6_ytd
-                    if derived_q3 >= 0 or label not in ALWAYS_POS:
-                        q_vals['Q3'] = derived_q3
-                        if best_rows['Q3'] is None:
-                            best_rows['Q3'] = (ytd9[1] if ytd9 else (best_rows['Q2'].copy() if best_rows['Q2'] is not None else None))
-
-    
         # --- DISCRETE Q4 CALCULATION ---
             # Priority 1: Q4 is missing -> derive from Annual âˆ’ YTD9.
             # Priority 2: Q4 equals the full annual total (filed as annual-duration
             #             XBRL by the 10-K, then picked up with too-loose tolerance)
             #             -> replace with the correct discrete Q4.
             # Safety: only subtract when we have a reliable 9-month baseline
-            #         (either a real YTD9 fact, or at least 2 individual quarters).
-            _has_baseline = (v9_ytd is not None) or (_v9_synthetic is not None) or (
-                sum(v is not None for v in [q_vals['Q1'], q_vals['Q2'], q_vals['Q3']]) >= 2
-            )
+            #         (either a real YTD9 fact, or all three exact-concept quarters).
+            _q4_bounds = None
+            if ytd12 is not None and v9_ytd is not None and ytd9 is not None:
+                _q4_bounds = _tail_remainder_bounds(ytd12[1], ytd9[1])
+            elif ytd12 is not None and _v9_synthetic is not None:
+                _q4_bounds = _synthetic_q123_bounds(ytd12[1], best_rows)
+            _has_baseline = (
+                ((v9_ytd is not None) or (_v9_synthetic is not None))
+                and _q4_bounds is not None)
 
             if v12_ytd is not None and _has_baseline:
                 _live_sum = (q_vals['Q1'] or 0) + (q_vals['Q2'] or 0) + (q_vals['Q3'] or 0)
                 if v9_ytd is not None:
-                    prev_9m = max(v9_ytd, _live_sum)
+                    # A filed nine-month cumulative value is the authoritative
+                    # subtraction baseline.  Taking max(YTD9, Q1+Q2+Q3) mixes
+                    # scopes and is especially wrong for negative values.
+                    prev_9m = v9_ytd
                 elif _v9_synthetic is not None:
-                    prev_9m = max(_v9_synthetic, _live_sum)
+                    prev_9m = _v9_synthetic
                 else:
                     prev_9m = _live_sum
                     
@@ -9908,12 +12357,23 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                         # means v12_ytd â‰ˆ baseline_9m + Q4_direct -- a tautology).
                         # Try an alternative annual that excludes the circular value.
                         if recon_err <= 0.02:
-                            alt_ytd12 = get_best_val('Q4', 365, 50, exclude_val=v12_ytd)
-                            if alt_ytd12 is not None:
+                            alt_ytd12 = get_best_val(
+                                'Q4', 365, 50,
+                                exclude_val=v12_ytd,
+                                concept_filter=(
+                                    _subtraction_annual_concept
+                                    or _subtraction_concept),
+                                exact_concept=True,
+                            )
+                            if (alt_ytd12 is not None
+                                    and ytd9 is not None
+                                    and _tail_remainder_bounds(
+                                        alt_ytd12[1], ytd9[1]) is not None):
                                 alt_v12   = alt_ytd12[0]
                                 alt_recon = abs(implied_annual - alt_v12) / max(abs(alt_v12), 1)
                                 if alt_recon > 0.02:
                                     # Found the audited annual -- upgrade and recompute
+                                    ytd12        = alt_ytd12
                                     v12_ytd     = alt_v12
                                     discrete_q4 = alt_v12 - prev_9m
                                     recon_err   = alt_recon
@@ -9930,9 +12390,15 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                                     ((group['Duration'] - 365).abs() <= 50)
                                 ]
                                 if not html_rows.empty:
-                                    html_val   = float(html_rows.iloc[0]['Value'])
+                                    html_row = html_rows.sort_values(
+                                        '_Filed_dt', ascending=False).iloc[0].copy()
+                                    html_val   = float(html_row['Value'])
                                     html_recon = abs(implied_annual - html_val) / max(abs(html_val), 1)
-                                    if html_recon > 0.02:
+                                    html_bounds = (
+                                        _tail_remainder_bounds(html_row, ytd9[1])
+                                        if ytd9 is not None else None)
+                                    if html_recon > 0.02 and html_bounds is not None:
+                                        ytd12        = (html_val, html_row)
                                         v12_ytd     = html_val
                                         discrete_q4 = html_val - prev_9m
                                         recon_err   = html_recon
@@ -9948,10 +12414,62 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                                 f"({recon_err:.1%} gap) -- using derived Q4 = {discrete_q4:,.0f}")
                             q_vals['Q4'] = discrete_q4
                             _q4_derived_flag = True
-        elif is_avg:
+        elif is_avg and not is_operating_average:
             if q_vals['Q2'] is None: q_vals['Q2'] = v6_ytd
             if q_vals['Q3'] is None: q_vals['Q3'] = v9_ytd
             if q_vals['Q4'] is None and 'EPS' not in label: q_vals['Q4'] = v12_ytd
+
+        # A missing beginning balance may be recovered from the immediately
+        # preceding ending balance of the same source-defined family.  Crucial
+        # guard: continuity can fill only an already-existing source period; it
+        # can never manufacture a future quarter or a new output column.
+        if operating_period_basis == _GB_BASIS_INSTANT_START:
+            metric_family = _gb_group_metric_family(group)
+            if metric_family:
+                _family_text = re.sub(
+                    r'[^a-z0-9]+', ' ', str(metric_family).casefold()).strip()
+                _all_families = df.get(
+                    'SourceMetricFamily', pd.Series('', index=df.index)
+                ).fillna('').astype(str).map(
+                    lambda value: re.sub(
+                        r'[^a-z0-9]+', ' ', value.casefold()).strip())
+                _family_rows = df[
+                    df['Category'].eq(cat) & _all_families.eq(_family_text)]
+                _family_source_periods = set()
+                for _family_fy, _family_q in zip(
+                        _family_rows.get('FY', pd.Series(dtype=object)),
+                        _family_rows.get('Q', pd.Series(dtype=object))):
+                    try:
+                        _family_source_periods.add((int(_family_fy), str(_family_q)))
+                    except (TypeError, ValueError):
+                        continue
+                for qn in ('Q1', 'Q2', 'Q3', 'Q4'):
+                    if (q_vals.get(qn) is not None
+                            or (int(fy), qn) not in _family_source_periods
+                            or (int(fy), qn) not in _operating_source_periods):
+                        continue
+                    previous_end = _gb_previous_operating_end_fact(
+                        df, cat, metric_family, fy, qn)
+                    if previous_end is None:
+                        continue
+                    previous_value, previous_row = previous_end
+                    q_vals[qn] = previous_value
+                    source_row = previous_row.copy()
+                    source_row['Category'] = cat
+                    source_row['Label'] = label
+                    source_row['FY'] = fy
+                    source_row['Q'] = qn
+                    source_row['Concept'] = _HTML_BUSINESS_CONCEPT
+                    source_row['SourcePeriodBasis'] = _GB_BASIS_INSTANT_START
+                    source_row['SourceDerivation'] = 'previous_ending_continuity'
+                    if 'SourceAliasCanonicalLabel' in source_row.index:
+                        source_row['SourceAliasCanonicalLabel'] = label
+                    if 'SourceAliasRule' in source_row.index:
+                        source_row['SourceAliasRule'] = 'previous_ending_continuity'
+                    if 'SourceAliasEvidence' in source_row.index:
+                        source_row['SourceAliasEvidence'] = (
+                            'immediately preceding verified ending balance')
+                    best_rows[qn] = source_row
 
         # =====================================================================
         # RESTATEMENT GUARD FOR INCOME-STATEMENT REVENUE Q4
@@ -9986,18 +12504,26 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                     _prev_9m_is = sum(v or 0 for v in
                                       (q_vals['Q1'], q_vals['Q2'], q_vals['Q3']))
                     _lo_is, _hi_is = 0.5 * _min_is, 2.5 * _max_is
-                    _best_ann_is, _best_q4_is = None, None
-                    for _alt_v in _is_annual_all.get((label, fy), []):
+                    _best_ann_is, _best_q4_is, _best_ann_row_is = None, None, None
+                    for _alt_v, _alt_row in _is_annual_rows.get(
+                            (label, fy), []):
                         _alt_q4 = _alt_v - _prev_9m_is
-                        if _lo_is <= _alt_q4 <= _hi_is:
+                        if (_lo_is <= _alt_q4 <= _hi_is
+                                and _synthetic_q123_bounds(
+                                    _alt_row, best_rows) is not None):
                             if _best_ann_is is None or _alt_v > _best_ann_is:
-                                _best_ann_is, _best_q4_is = _alt_v, _alt_q4
+                                (_best_ann_is, _best_q4_is,
+                                 _best_ann_row_is) = _alt_v, _alt_q4, _alt_row
                     if _best_q4_is is not None:
                         print(f"  [Restatement Fix] {label} FY{fy}: derived "
                               f"Q4={q_vals['Q4']:,.0f} below run-rate "
                               f"(restated-annual basis mismatch). Original annual "
                               f"{_best_ann_is:,.0f} -> Q4={_best_q4_is:,.0f}")
                         q_vals['Q4'] = _best_q4_is
+                        ytd12 = (_best_ann_is, _best_ann_row_is)
+                        v12_ytd = _best_ann_is
+                        _v9_synthetic = _prev_9m_is
+                        _q4_provenance_use_synthetic_baseline = True
 
         # =====================================================================
         # SCOPE-MISMATCH GUARD FOR CASH FLOW Q4  â€”  Root-Cause-First Design
@@ -10087,8 +12613,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
 
                     else:
                         # Q4 was derived (Annual âˆ’ YTD9). Apply root-cause logic.
-                        _prev_9m = sum(v or 0 for v in
-                                       [q_vals['Q1'], q_vals['Q2'], q_vals['Q3']])
+                        _prev_9m = (
+                            v9_ytd if v9_ytd is not None else _v9_synthetic)
 
                         # --------------------------------------------------
                         # Step 1: Try ALL alternative annual values.
@@ -10097,15 +12623,30 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                         # pick the one with the smallest implied Q4 magnitude
                         # (most conservative correction).
                         # --------------------------------------------------
-                        _alts = _cf_annual_all.get((label, fy), [])
+                        _annual_for_alt = _exact_subtraction_concept(
+                            ytd12[1] if ytd12 is not None else None)
+                        _alts = (
+                            _cf_annual_rows_by_concept.get(
+                                (label, fy, _annual_for_alt), [])
+                            if _annual_for_alt is not None else []
+                        )
                         _best_q4     = None
                         _best_annual = None
-                        for _alt_v in _alts:
+                        _best_annual_row = None
+                        for _alt_v, _alt_row in _alts:
                             _alt_q4 = _alt_v - _prev_9m
-                            if abs(_alt_q4) <= _max_q123 * 2.5:
+                            if v9_ytd is not None and ytd9 is not None:
+                                _alt_bounds = _tail_remainder_bounds(
+                                    _alt_row, ytd9[1])
+                            else:
+                                _alt_bounds = _synthetic_q123_bounds(
+                                    _alt_row, best_rows)
+                            if (_alt_bounds is not None
+                                    and abs(_alt_q4) <= _max_q123 * 2.5):
                                 if _best_q4 is None or abs(_alt_q4) < abs(_best_q4):
                                     _best_q4     = _alt_q4
                                     _best_annual = _alt_v
+                                    _best_annual_row = _alt_row
 
                         if _best_q4 is not None:
                             # Alt annual resolves the anomaly â€” use it.
@@ -10114,6 +12655,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                                   f"max(Q1-Q3) (derived). "
                                   f"Alt annual {_best_annual:,.0f} -> Q4={_best_q4:,.0f}")
                             q_vals['Q4'] = _best_q4
+                            ytd12 = (_best_annual, _best_annual_row)
+                            v12_ytd = _best_annual
 
                         else:
                             # --------------------------------------------------
@@ -10226,20 +12769,192 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                                           f"{sorted(_qtly_concepts)}) but '{label}' is a "
                                           f"top-level CF line â€” preserving with caution.")
 
+        if (_q4_derived_flag and q_vals.get('Q4') is not None
+                and ytd12 is not None):
+            annual_value = float(ytd12[0])
+            annual_row = ytd12[1]
+            if (not _q4_provenance_use_synthetic_baseline
+                    and v9_ytd is not None and ytd9 is not None):
+                baseline_value = v9_ytd
+                baseline_row = ytd9[1]
+                baseline_name = 'YTD9'
+                q4_bounds = _tail_remainder_bounds(annual_row, baseline_row)
+                derivation = (
+                    'value_proven_alias_annual_minus_ytd9'
+                    if _subtraction_alias_verified
+                    else 'exact_concept_annual_minus_ytd9')
+            else:
+                baseline_value = _v9_synthetic
+                baseline_row = best_rows.get('Q3')
+                baseline_name = 'Q1Q2Q3Sum'
+                q4_bounds = _synthetic_q123_bounds(annual_row, best_rows)
+                derivation = 'exact_concept_annual_minus_q1_q2_q3'
+            if q4_bounds is None or baseline_value is None:
+                q_vals['Q4'] = None
+                best_rows['Q4'] = None
+            else:
+                best_rows['Q4'] = _derived_source_row(
+                    annual_row, fy, 'Q4', q_vals['Q4'], derivation,
+                    start=q4_bounds[0], end=q4_bounds[1],
+                    operands={
+                        'Expression': (
+                            f"{annual_value} - {baseline_value} = "
+                            f"{q_vals['Q4']}"),
+                        'AnnualValue': annual_value,
+                        'AnnualConcept': annual_row.get('Concept'),
+                        'AnnualAccession': annual_row.get('Accession'),
+                        f'{baseline_name}Value': baseline_value,
+                        f'{baseline_name}Concept': (
+                            baseline_row.get('Concept')
+                            if baseline_row is not None else _subtraction_concept),
+                        f'{baseline_name}Accession': (
+                            baseline_row.get('Accession')
+                            if baseline_row is not None else None),
+                        'AliasVerified': bool(_subtraction_alias_verified),
+                    },
+                )
+
+        if cat == '3_Cash_Flow' and label in _DEBT_COMPONENT_LABELS:
+            # Gross issued/repaid facts are nonnegative flows.  A selected zero
+            # cumulative fact therefore proves zero activity throughout its own
+            # exact-concept interval; unlike a signed net fact, it cannot hide
+            # offsetting activity.  Track that proof separately from ``q_vals``
+            # so display cells remain blank unless a discrete value was actually
+            # reported or derived by subtraction.
+            horizons = (
+                ('Q2', 182, 40, ('Q1', 'Q2')),
+                ('Q3', 273, 40, ('Q1', 'Q2', 'Q3')),
+                ('Q4', 365, 50, ('Q1', 'Q2', 'Q3', 'Q4')),
+            )
+            concrete_concepts = sorted({
+                str(concept).strip() for concept in group['Concept'].dropna()
+                if _exact_subtraction_concept({'Concept': concept}) is not None
+            })
+            for debt_concept in concrete_concepts:
+                selected_cumulative = []
+                for q_label, target, tolerance, quarters in horizons:
+                    candidate = get_best_val(
+                        q_label, target, tolerance,
+                        concept_filter=debt_concept, exact_concept=True)
+                    if candidate is not None:
+                        selected_cumulative.append((candidate, set(quarters)))
+
+                nonzero = [
+                    (candidate, quarters)
+                    for candidate, quarters in selected_cumulative
+                    if abs(float(candidate[0])) > 1e-9
+                ]
+                zero = [
+                    (candidate, quarters)
+                    for candidate, quarters in selected_cumulative
+                    if abs(float(candidate[0])) <= 1e-9
+                ]
+                for (nonzero_value, nonzero_row), covered in nonzero:
+                    for qn in covered:
+                        q_value = q_vals.get(qn)
+                        q_row = best_rows.get(qn)
+                        q_concept = _exact_subtraction_concept(q_row)
+                        resolved = (
+                            q_value is not None and not pd.isna(q_value)
+                            and (q_concept == debt_concept
+                                 or _concepts_have_value_proven_equivalence(
+                                     q_concept, debt_concept))
+                        )
+                        if resolved:
+                            continue
+                        proven_zero = any(
+                            qn in zero_quarters
+                            and _cumulative_pair_compatible(
+                                zero_candidate[1], nonzero_row)
+                            for zero_candidate, zero_quarters in zero
+                        )
+                        if not proven_zero:
+                            _incomplete_debt_component_periods.add(
+                                (str(label), f'{int(fy)}-{qn}'))
+
         for qn in ['Q1', 'Q2', 'Q3', 'Q4']:
             val = q_vals[qn]
-            if val is not None and not pd.isna(val):
+            if (val is not None and not pd.isna(val)
+                    and (cat != OPERATING_METRICS_CATEGORY
+                         or (int(fy), qn) in _operating_source_periods)):
                 r = best_rows[qn]
                 if r is not None:
+                    if cat == OPERATING_METRICS_CATEGORY:
+                        source_role = r.get('SourcePeriodRole')
+                        source_derivation = r.get('SourceDerivation')
+                        is_prederived = (
+                            (pd.notna(source_role)
+                             and str(source_role).strip() == 'derived_discrete')
+                            or (pd.notna(source_derivation)
+                                and str(source_derivation).strip() != ''))
+                        reported_source = (
+                            r.get('SourceReportedValue')
+                            if is_prederived else r.get('Value'))
+                        reported_value = pd.to_numeric(
+                            pd.Series([reported_source]), errors='coerce').iloc[0]
+                        r['SourceReportedValue'] = reported_value
+                        is_derived_value = (
+                            is_prederived
+                            or pd.isna(reported_value)
+                            or not _gb_close_values(reported_value, val)
+                        )
+                        if is_derived_value:
+                            existing_derivation = (
+                                str(source_derivation).strip()
+                                if pd.notna(source_derivation) else '')
+                            r['SourceDerivation'] = (
+                                existing_derivation
+                                or 'same_basis_quarterization')
+                            if not bool(r.get('SourceConflict', False)):
+                                r['SourceVerificationStatus'] = _GB_STATUS_DERIVED_VERIFIED
+                            r['SourceTrustScore'] = min(
+                                _gb_numeric_or_default(
+                                    r.get('SourceTrustScore'), 0.75),
+                                0.88,
+                            )
                     r['Value'] = val
                     r['Period'] = f"{fy}-{qn}"
                     final_rows.append(r)
     
     final_df = pd.DataFrame(final_rows)
     if final_df.empty: return pd.DataFrame()
-    final_df = final_df.sort_values(['Category', 'Label', 'Period', 'Filed'], ascending=[True, True, True, False])
+    _final_operating_mask = final_df['Category'].eq(
+        OPERATING_METRICS_CATEGORY)
+    _final_non_operating = final_df.loc[~_final_operating_mask].sort_values(
+        ['Category', 'Label', 'Period', 'Filed'],
+        ascending=[True, True, True, False])
+    _final_operating = final_df.loc[_final_operating_mask]
+    if not _final_operating.empty:
+        _final_sort = ['Category', 'Label', 'Period']
+        _final_ascending = [True, True, True]
+        if 'SourceAliasPreferred' in _final_operating.columns:
+            _final_sort.append('SourceAliasPreferred'); _final_ascending.append(False)
+        if 'SourceConflict' in _final_operating.columns:
+            _final_sort.append('SourceConflict'); _final_ascending.append(True)
+        if 'SourceTrustScore' in _final_operating.columns:
+            _final_sort.append('SourceTrustScore'); _final_ascending.append(False)
+        _final_sort.append('Filed'); _final_ascending.append(False)
+        _final_operating = _final_operating.sort_values(
+            _final_sort, ascending=_final_ascending)
+    final_df = pd.concat([_final_non_operating, _final_operating], axis=0)
     final_df = final_df.drop_duplicates(subset=['Category', 'Label', 'Period'], keep='first')
+    fact_audit = _gb_fact_audit_from_selected_rows(final_df, ticker)
+    _additive_capex_totals = _additive_capex_totals_from_audit(fact_audit)
+    _additive_capex_periods = sorted(_additive_capex_totals)
+    fact_audit.attrs[_INCOMPLETE_DEBT_COMPONENT_PERIODS_ATTR] = sorted(
+        _incomplete_debt_component_periods)
+    fact_audit.attrs[_ADDITIVE_CAPEX_DETAIL_PERIODS_ATTR] = list(
+        _additive_capex_periods)
+    fact_audit.attrs[_ADDITIVE_CAPEX_TOTALS_ATTR] = dict(
+        _additive_capex_totals)
     pivoted_temp = final_df.pivot(index=['Category', 'Label'], columns='Period', values='Value')
+    pivoted_temp.attrs[_INCOMPLETE_DEBT_COMPONENT_PERIODS_ATTR] = sorted(
+        _incomplete_debt_component_periods)
+    pivoted_temp.attrs[_ADDITIVE_CAPEX_DETAIL_PERIODS_ATTR] = list(
+        _additive_capex_periods)
+    pivoted_temp.attrs[_ADDITIVE_CAPEX_TOTALS_ATTR] = dict(
+        _additive_capex_totals)
+    pivoted_temp.attrs['fact_audit'] = fact_audit
     # Inversion guarantee: every face-statement concept that produced facts
     # must yield an output row. Anything lost to dedup/merging is reported.
     try:
@@ -10294,8 +13009,22 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     final_pivot = _neutralize_ytd_undercapture(final_pivot)
     final_pivot = _recompute_cf_residuals(final_pivot)
     final_pivot = _refresh_balance_sheet_closure(final_pivot)
+    final_pivot = _gb_add_operating_integrity_checks(final_pivot, fact_audit)
     sorted_cols = sorted(final_pivot.columns, key=lambda x: (x.split('-')[0], x.split('-')[1]), reverse=True)
-    return final_pivot[sorted_cols]
+    final_pivot = final_pivot[sorted_cols]
+    final_pivot.attrs['fact_audit'] = fact_audit
+    final_pivot.attrs['operating_alias_audit'] = _operating_alias_audit
+    final_pivot.attrs['source_periods'] = sorted(
+        f'{fy}-{quarter}' for fy, quarter in _source_periods)
+    final_pivot.attrs['eligible_operating_source_periods'] = sorted(
+        f'{fy}-{quarter}' for fy, quarter in _operating_source_periods)
+    final_pivot.attrs[_INCOMPLETE_DEBT_COMPONENT_PERIODS_ATTR] = sorted(
+        _incomplete_debt_component_periods)
+    final_pivot.attrs[_ADDITIVE_CAPEX_DETAIL_PERIODS_ATTR] = list(
+        _additive_capex_periods)
+    final_pivot.attrs[_ADDITIVE_CAPEX_TOTALS_ATTR] = dict(
+        _additive_capex_totals)
+    return final_pivot
 
 _YTD_UNDERCAPTURE_LABELS = {
     'Purchases of Investments', 'Proceeds from Investments',
@@ -10304,6 +13033,12 @@ _YTD_UNDERCAPTURE_LABELS = {
 
 
 def _neutralize_ytd_undercapture(df: pd.DataFrame) -> pd.DataFrame:
+    # Exact-concept cumulative pairing in ``build_pivoted_data`` supersedes the
+    # old neighbor-pattern heuristic below.  A lumpy year can legitimately have
+    # filed zero activity through Q3 and all activity in Q4 (HOOD investment
+    # purchases in 2021).  Pattern inference must never erase those SEC facts.
+    return df
+
     if df is None or df.empty:
         return df
     cols = [c for c in df.columns if isinstance(c, str) and len(c) == 7 and c[4] == '-']
@@ -10643,11 +13378,19 @@ def _apply_accounting_engine(df, is_financial=False, is_insurance=False, is_oil_
             equity = get_v('2_Balance_Sheet', 'Total Equity', col)
             
             if assets is None and liab is not None and equity is not None:
-                set_v('2_Balance_Sheet', 'Total Assets', col, liab + equity)
+                derived_assets = liab + equity
+                if derived_assets > 0:
+                    set_v('2_Balance_Sheet', 'Total Assets', col, derived_assets)
             elif liab is None and assets is not None and equity is not None:
-                set_v('2_Balance_Sheet', 'Total Liabilities', col, assets - equity)
+                derived_liabilities = assets - equity
+                if assets > 0 and derived_liabilities >= 0:
+                    set_v('2_Balance_Sheet', 'Total Liabilities', col,
+                          derived_liabilities)
             elif equity is None and assets is not None and liab is not None:
-                set_v('2_Balance_Sheet', 'Total Equity', col, assets - liab)
+                if assets > 0 and liab >= 0:
+                    # Equity may legitimately be negative; only A and L carry
+                    # non-negative economic constraints.
+                    set_v('2_Balance_Sheet', 'Total Equity', col, assets - liab)
 
             # --- PHASE 3: CASH FLOW ---
             ni_cf = get_v('3_Cash_Flow', 'Net Income (CF)', col)
@@ -11104,6 +13847,12 @@ def _move_noisy_business_segment_rows_to_disclosures(df: pd.DataFrame) -> pd.Dat
         m = re.sub(r"\s+", " ", member.lower()).strip()
         full = re.sub(r"\s+", " ", text.lower()).strip()
         metric = text.split(' - ', 1)[0].strip().lower()
+        # These rows already passed the strict key-driver context, row-unit,
+        # and multi-row admission checks.  Terms such as "receivables" and
+        # "acquired assets" are valid company operating measures here, not
+        # dimensional accounting leaks to be reclassified as disclosures.
+        if metric == 'operating measure':
+            continue
         if metric == 'net income':
             noisy.append(idx)
             continue
@@ -11286,6 +14035,123 @@ def _move_parent_only_balance_sheet_rows_to_disclosures(df: pd.DataFrame) -> pd.
     return df
 
 
+_CAPEX_DETAIL_LABELS = (
+    'Capital Expenditures (Software)',
+    'Capital Expenditures (Intangibles)',
+    'Capital Expenditures (Equipment & Buildings)',
+)
+_NONCASH_CAPEX_DETAIL_CONCEPTS = frozenset({
+    'CapitalExpendituresIncurredButNotYetPaid',
+})
+
+
+def _calc_parent_weight_sets(concept: str) -> dict[str, set[float]]:
+    """Return deterministic parent -> distinct finite weights for one concept."""
+    result = {}
+    for relationship in GLOBAL_CALC_PARENT.get(str(concept or '').strip(), ()):
+        if not isinstance(relationship, (tuple, list)) or len(relationship) != 2:
+            continue
+        parent, weight = relationship
+        parent = str(parent or '').strip()
+        weight = pd.to_numeric(weight, errors='coerce')
+        if not parent or pd.isna(weight) or abs(float(weight)) <= 1e-12:
+            continue
+        result.setdefault(parent, set()).add(float(weight))
+    return result
+
+
+def _concepts_share_additive_calc_parent(concepts) -> bool:
+    """Prove every concept is a distinct same-sign child of one stable parent."""
+    concepts = tuple(dict.fromkeys(
+        str(concept or '').strip() for concept in concepts
+        if str(concept or '').strip()))
+    if len(concepts) < 2 or len(set(concepts)) != len(concepts):
+        return False
+    parent_maps = [_calc_parent_weight_sets(concept) for concept in concepts]
+    # A parent/child pair is a total plus detail, never two additive siblings.
+    if any(left in parent_maps[right_pos]
+           for left_pos, left in enumerate(concepts)
+           for right_pos in range(len(concepts)) if left_pos != right_pos):
+        return False
+    common_parents = set(parent_maps[0])
+    for parent_map in parent_maps[1:]:
+        common_parents.intersection_update(parent_map)
+    qualified = []
+    for parent in sorted(common_parents):
+        weights = [parent_map[parent] for parent_map in parent_maps]
+        # Conflicting weights for one concept/parent across the unioned graph
+        # indicate role/filing ambiguity, so fail closed.
+        if any(len(values) != 1 for values in weights):
+            continue
+        scalar_weights = [next(iter(values)) for values in weights]
+        if all(weight > 0 for weight in scalar_weights) or all(
+                weight < 0 for weight in scalar_weights):
+            qualified.append(parent)
+    # Multiple common direct parents can come from mutually exclusive linkroles.
+    return len(qualified) == 1
+
+
+def _concepts_are_additive_calc_siblings(left, right) -> bool:
+    """Backward-compatible two-concept wrapper for the strict group proof."""
+    return _concepts_share_additive_calc_parent((left, right))
+
+
+def _additive_capex_totals_from_audit(
+        fact_audit: pd.DataFrame) -> dict[str, float]:
+    """Return immutable per-period totals for proven additive CapEx siblings."""
+    required = {
+        'Category', 'Label', 'Period', 'Value', 'Concept', 'Accession',
+    }
+    if (not isinstance(fact_audit, pd.DataFrame) or fact_audit.empty
+            or not required.issubset(fact_audit.columns)):
+        return {}
+    labels = {'Capital Expenditures', *_CAPEX_DETAIL_LABELS}
+    selected = fact_audit[
+        fact_audit['Category'].eq('3_Cash_Flow')
+        & fact_audit['Label'].isin(labels)
+    ].copy()
+    if selected.empty:
+        return {}
+    selected['_ValueNum'] = pd.to_numeric(selected['Value'], errors='coerce')
+    totals = {}
+    for period, group in selected.groupby('Period', sort=False):
+        generic = group[
+            group['Label'].eq('Capital Expenditures')
+            & group['_ValueNum'].notna()]
+        details = group[
+            group['Label'].isin(_CAPEX_DETAIL_LABELS)
+            & group['_ValueNum'].notna()
+            & group['_ValueNum'].abs().gt(1e-9)]
+        details = details[
+            ~details['Concept'].astype(str).isin(
+                _NONCASH_CAPEX_DETAIL_CONCEPTS)]
+        if generic.empty or details.empty:
+            continue
+        generic = generic.iloc[[0]]
+        details = details.drop_duplicates(subset=['Label'], keep='first')
+        proof_rows = pd.concat([generic, details], ignore_index=True)
+        accessions = proof_rows['Accession'].fillna('').astype(str).str.strip()
+        concepts = proof_rows['Concept'].fillna('').astype(str).str.strip()
+        if (not accessions.ne('').all() or accessions.nunique() != 1
+                or not concepts.ne('').all()
+                or not _concepts_share_additive_calc_parent(concepts)):
+            continue
+        # ``fact_audit`` contains selected output facts.  Snapshot the raw
+        # component total here so later display passes never add detail to
+        # an already-normalized generic row.
+        generic_value = float(generic.iloc[0]['_ValueNum'])
+        detail_values = details['_ValueNum'].sum()
+        total = generic_value + float(detail_values)
+        if np.isfinite(total):
+            totals[str(period)] = total
+    return dict(sorted(totals.items()))
+
+
+def _additive_capex_periods_from_audit(fact_audit: pd.DataFrame) -> list[str]:
+    """Find periods where generic capex and detail are proven calc siblings."""
+    return sorted(_additive_capex_totals_from_audit(fact_audit))
+
+
 def _effective_capex_series(df: pd.DataFrame) -> pd.Series:
     """Return capex using detail rows when the generic row is missing or stale.
 
@@ -11302,15 +14168,55 @@ def _effective_capex_series(df: pd.DataFrame) -> pd.Series:
              else pd.Series(np.nan, index=idx))
     detail_sum = pd.Series(0.0, index=idx)
     detail_mask = pd.Series(False, index=idx)
-    for lbl in ('Capital Expenditures (Software)', 'Capital Expenditures (Intangibles)', 'Capital Expenditures (Equipment & Buildings)'):
-        key = ('3_Cash_Flow', lbl)
-        if key in df.index:
-            row = pd.to_numeric(df.loc[key], errors='coerce')
-            detail_sum = detail_sum + row.fillna(0)
-            detail_mask = detail_mask | row.notna()
+    fact_audit = df.attrs.get('fact_audit')
+    if (_has_authoritative_fact_audit(df)
+            and isinstance(fact_audit, pd.DataFrame)
+            and 'Concept' in fact_audit.columns):
+        selected_details = fact_audit[
+            fact_audit['Category'].astype(str).eq('3_Cash_Flow')
+            & fact_audit['Label'].isin(_CAPEX_DETAIL_LABELS)
+            & ~fact_audit['Concept'].astype(str).isin(
+                _NONCASH_CAPEX_DETAIL_CONCEPTS)
+        ].copy()
+        selected_details['_ValueNum'] = pd.to_numeric(
+            selected_details['Value'], errors='coerce')
+        selected_details = selected_details.dropna(subset=['_ValueNum'])
+        selected_details = selected_details.drop_duplicates(
+            subset=['Label', 'Period'], keep='first')
+        for period, period_rows in selected_details.groupby('Period', sort=False):
+            matching = [column for column in idx if str(column) == str(period)]
+            if not matching:
+                continue
+            detail_sum.loc[matching] = float(period_rows['_ValueNum'].sum())
+            detail_mask.loc[matching] = True
+    else:
+        for lbl in _CAPEX_DETAIL_LABELS:
+            key = ('3_Cash_Flow', lbl)
+            if key in df.index:
+                row = pd.to_numeric(df.loc[key], errors='coerce')
+                detail_sum = detail_sum + row.fillna(0)
+                detail_mask = detail_mask | row.notna()
     detail_nonzero = detail_mask & (detail_sum.abs() > 1e-9)
     capex_missing_or_stale_zero = capex.isna() | ((capex.abs() <= 1e-9) & detail_nonzero)
-    return capex.where(~capex_missing_or_stale_zero, detail_sum.where(detail_mask))
+    effective = capex.where(
+        ~capex_missing_or_stale_zero, detail_sum.where(detail_mask))
+
+    evidence = _quality_evidence_attrs(df)
+    verified_totals = evidence.get(_ADDITIVE_CAPEX_TOTALS_ATTR, {})
+    if not isinstance(verified_totals, dict):
+        verified_totals = {}
+    if not verified_totals:
+        # Backward-compatible fallback for an in-memory frame created before
+        # immutable totals were attached.  Recompute from selected raw facts,
+        # never from the possibly normalized display row.
+        verified_totals = _additive_capex_totals_from_audit(
+            df.attrs.get('fact_audit'))
+    for period in idx:
+        total = pd.to_numeric(
+            verified_totals.get(str(period)), errors='coerce')
+        if pd.notna(total):
+            effective.loc[period] = float(total)
+    return effective
 
 
 def _effective_depreciation_amortization_series(df: pd.DataFrame) -> pd.Series:
@@ -11411,22 +14317,162 @@ def _refresh_fcf_from_effective_capex(df: pd.DataFrame) -> pd.DataFrame:
         df.loc[('3_Cash_Flow', 'Capital Expenditures'), :] = eff_capex.values
     elif ('3_Cash_Flow', 'Capital Expenditures') in df.index:
         capex = pd.to_numeric(df.loc[('3_Cash_Flow', 'Capital Expenditures')], errors='coerce')
-        fill = (capex.isna() | ((capex.abs() <= 1e-9) & eff_capex.notna() & (eff_capex.abs() > 1e-9))) & eff_capex.notna()
+        scale = pd.concat([capex.abs(), eff_capex.abs()], axis=1).max(
+            axis=1).clip(lower=1.0)
+        fill = (
+            eff_capex.notna()
+            & (capex.isna() | ((capex - eff_capex).abs() > scale * 1e-9)))
         if fill.any():
             df.loc[('3_Cash_Flow', 'Capital Expenditures'), fill.index[fill]] = eff_capex[fill].values
-    fcf = ocf - eff_capex.fillna(0)
-    if fcf.notna().any():
-        df.loc[('5_KPI_Metrics', 'Metric: Free Cash Flow'), :] = fcf.values
-        rev = pd.to_numeric(df.loc[('1_Income_Statement', 'Revenue')], errors='coerce') if ('1_Income_Statement', 'Revenue') in df.index else pd.Series(np.nan, index=idx)
-        df.loc[('5_KPI_Metrics', 'Metric: FCF Margin %'), :] = ((fcf / rev) * 100).values
+    # Missing cash CapEx is unknown, not zero.  Publish FCF only where both OCF
+    # and cash CapEx have evidence; an explicitly filed zero remains valid.
+    fcf = (ocf - eff_capex).where(ocf.notna() & eff_capex.notna())
+    fcf_key = ('5_KPI_Metrics', 'Metric: Free Cash Flow')
+    if fcf.notna().any() or fcf_key in df.index:
+        df.loc[fcf_key, :] = fcf.values
+    rev = pd.to_numeric(df.loc[('1_Income_Statement', 'Revenue')], errors='coerce') if ('1_Income_Statement', 'Revenue') in df.index else pd.Series(np.nan, index=idx)
+    fcf_margin = ((fcf / rev) * 100).where(
+        fcf.notna() & rev.notna() & (rev != 0))
+    for margin_label in ('Metric: FCF Margin %', 'FCF Margin (%)'):
+        margin_key = ('5_KPI_Metrics', margin_label)
+        if fcf_margin.notna().any() or margin_key in df.index:
+            df.loc[margin_key, :] = fcf_margin.values
     int_exp = pd.to_numeric(df.loc[('1_Income_Statement', 'Interest Expense')], errors='coerce').fillna(0) if ('1_Income_Statement', 'Interest Expense') in df.index else pd.Series(0.0, index=idx)
     tax = pd.to_numeric(df.loc[('1_Income_Statement', 'Income Tax Expense')], errors='coerce').fillna(0) if ('1_Income_Statement', 'Income Tax Expense') in df.index else pd.Series(0.0, index=idx)
     pretax = pd.to_numeric(df.loc[('1_Income_Statement', 'Pretax Income')], errors='coerce') if ('1_Income_Statement', 'Pretax Income') in df.index else pd.Series(np.nan, index=idx)
     tax_rate = (tax / pretax).where(pretax > 0, 0.0).clip(0, 1)
     ufcf = fcf + int_exp * (1 - tax_rate)
-    if ufcf.notna().any():
-        df.loc[('5_KPI_Metrics', 'Metric: Unlevered Free Cash Flow'), :] = ufcf.values
+    ufcf_key = ('5_KPI_Metrics', 'Metric: Unlevered Free Cash Flow')
+    if ufcf.notna().any() or ufcf_key in df.index:
+        df.loc[ufcf_key, :] = ufcf.values
     return df
+
+
+def _quality_evidence_attrs(df: pd.DataFrame) -> dict:
+    """Snapshot lightweight verification attrs, with fact-audit fallback."""
+    evidence = {
+        key: df.attrs[key] for key in _QUALITY_EVIDENCE_ATTRS
+        if key in df.attrs
+    }
+    fact_audit = df.attrs.get('fact_audit')
+    if isinstance(fact_audit, pd.DataFrame):
+        for key in _QUALITY_EVIDENCE_ATTRS:
+            if key not in evidence and key in fact_audit.attrs:
+                evidence[key] = fact_audit.attrs[key]
+    return evidence
+
+
+def _groupby_first_preserving_quality_attrs(
+        df: pd.DataFrame, levels=('Category', 'Label')) -> pd.DataFrame:
+    """Collapse duplicate output rows without losing verification evidence."""
+    evidence = _quality_evidence_attrs(df)
+    fact_audit = df.attrs.get('fact_audit')
+    grouped = df.groupby(level=list(levels)).first()
+    grouped.attrs.update(evidence)
+    if isinstance(fact_audit, pd.DataFrame):
+        grouped.attrs['fact_audit'] = fact_audit
+    return grouped
+
+
+def _prepend_period_header_preserving_attrs(
+        df: pd.DataFrame, period_dates: dict) -> pd.DataFrame:
+    """Prepend CSV period header without pandas attr equality/drop hazards."""
+    attrs = dict(df.attrs)
+    header = pd.DataFrame(
+        {column: period_dates.get(column, '') for column in df.columns},
+        index=pd.MultiIndex.from_tuples(
+            [('0_Period_Header', 'Period Ending')],
+            names=['Category', 'Label']),
+    )
+    body = df.copy(deep=False)
+    body.attrs = {}
+    header.attrs = {}
+    result = pd.concat([header, body])
+    result.attrs.update(attrs)
+    return result
+
+
+def _incomplete_debt_component_mask(
+        df: pd.DataFrame, labels=None) -> pd.Series:
+    """Return periods whose discrete debt-component evidence is incomplete.
+
+    The attr contains ``(label, period)`` pairs emitted by the quarterization
+    layer when a non-zero cumulative debt fact covers a missing quarter but no
+    exact subtraction baseline exists.  An empty/malformed attr must be a safe
+    no-op so callers and legacy cached frames remain backward compatible.
+    """
+    index = df.columns
+    raw_pairs = _quality_evidence_attrs(df).get(
+        _INCOMPLETE_DEBT_COMPONENT_PERIODS_ATTR, ())
+    pairs = set()
+    for item in raw_pairs:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        pairs.add((str(item[0]), str(item[1])))
+    if labels is None:
+        selected_labels = _DEBT_COMPONENT_LABELS
+    elif isinstance(labels, str):
+        selected_labels = (labels,)
+    else:
+        selected_labels = tuple(labels)
+    return pd.Series(
+        [any((label, str(period)) in pairs for label in selected_labels)
+         for period in index],
+        index=index,
+        dtype=bool,
+    )
+
+
+def _fact_audit_output_series(
+        df: pd.DataFrame, category: str, label: str,
+        field: str = 'Value') -> pd.Series:
+    """Rebuild one output series from immutable selected-fact provenance."""
+    numeric = field == 'Value'
+    result = pd.Series(
+        np.nan if numeric else None,
+        index=df.columns,
+        dtype='float64' if numeric else 'object')
+    fact_audit = df.attrs.get('fact_audit')
+    required = {'Category', 'Label', 'Period', field}
+    if (not isinstance(fact_audit, pd.DataFrame) or fact_audit.empty
+            or not required.issubset(fact_audit.columns)):
+        return result
+    selected = fact_audit[
+        fact_audit['Category'].astype(str).eq(str(category))
+        & fact_audit['Label'].astype(str).eq(str(label))
+    ]
+    if selected.empty:
+        return result
+    selected = selected.drop_duplicates(subset=['Period'], keep='first')
+    for _, row in selected.iterrows():
+        matching = [column for column in result.index
+                    if str(column) == str(row['Period'])]
+        if not matching:
+            continue
+        value = row[field]
+        if numeric:
+            value = pd.to_numeric(value, errors='coerce')
+            if pd.isna(value):
+                continue
+            value = float(value)
+        elif value is None or pd.isna(value):
+            continue
+        result.loc[matching] = value
+    return result
+
+
+def _source_backed_output_period_mask(
+        df: pd.DataFrame, category: str, label: str) -> pd.Series:
+    """Return periods where selected-fact provenance supports an output row."""
+    return _fact_audit_output_series(df, category, label).notna()
+
+
+def _has_authoritative_fact_audit(df: pd.DataFrame) -> bool:
+    """Whether selected-fact provenance is available, including an empty audit."""
+    fact_audit = df.attrs.get('fact_audit')
+    required = {'Category', 'Label', 'Period', 'Value'}
+    return (isinstance(fact_audit, pd.DataFrame)
+            and required.issubset(fact_audit.columns))
 
 
 def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
@@ -11434,11 +14480,10 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
 
     Priority by period:
       1) if both gross total issued and repaid are visible, net = issued - repaid;
-      2) if short-term net-debt evidence is available, combine it with long-term
-         net evidence instead of letting one-sided gross rows erase it;
-      3) if only one gross total is visible and no short-term net evidence can
-         explain the missing side, use the one-sided gross value (missing side=0);
-      4) otherwise preserve a directly reported net-debt fact.
+      2) otherwise combine available short-term, long-term, and line-of-credit
+         component evidence exactly once;
+      3) otherwise preserve a directly reported net-debt fact.  A one-sided
+         aggregate gross row alone is not proof that the missing side was zero.
 
     This fixes AVGO-style periods where total repayments exist but the old net
     row stayed at zero, while preserving UNH-style periods where the correct net
@@ -11447,35 +14492,104 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     idx = df.columns
+    authoritative_audit = _has_authoritative_fact_audit(df)
+
     def ser(label):
         key = ('3_Cash_Flow', label)
         return pd.to_numeric(df.loc[key], errors='coerce') if key in df.index else pd.Series(np.nan, index=idx)
+
+    def evidenced_ser(label):
+        if authoritative_audit:
+            return _fact_audit_output_series(
+                df, '3_Cash_Flow', label).reindex(idx)
+        return ser(label)
+
     def first_nonmissing(*series):
         out = pd.Series(np.nan, index=idx)
         for s in series:
             out = out.where(out.notna(), s)
         return out
 
-    issued = ser('Total Debt Issued')
-    repaid = ser('Total Debt Repaid')
-    net_existing = ser('Total Net Debt Issued (Repaid)')
+    issued_direct = evidenced_ser('Total Debt Issued')
+    repaid_direct = evidenced_ser('Total Debt Repaid')
+    net_existing = evidenced_ser('Total Net Debt Issued (Repaid)')
 
-    st_issued = ser('Short-term Debt Issued')
-    st_repaid = ser('Short-term Debt Repaid')
-    st_direct = first_nonmissing(ser('Net Short-Term Debt Issued (Repaid)'),
-                                 ser('Net Change in Short-term Debt'))
-    st_from_components = (st_issued.fillna(0) - st_repaid.fillna(0)).where(st_issued.notna() | st_repaid.notna())
-    st_net = first_nonmissing(st_direct, st_from_components)
+    st_issued = evidenced_ser('Short-term Debt Issued')
+    st_repaid = evidenced_ser('Short-term Debt Repaid')
+    st_normalized_direct = evidenced_ser(
+        'Net Short-Term Debt Issued (Repaid)')
+    short_change_direct = evidenced_ser('Net Change in Short-term Debt')
+    short_change_concepts = _fact_audit_output_series(
+        df, '3_Cash_Flow', 'Net Change in Short-term Debt',
+        field='Concept').reindex(idx)
+    normalized_concepts = short_change_concepts.fillna('').astype(str).str.replace(
+        r'[^a-z0-9]+', '', regex=True).str.casefold()
+    loc_direct_mask = normalized_concepts.str.contains(
+        r'lines?ofcredit', regex=True) & short_change_direct.notna()
+    st_specific_mask = normalized_concepts.str.contains(
+        'commercialpaper', regex=False) & short_change_direct.notna()
+    # Generic short-term net concepts can include lines of credit.  Treat them
+    # as one combined ST+LOC family instead of adding gross LOC activity again.
+    combined_short_mask = (
+        short_change_direct.notna() & ~loc_direct_mask & ~st_specific_mask)
+    if not authoritative_audit:
+        combined_short_mask = short_change_direct.notna()
 
-    lt_issued = ser('Long-term Debt Issued')
-    lt_repaid = ser('Long-term Debt Repaid')
-    lt_direct = ser('Net Long-Term Debt Issued (Repaid)')
-    lt_from_components = (lt_issued.fillna(0) - lt_repaid.fillna(0)).where(lt_issued.notna() | lt_repaid.notna())
-    lt_net = first_nonmissing(lt_from_components, lt_direct)
+    st_incomplete = _incomplete_debt_component_mask(
+        df, ('Short-term Debt Issued', 'Short-term Debt Repaid'))
+    st_from_components = (
+        st_issued.fillna(0) - st_repaid.fillna(0)).where(
+            (st_issued.notna() | st_repaid.notna()) & ~st_incomplete)
+    st_family_direct = short_change_direct.where(st_specific_mask)
+    st_family_net = first_nonmissing(st_family_direct, st_from_components)
+    st_display = first_nonmissing(
+        st_normalized_direct, short_change_direct, st_from_components)
 
-    component_mask = st_net.notna() | lt_net.notna()
-    component_net = st_net.fillna(0) + lt_net.fillna(0)
-    gross_mask = issued.notna() | repaid.notna()
+    lt_issued = evidenced_ser('Long-term Debt Issued')
+    lt_repaid = evidenced_ser('Long-term Debt Repaid')
+    lt_direct = evidenced_ser('Net Long-Term Debt Issued (Repaid)')
+    lt_incomplete = _incomplete_debt_component_mask(
+        df, ('Long-term Debt Issued', 'Long-term Debt Repaid'))
+    lt_from_components = (
+        lt_issued.fillna(0) - lt_repaid.fillna(0)).where(
+            (lt_issued.notna() | lt_repaid.notna()) & ~lt_incomplete)
+    lt_net = first_nonmissing(lt_direct, lt_from_components)
+
+    loc_issued = evidenced_ser('Lines of Credit Issued')
+    loc_repaid = evidenced_ser('Lines of Credit Repaid')
+    loc_incomplete = _incomplete_debt_component_mask(
+        df, ('Lines of Credit Issued', 'Lines of Credit Repaid'))
+    loc_from_components = (loc_issued.fillna(0) - loc_repaid.fillna(0)).where(
+        (loc_issued.notna() | loc_repaid.notna()) & ~loc_incomplete)
+    loc_net = first_nonmissing(
+        short_change_direct.where(loc_direct_mask), loc_from_components)
+
+    short_loc_mask = (
+        combined_short_mask | st_family_net.notna() | loc_net.notna())
+    short_loc_net = st_family_net.fillna(0) + loc_net.fillna(0)
+    short_loc_net[combined_short_mask] = short_change_direct[
+        combined_short_mask]
+    component_mask = short_loc_mask | lt_net.notna()
+    component_net = short_loc_net.fillna(0) + lt_net.fillna(0)
+
+    incomplete_issued = _incomplete_debt_component_mask(
+        df, _DEBT_ISSUED_COMPONENT_LABELS)
+    incomplete_repaid = _incomplete_debt_component_mask(
+        df, _DEBT_REPAID_COMPONENT_LABELS)
+    issued_component_mask = (
+        st_issued.notna() | lt_issued.notna() | loc_issued.notna())
+    repaid_component_mask = (
+        st_repaid.notna() | lt_repaid.notna() | loc_repaid.notna())
+    issued_from_components = (
+        st_issued.fillna(0) + lt_issued.fillna(0)
+        + loc_issued.fillna(0)).where(
+            issued_component_mask & ~incomplete_issued)
+    repaid_from_components = (
+        st_repaid.fillna(0) + lt_repaid.fillna(0)
+        + loc_repaid.fillna(0)).where(
+            repaid_component_mask & ~incomplete_repaid)
+    issued = first_nonmissing(issued_direct, issued_from_components)
+    repaid = first_nonmissing(repaid_direct, repaid_from_components)
     gross_pair = issued.notna() & repaid.notna()
     gross_net = issued.fillna(0) - repaid.fillna(0)
 
@@ -11486,27 +14600,39 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
     # Complete gross totals are the strongest display identity.
     net[gross_pair] = gross_net[gross_pair]
 
-    # Component net is strongest for one-sided gross periods when short-term net
-    # debt is explicitly reported (UNH-style: short-term net + long-term activity).
-    explicit_short_net = st_direct.notna() & (st_direct.abs() > 1e-9)
-    use_component = component_mask & ~gross_pair & explicit_short_net
+    # Components are stronger than an incomplete one-sided aggregate because
+    # they never require assuming the missing aggregate side was zero.
+    any_incomplete = st_incomplete | lt_incomplete | loc_incomplete
+    use_component = component_mask & ~gross_pair & ~any_incomplete
     net[use_component] = component_net[use_component]
 
-    # If no explicit short-term net evidence exists, one-sided gross debt rows
-    # should still affect total net debt. This catches AVGO 2024-Q2 and similar
-    # periods where repayment totals were visible but the previous net stayed 0.
-    one_sided_gross = gross_mask & ~gross_pair
-    use_gross_one_sided = one_sided_gross & ~explicit_short_net
-    net[use_gross_one_sided] = gross_net[use_gross_one_sided]
+    out = df.copy()
+    if authoritative_audit:
+        for gross_label, supported in (
+                ('Total Debt Issued', issued),
+                ('Total Debt Repaid', repaid)):
+            key = ('3_Cash_Flow', gross_label)
+            if supported.notna().any() or key in out.index:
+                out.loc[key, :] = supported.values
 
-    # If there is no gross evidence, but component net exists, use it.
-    use_component_no_gross = component_mask & ~gross_mask
-    net[use_component_no_gross] = component_net[use_component_no_gross]
+    for subtotal_label, incomplete, supported in (
+            ('Net Short-Term Debt Issued (Repaid)', st_incomplete, st_display),
+            ('Net Long-Term Debt Issued (Repaid)', lt_incomplete, lt_net)):
+        subtotal_key = ('3_Cash_Flow', subtotal_label)
+        if authoritative_audit:
+            # Rebuild normalized subtotal rows solely from direct facts or
+            # independently supported gross components.  This clears a stale
+            # KPI rollup without discarding a provable long-term subtotal merely
+            # because a different debt family is incomplete.
+            if supported.notna().any() or subtotal_key in out.index:
+                out.loc[subtotal_key, :] = supported.values
+        elif subtotal_key in out.index and incomplete.any():
+            out.loc[subtotal_key, incomplete.index[incomplete]] = np.nan
 
-    if net.notna().any():
-        df = df.copy()
-        df.loc[('3_Cash_Flow', 'Total Net Debt Issued (Repaid)'), :] = net.values
-    return df
+    total_key = ('3_Cash_Flow', 'Total Net Debt Issued (Repaid)')
+    if net.notna().any() or total_key in out.index:
+        out.loc[total_key, :] = net.values
+    return out
 
 
 def _move_duplicate_short_term_debt_net_change_to_disclosures(df: pd.DataFrame) -> pd.DataFrame:
@@ -11663,7 +14789,12 @@ def _refresh_granular_footing_checks(df: pd.DataFrame) -> pd.DataFrame:
     # Balance sheet closure.
     assets, liab, eq = row('2_Balance_Sheet', 'Total Assets'), row('2_Balance_Sheet', 'Total Liabilities'), row('2_Balance_Sheet', 'Total Equity')
     bs_have = assets.notna() & liab.notna() & eq.notna()
-    bs_pass = (assets - liab - eq).abs() <= (assets.abs() * 0.005).clip(lower=50e6)
+    bs_economically_valid = (assets > 0) & (liab >= 0)
+    bs_pass = (
+        bs_economically_valid
+        & ((assets - liab - eq).abs()
+           <= (assets.abs() * 0.005).clip(lower=50e6))
+    )
     bs_flag = flag(bs_have, bs_pass)
 
     # Cash flow bridge: Net Cash Flow is before FX in this script's convention.
@@ -11760,10 +14891,27 @@ def _refresh_granular_footing_checks(df: pd.DataFrame) -> pd.DataFrame:
         if series.notna().any():
             df.loc[('8_Integrity_Checks', label), :] = series.values
 
-    valid = [s for s in checks.values() if s.notna().any()]
-    broad = pd.DataFrame(valid).min(axis=0, skipna=True) if valid else pd.Series(np.nan, index=cols)
-    if broad.notna().any():
-        df.loc[('8_Integrity_Checks', 'Metric: Financials Footing Verified'), :] = broad.values
+    # ``Financials Footing Verified = 1`` is a completeness claim, not merely
+    # an absence-of-failure claim.  A historical fragment with only an income
+    # statement identity (or only a balance sheet identity) must not be shown as
+    # fully verified.  Fail closed when any available core statement fails, but
+    # publish a pass only when all three primary statements have evidence and
+    # pass.  Segment footing remains a separate diagnostic because segment
+    # disclosures are optional and frequently use mixed/non-additive bases.
+    core_flags = pd.DataFrame({
+        'income_statement': is_flag,
+        'balance_sheet': bs_flag,
+        'cash_flow': cf_flag,
+    })
+    broad = pd.Series(np.nan, index=cols, dtype=float)
+    any_core_failure = core_flags.eq(0.0).any(axis=1)
+    all_core_present = core_flags.notna().all(axis=1)
+    all_core_pass = core_flags.eq(1.0).all(axis=1)
+    broad[any_core_failure] = 0.0
+    broad[all_core_present & all_core_pass] = 1.0
+    broad_key = ('8_Integrity_Checks', 'Metric: Financials Footing Verified')
+    if broad.notna().any() or broad_key in df.index:
+        df.loc[broad_key, :] = broad.values
     return df
 
 
@@ -11776,14 +14924,13 @@ def _apply_quality_result_fixes(df: pd.DataFrame) -> pd.DataFrame:
     df = _refresh_insurance_statement_subtotals(df)
     df = _refresh_ebitda(df)
     df = _refresh_fcf_from_effective_capex(df)
+    df = _recompute_cf_residuals(df)
     df = _repair_segment_revenue_residuals(df)
     df = _move_noisy_business_segment_rows_to_disclosures(df)
     df = _move_parent_only_balance_sheet_rows_to_disclosures(df)
     df = _refresh_granular_footing_checks(df)
-    # Collapse any category moves/added rows safely without changing values for
-    # duplicate row labels. Existing newest/rightmost value wins per pandas first.
     if df.index.duplicated().any():
-        df = df.groupby(level=['Category', 'Label']).first()
+        df = _groupby_first_preserving_quality_attrs(df)
     return df
 
 
@@ -11916,7 +15063,8 @@ def _refresh_balance_sheet_closure(df: pd.DataFrame) -> pd.DataFrame:
             continue   # never had an independently-verifiable closure -> leave absent
         if pd.isna(ta.get(c)) or pd.isna(ident.get(c)):
             continue
-        new_v = 1.0 if resid[c] <= tol[c] else 0.0
+        economically_valid = bool(ta[c] > 0 and tl[c] >= 0)
+        new_v = 1.0 if economically_valid and resid[c] <= tol[c] else 0.0
         if new_v != float(existing[c]):
             df.at[idx_clo, c] = new_v
             refreshed += 1
@@ -12771,26 +15919,47 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     # -- Financing variables ------------------------------------------
     st_debt_issued  = get_row('Short-term Debt Issued')
     lt_debt_issued  = get_row('Long-term Debt Issued')
+    loc_debt_issued = get_row('Lines of Credit Issued')
     debt_issued     = get_row('Total Debt Issued')
     
     st_debt_repaid  = get_row('Short-term Debt Repaid')
     lt_debt_repaid  = get_row('Long-term Debt Repaid')
+    loc_debt_repaid = get_row('Lines of Credit Repaid')
     debt_repaid     = get_row('Total Debt Repaid')
     
     short_debt_net  = get_row('Net Change in Short-term Debt')
 
+    incomplete_issued = _incomplete_debt_component_mask(
+        pivoted, _DEBT_ISSUED_COMPONENT_LABELS)
+    incomplete_repaid = _incomplete_debt_component_mask(
+        pivoted, _DEBT_REPAID_COMPONENT_LABELS)
+    incomplete_st = _incomplete_debt_component_mask(
+        pivoted, ('Short-term Debt Issued', 'Short-term Debt Repaid'))
+    incomplete_lt = _incomplete_debt_component_mask(
+        pivoted, ('Long-term Debt Issued', 'Long-term Debt Repaid'))
+    incomplete_loc = _incomplete_debt_component_mask(
+        pivoted, ('Lines of Credit Issued', 'Lines of Credit Repaid'))
+    any_incomplete_debt_component = (
+        incomplete_st | incomplete_lt | incomplete_loc)
+
     st_issued_n     = pd.to_numeric(st_debt_issued, errors='coerce').fillna(0)
     lt_issued_n     = pd.to_numeric(lt_debt_issued, errors='coerce').fillna(0)
+    loc_issued_n    = pd.to_numeric(loc_debt_issued, errors='coerce').fillna(0)
     st_repaid_n     = pd.to_numeric(st_debt_repaid, errors='coerce').fillna(0)
     lt_repaid_n     = pd.to_numeric(lt_debt_repaid, errors='coerce').fillna(0)
+    loc_repaid_n    = pd.to_numeric(loc_debt_repaid, errors='coerce').fillna(0)
 
     # Derive missing Total Debt Issued
-    derived_issued = st_issued_n + lt_issued_n
+    derived_issued = st_issued_n + lt_issued_n + loc_issued_n
     issued_raw_n = pd.to_numeric(debt_issued, errors='coerce')
     issued_n = issued_raw_n.copy()
-    components_issued = st_debt_issued.notna() | lt_debt_issued.notna()
+    components_issued = (
+        st_debt_issued.notna() | lt_debt_issued.notna()
+        | loc_debt_issued.notna())
     mask_issued = needs_anomaly_rescue(issued_n, derived_issued, components_issued, is_exact_identity=False)
-    mask_issued = mask_issued & (derived_issued > 0)
+    mask_issued = (
+        mask_issued & components_issued & ~incomplete_issued
+        & (derived_issued >= 0))
     if mask_issued.any():
         issued_n[mask_issued] = derived_issued[mask_issued]
         add_val('3_Cash_Flow', 'Total Debt Issued', issued_n[mask_issued])
@@ -12799,12 +15968,16 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     issued_n = issued_n.fillna(0)
 
     # Derive missing Total Debt Repaid
-    derived_repaid = st_repaid_n + lt_repaid_n
+    derived_repaid = st_repaid_n + lt_repaid_n + loc_repaid_n
     repaid_raw_n = pd.to_numeric(debt_repaid, errors='coerce')
     repaid_n = repaid_raw_n.copy()
-    components_repaid = st_debt_repaid.notna() | lt_debt_repaid.notna()
+    components_repaid = (
+        st_debt_repaid.notna() | lt_debt_repaid.notna()
+        | loc_debt_repaid.notna())
     mask_repaid = needs_anomaly_rescue(repaid_n, derived_repaid, components_repaid, is_exact_identity=False)
-    mask_repaid = mask_repaid & (derived_repaid > 0)
+    mask_repaid = (
+        mask_repaid & components_repaid & ~incomplete_repaid
+        & (derived_repaid >= 0))
     if mask_repaid.any():
         repaid_n[mask_repaid] = derived_repaid[mask_repaid]
         add_val('3_Cash_Flow', 'Total Debt Repaid', repaid_n[mask_repaid])
@@ -12813,22 +15986,62 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     repaid_n = repaid_n.fillna(0)
 
     short_net_raw   = pd.to_numeric(short_debt_net, errors='coerce')
-    short_net_n     = short_net_raw.fillna(0)
+    _short_net_concepts = _fact_audit_output_series(
+        pivoted, '3_Cash_Flow', 'Net Change in Short-term Debt',
+        field='Concept').reindex(pivoted.columns)
+    _short_net_concepts = _short_net_concepts.fillna('').astype(str).str.replace(
+        r'[^a-z0-9]+', '', regex=True).str.casefold()
+    _short_net_loc = (
+        _short_net_concepts.str.contains(r'lines?ofcredit', regex=True)
+        & short_net_raw.notna())
+    _short_net_st_specific = (
+        _short_net_concepts.str.contains('commercialpaper', regex=False)
+        & short_net_raw.notna())
+    _short_net_combined = (
+        short_net_raw.notna() & ~_short_net_loc & ~_short_net_st_specific)
+    if not _has_authoritative_fact_audit(pivoted):
+        _short_net_combined = short_net_raw.notna()
 
     # -- Calculate Explicit Net Debt Lines ----------------------------
-    net_lt_debt = lt_issued_n - lt_repaid_n
-    mask_lt = lt_debt_issued.notna() | lt_debt_repaid.notna()
+    net_lt_direct = pd.to_numeric(
+        get_row('Net Long-Term Debt Issued (Repaid)'), errors='coerce')
+    lt_component_evidence = (
+        (lt_debt_issued.notna() | lt_debt_repaid.notna()) & ~incomplete_lt)
+    net_lt_debt = (lt_issued_n - lt_repaid_n).where(
+        lt_component_evidence)
+    net_lt_debt = net_lt_debt.where(
+        net_lt_direct.isna(), net_lt_direct)
+    mask_lt = lt_component_evidence | net_lt_direct.notna()
     if mask_lt.any():
         add_val('3_Cash_Flow', 'Net Long-Term Debt Issued (Repaid)', net_lt_debt[mask_lt])
 
-    net_st_debt = st_issued_n - st_repaid_n
-    # If the company explicitly files a net short-term change, prioritize it
-    if short_net_raw.notna().any():
-        net_st_debt = net_st_debt.where(short_net_raw.isna(), short_net_raw)
+    st_component_evidence = (
+        (st_debt_issued.notna() | st_debt_repaid.notna()) & ~incomplete_st)
+    net_st_debt = (st_issued_n - st_repaid_n).where(
+        st_component_evidence)
+    # A commercial-paper-specific net fact belongs to the ST family.  A generic
+    # short-term fact is still displayed here, but total-net logic below treats
+    # it as the combined ST+LOC family to avoid overlap.
+    _short_net_for_st = short_net_raw.where(
+        _short_net_st_specific | _short_net_combined)
+    if _short_net_for_st.notna().any():
+        net_st_debt = net_st_debt.where(
+            _short_net_for_st.isna(), _short_net_for_st)
         
-    mask_st = st_debt_issued.notna() | st_debt_repaid.notna() | short_net_raw.notna()
+    mask_st = st_component_evidence | short_net_raw.notna()
     if mask_st.any():
-        add_val('3_Cash_Flow', 'Net Short-Term Debt Issued (Repaid)', net_st_debt[mask_st])
+        _net_st_display = net_st_debt.where(
+            ~_short_net_loc, short_net_raw)
+        add_val('3_Cash_Flow', 'Net Short-Term Debt Issued (Repaid)', _net_st_display[mask_st])
+
+    loc_component_evidence = (
+        (loc_debt_issued.notna() | loc_debt_repaid.notna())
+        & ~incomplete_loc)
+    net_loc_debt = (loc_issued_n - loc_repaid_n).where(
+        loc_component_evidence)
+    net_loc_debt = net_loc_debt.where(
+        ~_short_net_loc, short_net_raw)
+    mask_loc = loc_component_evidence | _short_net_loc
         
     # -- Calculate Total Net Debt -------------------------------------
     # If BOTH gross issued and gross repaid totals are available, the net line
@@ -12838,17 +16051,22 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     total_net_reported = get_row('Total Net Debt Issued (Repaid)', preferred_cat='3_Cash_Flow')
     total_net_reported_n = pd.to_numeric(total_net_reported, errors='coerce')
     gross_pair_available = issued_available & repaid_available
-    one_sided_gross = (issued_available | repaid_available) & ~gross_pair_available
     net_total_debt = total_net_reported_n.copy()
     net_total_debt[gross_pair_available] = issued_n[gross_pair_available] - repaid_n[gross_pair_available]
 
-    derived_total_net = net_st_debt + net_lt_debt
-    mask_use_derived = net_total_debt.isna() & (~gross_pair_available) & (mask_st | mask_lt) & derived_total_net.notna()
+    _short_loc_net = net_st_debt.fillna(0) + net_loc_debt.fillna(0)
+    _short_loc_net[_short_net_combined] = short_net_raw[
+        _short_net_combined]
+    derived_total_net = _short_loc_net + net_lt_debt.fillna(0)
+    mask_use_derived = (
+        net_total_debt.isna() & (~gross_pair_available)
+        & ~any_incomplete_debt_component
+        & (mask_st | mask_lt | mask_loc) & derived_total_net.notna())
     net_total_debt[mask_use_derived] = derived_total_net[mask_use_derived]
-    # Last resort for one-sided gross rows only when no direct net fact exists.
-    net_total_debt[one_sided_gross & net_total_debt.isna()] = (issued_n - repaid_n)[one_sided_gross & net_total_debt.isna()]
 
-    mask_total = gross_pair_available | one_sided_gross | total_net_reported_n.notna() | mask_st | mask_lt
+    mask_total = (
+        gross_pair_available | total_net_reported_n.notna()
+        | mask_st | mask_lt | mask_loc)
     if mask_total.any():
         add_val('3_Cash_Flow', 'Total Net Debt Issued (Repaid)', net_total_debt[mask_total])
         
@@ -13163,9 +16381,12 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     _ta_resid = (assets_n - _ta_ident).abs()
     _ta_ctol = (assets_n.abs() * 0.02).clip(lower=50e6)
     _ta_have = assets_n.notna() & _ta_ident.notna()
+    _ta_economically_valid = (assets_n > 0) & (_ta_liab >= 0)
     _ta_closure = pd.Series(np.nan, index=assets_n.index)
-    _ta_closure[_ta_have] = 1.0
-    _ta_closure[_ta_have & (_ta_resid > _ta_ctol)] = 0.0
+    _ta_closure[_ta_have] = 0.0
+    _ta_closure[
+        _ta_have & _ta_economically_valid & (_ta_resid <= _ta_ctol)
+    ] = 1.0
     add_val('8_Integrity_Checks', 'Metric: Balance Sheet Closure Verified', _ta_closure[_ta_have])
 
     add_val('5_KPI_Metrics', 'Metric: Gross Margin %', (gp_n / rev_n) * 100)
@@ -13203,21 +16424,42 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     add_val('5_KPI_Metrics', 'Metric: Free Cash Flow', fcf)
     add_val('5_KPI_Metrics', 'Metric: FCF Margin %', (fcf / rev_n) * 100)
     
-    st_debt  = get_num('Short-term Debt').fillna(0)
-    st_borr  = get_num('Short-term Borrowings').fillna(0)
-    cp_ltd   = get_num('Current Portion of Long-term Debt').fillna(0)
-    lt_debt_total = get_num('Long-term Debt').fillna(0)
-    lt_debt_parts = get_num('Senior Notes').fillna(0) + \
-                    get_num('Convertible Debt').fillna(0) + \
-                    get_num('Other Long-term Borrowings').fillna(0)
+    st_debt_raw = get_num('Short-term Debt')
+    st_borr_raw = get_num('Short-term Borrowings')
+    cp_ltd_raw = get_num('Current Portion of Long-term Debt')
+    lt_debt_total_raw = get_num('Long-term Debt')
+    senior_notes_raw = get_num('Senior Notes')
+    convertible_debt_raw = get_num('Convertible Debt')
+    other_lt_borrowings_raw = get_num('Other Long-term Borrowings')
+    op_lc_raw = get_num('Operating Lease Liability (Current)')
+    op_lnc_raw = get_num('Operating Lease Liability (Non-current)')
+    fin_lc_raw = get_num('Finance Lease Liability (Current)')
+    fin_lnc_raw = get_num('Finance Lease Liability (Non-current)')
+
+    _debt_sources = [
+        st_debt_raw, st_borr_raw, cp_ltd_raw, lt_debt_total_raw,
+        senior_notes_raw, convertible_debt_raw, other_lt_borrowings_raw,
+        op_lc_raw, op_lnc_raw, fin_lc_raw, fin_lnc_raw,
+    ]
+    debt_evidence = pd.concat(_debt_sources, axis=1).notna().any(axis=1)
+
+    st_debt = st_debt_raw.fillna(0)
+    st_borr = st_borr_raw.fillna(0)
+    cp_ltd = cp_ltd_raw.fillna(0)
+    lt_debt_total = lt_debt_total_raw.fillna(0)
+    lt_debt_parts = (senior_notes_raw.fillna(0)
+                     + convertible_debt_raw.fillna(0)
+                     + other_lt_borrowings_raw.fillna(0))
     lt_debt = lt_debt_total.where(lt_debt_total != 0, lt_debt_parts)
-    op_lc    = get_num('Operating Lease Liability (Current)').fillna(0)
-    op_lnc   = get_num('Operating Lease Liability (Non-current)').fillna(0)
-    fin_lc   = get_num('Finance Lease Liability (Current)').fillna(0)
-    fin_lnc  = get_num('Finance Lease Liability (Non-current)').fillna(0)
+    op_lc = op_lc_raw.fillna(0)
+    op_lnc = op_lnc_raw.fillna(0)
+    fin_lc = fin_lc_raw.fillna(0)
+    fin_lnc = fin_lnc_raw.fillna(0)
     
     total_st_debt = st_debt.where(st_debt != 0, st_borr + cp_ltd)
-    total_debt = total_st_debt + lt_debt + op_lc + op_lnc + fin_lc + fin_lnc
+    total_debt = (
+        total_st_debt + lt_debt + op_lc + op_lnc + fin_lc + fin_lnc
+    ).where(debt_evidence)
     add_val('5_KPI_Metrics', 'Metric: Total Debt', total_debt)
 
     # -- Lease Liabilities (ASC 842) ----------------------------------
@@ -13241,11 +16483,11 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     si_n = pd.to_numeric(short_invest, errors='coerce').fillna(0)
     total_cash = ce_n + si_n
     total_cash[cash_equiv.isna() & short_invest.isna()] = np.nan
-    if not total_cash.isna().all() or not total_debt.isna().all():
-        tc_fill = total_cash.fillna(0)
-        td_fill = total_debt.fillna(0)
-        net_cash = tc_fill - td_fill
-        net_cash[total_cash.isna() & total_debt.isna()] = np.nan
+    if not total_cash.isna().all() and not total_debt.isna().all():
+        # Missing debt facts are not proof of zero debt, just as missing cash
+        # facts are not proof of zero cash.  Publish only on evidence for both.
+        net_cash = (total_cash - total_debt).where(
+            total_cash.notna() & total_debt.notna())
         add_val('5_KPI_Metrics', 'Metric: Net Cash (Debt)', net_cash)
 
     # -- ROE % (Annualised) -------------------------------------------
@@ -13388,9 +16630,11 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     asset_keywords = ['AR', 'Inventory', 'Prepaid', 'Asset']
     ocf_total = get_row('Operating Cash Flow', preferred_cat='3_Cash_Flow')
     ocf_residual = pd.Series(0.0, index=pivoted.columns)
+    _cf_claimed = set()
+    _ocf_contribs = {}
+    _inv_contribs = {}
     if not ocf_total.isna().all():
         ocf_sum = pd.Series(0.0, index=pivoted.columns)
-        _ocf_contribs = {}
         for lbl in op_components:
             val = get_num(lbl, preferred_cat='3_Cash_Flow').fillna(0)
             
@@ -13419,7 +16663,6 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
             if isinstance(_info, dict):
                 _cf_counted.update(_info.get('tags') or [])
         _cf_counted = frozenset(_cf_counted)
-        _cf_claimed = set()
         _dyn_cf = []
         for _cat0, _lbl in pivoted.index:
             if _cat0 != '3_Cash_Flow' or _lbl in op_components or _lbl in _cf_claimed:
@@ -13842,20 +17085,10 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     # ENHANCED FOOTING VERIFICATION
     # 1.0 = Verified (all residuals < 50M), 0.0 = Not Verified
     # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    footing_verified = pd.Series(1.0, index=pivoted.columns)
-
-    # Check Income Statement residuals
-    for res in [gp_res, opinc_res, pretax_res, ni_res]:
-        if res.notna().any():
-            footing_verified[res.abs() > 50e6] = 0.0
-
-    # Check Cash Flow residuals (only if totals exist)
-    if inv_total.notna().any():
-        footing_verified[inv_residual.abs() > 50e6] = 0.0
-    if fin_total.notna().any():
-        footing_verified[fin_residual.abs() > 50e6] = 0.0
-
-    add_val('8_Integrity_Checks', 'Metric: Financials Footing Verified', footing_verified)
+    # The broad financials-footing flag is published only by
+    # ``_refresh_granular_footing_checks`` after all three core statements have
+    # been evaluated.  Seeding it here with 1.0 made evidence-free and partial
+    # historical periods look fully verified.
     
     # -- Basis-aware Segment Revenue Verification and Residual Repair --
     # Only verify business-segment revenue when we can identify a clean,
@@ -14030,14 +17263,23 @@ def _repair_always_positive(df):
     # write target/print are unchanged, so behavior is identical to iterrows.
     for _t in df.itertuples(index=True, name=None):
         idx = _t[0]
+        category = idx[0]
         label = idx[1]
         base_label = label.split(' - ')[0]
         
         is_strictly_positive = False
         label_lower = label.lower()
-        if 'share based' in label_lower or 'stock based' in label_lower:
+        if (base_label.casefold() in {
+                'share based compensation', 'stock based compensation',
+                'stock-based compensation'}):
             is_strictly_positive = True
-        elif any(base_label == kw or base_label.startswith(kw) for kw in ALWAYS_POSITIVE_CF_LABELS):
+        elif (category == '3_Cash_Flow'
+              and (label_lower.startswith('proceeds from ')
+                   or label_lower.startswith('shares issued'))):
+            is_strictly_positive = True
+        elif (category == '3_Cash_Flow'
+              and any(base_label == kw or base_label.startswith(kw)
+                      for kw in ALWAYS_POSITIVE_CF_LABELS)):
             is_strictly_positive = True
             
         if is_strictly_positive:
@@ -14052,6 +17294,7 @@ def _remerge_false_positive_splits(df):
     """
     Check for ' (Pre Change)' and ' (Post Change)' labels.
     If they match 100% on overlapping non-NaN periods, re-merge them.
+
     Used to fix false positive segment splits (e.g. in Adobe).
     """
     labels = df.index.get_level_values('Label')
@@ -14180,6 +17423,96 @@ def apply_stock_splits(df):
             for col, _ in clusters[k+1]: shares_adj[col] = max(shares_adj.get(col, 1.0), cumulative)
         if shares_adj: break
 
+    # A share-count level change is not, by itself, evidence of a stock split.
+    # IPOs, preferred-stock conversions, note conversions, and large issuances
+    # can all create clean integer-looking jumps (HOOD's 2021 IPO is a concrete
+    # example).  Only normalize an older share cluster when the filed
+    # Net-Income / Shares / EPS identity independently says that the shares are
+    # still on the old basis while EPS is already on the new basis.  If filed
+    # shares and EPS reconcile on their existing basis, the jump is economic
+    # dilution/capitalization and must be preserved.
+    if shares_adj:
+        nci_idx = ('1_Income_Statement', 'Net Income to Noncontrolling Interest')
+        nci_s = (pd.to_numeric(df.loc[nci_idx], errors='coerce')
+                 if nci_idx in df.index else None)
+
+        def _split_identity_status(col, factor):
+            """Return corroborated, coherent, or unknown for one candidate.
+
+            ``corroborated`` means multiplying shares by ``factor`` repairs a
+            filed EPS identity.  ``coherent`` is affirmative counter-evidence:
+            the issuer's filed shares and EPS already reconcile without a
+            split adjustment.  Considering both consolidated and ex-NCI income
+            avoids mistaking an umbrella-company numerator mismatch for a
+            split signal.
+            """
+            ni_s = _num.get(NI_IDX)
+            if ni_s is None:
+                return 'unknown'
+            ni_v = ni_s.get(col, np.nan)
+            if pd.isna(ni_v):
+                return 'unknown'
+            numerators = [float(ni_v)]
+            if nci_s is not None:
+                nci_v = nci_s.get(col, np.nan)
+                if pd.notna(nci_v):
+                    numerators.append(float(ni_v) - float(nci_v))
+
+            saw_factor = False
+            for sh_idx, ep_idx in (
+                    (SHARES_BASIC, EPS_BASIC),
+                    (SHARES_DILUTED, EPS_DILUTED)):
+                sh_s, ep_s = _num.get(sh_idx), _num.get(ep_idx)
+                if sh_s is None or ep_s is None:
+                    continue
+                sh_v, ep_v = sh_s.get(col, np.nan), ep_s.get(col, np.nan)
+                if (pd.isna(sh_v) or pd.isna(ep_v)
+                        or float(sh_v) < MIN_SHARES
+                        or abs(float(ep_v)) < 1e-6):
+                    continue
+                for numerator in numerators:
+                    ratio = abs(numerator / (float(sh_v) * float(ep_v)))
+                    if not np.isfinite(ratio):
+                        continue
+                    if abs(ratio - 1.0) <= 0.15:
+                        return 'coherent'
+                    if abs(ratio - float(factor)) / float(factor) <= 0.15:
+                        saw_factor = True
+            return 'corroborated' if saw_factor else 'unknown'
+
+        corroborated_adjustments = {}
+        by_factor = defaultdict(list)
+        for col, factor in shares_adj.items():
+            by_factor[float(factor)].append(col)
+        for factor, factor_cols in by_factor.items():
+            statuses = {
+                col: _split_identity_status(col, factor)
+                for col in factor_cols
+            }
+            corroborated = [
+                col for col, status in statuses.items()
+                if status == 'corroborated'
+            ]
+            coherent = [
+                col for col, status in statuses.items()
+                if status == 'coherent'
+            ]
+            # A split applies consistently across its pre-split era.  One
+            # coherent filed identity is therefore enough to veto a blanket
+            # adjustment; multi-period eras need corroboration in at least two
+            # periods so a single noisy EPS numerator cannot create a split.
+            required = 1 if len(factor_cols) == 1 else 2
+            if not coherent and len(corroborated) >= required:
+                for col in factor_cols:
+                    corroborated_adjustments[col] = factor
+            else:
+                nice = int(factor) if factor == int(factor) else factor
+                print(
+                    f"  [Stock Split] Ignored uncorroborated x{nice} share "
+                    f"level change ({len(corroborated)} EPS identity signal(s), "
+                    f"{len(coherent)} already coherent).")
+        shares_adj = corroborated_adjustments
+
     eps_adj = {}
     valid_eps_factors = sorted(set(shares_adj.values())) if shares_adj else []
     if NI_IDX in _num and valid_eps_factors:
@@ -14235,7 +17568,6 @@ def apply_stock_splits(df):
                     closest = min(valid_eps_factors, key=lambda x: abs(x - ratio))
                     if abs(ratio - closest) / closest < 0.15: eps_adj[col] = max(eps_adj.get(col, 1.0), closest)
 
-    from collections import defaultdict
     def _log_group(adj_dict, signal_name, verb):
         by_factor = defaultdict(list)
         for col, f in sorted(adj_dict.items(), key=lambda x: col_pos.get(x[0], 9999)): by_factor[f].append(col)
@@ -17570,7 +20902,7 @@ def _fx_assemble(annual, xbrl_layer, qz, ye_month):
         A = g("Total Assets", col, _FX_BS)
         L = g("Total Liabilities", col, _FX_BS)
         E = g("Total Equity", col, _FX_BS)
-        if None not in (A, L, E) and A:
+        if None not in (A, L, E) and A > 0 and L >= 0:
             put((_FX_CHK, "Metric: Balance Sheet Closure Verified"), col,
                 1.0 if abs(A - L - E) <= _FX_TOL * abs(A) else 0.0)
         cfo = g("Operating Cash Flow", col, _FX_CF)
@@ -17653,6 +20985,7 @@ def _fx_write_foreign_outputs(final_pivot, ticker, out_dir, diagnostics=None,
         ads_ratio_by_year=ads_ratio_by_year,
         stable_ads_ratio=stable_ads_ratio,
     )
+    final_pivot = _normalize_output_margin_rows(final_pivot)
     if save_xlsx:
         xlsx_dir = f"{out_dir}/excel"
         os.makedirs(xlsx_dir, exist_ok=True)
@@ -17665,9 +20998,9 @@ def _fx_write_foreign_outputs(final_pivot, ticker, out_dir, diagnostics=None,
         except Exception as _xe:
             print(f"  [xlsx] export failed ({_xe}); saved CSV instead.")
 
-    final_pivot = _normalize_output_margin_rows(final_pivot)
     out_path = f"{out_dir}/{ticker}_annual_financials.csv"
-    _profile_call("write_csv", final_pivot.to_csv, out_path)
+    _profile_call("write_csv", final_pivot.to_csv, out_path,
+                  lineterminator="\n")
     return out_path
 
 
@@ -18602,6 +21935,276 @@ def _normalize_output_margin_rows(final_pivot):
             result = result.rename(index={legacy_label: public_label}, level='Label')
     return result
 
+
+_OPERATING_DISPLAY_WINDOW_QUARTERS = 6
+_QUARTER_COLUMN_RE = re.compile(r'^([12]\d{3})-Q([1-4])$')
+
+
+def _hide_unsupported_trailing_periods(final_pivot, protected_periods=None):
+    """Remove only oldest, statement-incomplete pseudo-period columns.
+
+    Comparative facts in a later filing can expose isolated annual/share/balance
+    fragments years before the first usable quarterly statement.  Treating those
+    fragments as a discrete Q4 produces misleading columns.  This gate is
+    intentionally conservative:
+
+    * only a contiguous unsupported tail at the *oldest* end may be removed;
+      an internal or recent sparse quarter is retained so gaps are not hidden;
+    * primary filing periods, verified operating-measure periods, sufficiently
+      complete discrete face statements, and valid balance sheets are retained;
+    * this is column-level statement coverage logic, not operating-metric cleanup.
+    """
+    if final_pivot is None or final_pivot.empty:
+        return final_pivot
+    if not isinstance(final_pivot.index, pd.MultiIndex):
+        return final_pivot
+
+    quarter_columns = []
+    for column in final_pivot.columns:
+        match = _QUARTER_COLUMN_RE.fullmatch(str(column))
+        if match:
+            quarter_columns.append(
+                (int(match.group(1)), int(match.group(2)), column))
+    if not quarter_columns:
+        return final_pivot
+
+    if isinstance(protected_periods, dict):
+        protected_periods = protected_periods.keys()
+    protected_periods = {
+        str(period) for period in (protected_periods or ())
+    }
+
+    core_flow_anchors = (
+        ('1_Income_Statement', 'Revenue'),
+        ('1_Income_Statement', 'Operating Income'),
+        ('1_Income_Statement', 'Pretax Income'),
+        ('1_Income_Statement', 'Net Income'),
+        ('3_Cash_Flow', 'Operating Cash Flow'),
+        ('3_Cash_Flow', 'Investing Cash Flow'),
+        ('3_Cash_Flow', 'Financing Cash Flow'),
+        ('3_Cash_Flow', 'Net Cash Flow'),
+    )
+    balance_sheet_anchors = (
+        ('2_Balance_Sheet', 'Total Assets'),
+        ('2_Balance_Sheet', 'Total Liabilities'),
+        ('2_Balance_Sheet', 'Total Equity'),
+    )
+
+    audit = final_pivot.attrs.get('fact_audit')
+    audited_period_evidence = {}
+    if (isinstance(audit, pd.DataFrame) and not audit.empty
+            and {'Period', 'Category', 'Label'}.issubset(audit.columns)):
+        audit_subset = audit[
+            audit['Category'].astype(str).isin({
+                '1_Income_Statement', '2_Balance_Sheet', '3_Cash_Flow'
+            })
+        ].copy()
+        if not audit_subset.empty:
+            audit_subset['_DurationNumeric'] = pd.to_numeric(
+                audit_subset.get(
+                    'Duration', pd.Series(np.nan, index=audit_subset.index)),
+                errors='coerce')
+            audit_subset['_QuarterSuffix'] = (
+                audit_subset['Period'].astype(str).str.extract(
+                    r'-(Q[1-4])$', expand=False))
+            audit_subset['_SourceQuarter'] = audit_subset.get(
+                'Q', pd.Series('', index=audit_subset.index)
+            ).fillna('').astype(str)
+            audit_subset['_DerivedDiscrete'] = audit_subset.get(
+                'SourcePeriodRole', pd.Series('', index=audit_subset.index)
+            ).fillna('').astype(str).eq('derived_discrete')
+            audit_subset['_QuarterMatches'] = (
+                audit_subset['_SourceQuarter'].eq(
+                    audit_subset['_QuarterSuffix'])
+                | audit_subset['_DerivedDiscrete'])
+            audit_subset['_FlowDiscrete'] = (
+                audit_subset['_DerivedDiscrete']
+                | audit_subset['_DurationNumeric'].between(45, 125)
+            )
+            audit_subset['_Instant'] = (
+                audit_subset['_DurationNumeric'].between(0, 15))
+            for period, period_rows in audit_subset.groupby('Period'):
+                discrete_face_facts = set()
+                anchors = set()
+                for _, source_row in period_rows.iterrows():
+                    key = (str(source_row['Category']), str(source_row['Label']))
+                    if not bool(source_row['_QuarterMatches']):
+                        continue
+                    category = key[0]
+                    qualifies = (
+                        category == '2_Balance_Sheet'
+                        and bool(source_row['_Instant'])
+                    ) or (
+                        category in {'1_Income_Statement', '3_Cash_Flow'}
+                        and bool(source_row['_FlowDiscrete'])
+                    )
+                    if not qualifies:
+                        continue
+                    discrete_face_facts.add(key)
+                    if key in core_flow_anchors or key in balance_sheet_anchors:
+                        anchors.add(key)
+                audited_period_evidence[str(period)] = {
+                    'facts': discrete_face_facts,
+                    'anchors': anchors,
+                }
+
+    def _present(key, column):
+        if key not in final_pivot.index:
+            return False
+        value = final_pivot.at[key, column]
+        if pd.isna(value):
+            return False
+        return not (isinstance(value, str) and not value.strip())
+
+    def _has_operating_measure(column):
+        try:
+            categories = final_pivot.index.get_level_values('Category')
+        except (KeyError, ValueError):
+            categories = final_pivot.index.get_level_values(0)
+        operating_rows = final_pivot.loc[
+            categories == OPERATING_METRICS_CATEGORY, column]
+        if operating_rows.empty:
+            return False
+        operating_rows = operating_rows.replace(r'^\s*$', np.nan, regex=True)
+        return bool(operating_rows.notna().any())
+
+    def _has_valid_complete_balance_sheet(column, evidence):
+        if not all(key in evidence for key in balance_sheet_anchors):
+            return False
+        values = []
+        for key in balance_sheet_anchors:
+            value = pd.to_numeric(
+                pd.Series([final_pivot.at[key, column]]), errors='coerce').iloc[0]
+            values.append(value)
+        assets, liabilities, equity = values
+        if (pd.isna(assets) or pd.isna(liabilities) or pd.isna(equity)
+                or assets <= 0 or liabilities < 0):
+            return False
+        tolerance = max(abs(float(assets)) * 0.005, 50e6)
+        return abs(float(assets) - float(liabilities) - float(equity)) <= tolerance
+
+    def _is_supported(column):
+        if str(column) in protected_periods or _has_operating_measure(column):
+            return True
+
+        audited = audited_period_evidence.get(str(column))
+        if audited is not None:
+            discrete_facts = {
+                key for key in audited['facts'] if _present(key, column)
+            }
+            anchors = {
+                key for key in audited['anchors'] if _present(key, column)
+            }
+        else:
+            # Unit callers and legacy cached pivots may lack an audit ledger.
+            # Visible face rows are a weaker fallback, so require the same
+            # minimum count and a core anchor.
+            discrete_facts = {
+                key for key in final_pivot.index
+                if key[0] in {
+                    '1_Income_Statement', '2_Balance_Sheet', '3_Cash_Flow'
+                } and _present(key, column)
+            }
+            anchors = discrete_facts.intersection(
+                set(core_flow_anchors) | set(balance_sheet_anchors))
+
+        if _has_valid_complete_balance_sheet(column, anchors):
+            return True
+        has_flow_anchor = any(key in anchors for key in core_flow_anchors)
+        return bool(has_flow_anchor and len(discrete_facts) >= 4)
+
+    oldest_first = sorted(quarter_columns, key=lambda item: (item[0], item[1]))
+    unsupported_tail = []
+    for _, _, column in oldest_first:
+        if _is_supported(column):
+            break
+        unsupported_tail.append(column)
+    if not unsupported_tail:
+        return final_pivot
+
+    attrs = dict(final_pivot.attrs)
+    result = final_pivot.drop(columns=unsupported_tail).copy()
+    result.attrs.update(attrs)
+    result.attrs['suppressed_unsupported_trailing_periods'] = tuple(
+        str(column) for column in unsupported_tail)
+    print(
+        "  [Period Coverage] Hid unsupported oldest period fragment(s): "
+        + ', '.join(str(column) for column in unsupported_tail)
+    )
+    return result
+
+
+def _hide_stale_operating_measure_rows(
+        final_pivot, window_quarters=_OPERATING_DISPLAY_WINDOW_QUARTERS):
+    """Hide operating metrics absent from every recent quarter after merging.
+
+    This is deliberately an output-boundary rule.  Operating-measure aliases
+    have already been reconciled and stitched into their canonical row before
+    this function runs, so a recent value reported under *any* proven alias
+    keeps the merged metric visible.  Suppressed rows remain in the fact and
+    alias audit ledgers; only the public CSV/XLSX pivot is filtered.
+    """
+    if final_pivot is None or final_pivot.empty:
+        return final_pivot
+    if not isinstance(final_pivot.index, pd.MultiIndex):
+        return final_pivot
+    try:
+        window_quarters = int(window_quarters)
+    except (TypeError, ValueError):
+        window_quarters = _OPERATING_DISPLAY_WINDOW_QUARTERS
+    if window_quarters <= 0:
+        return final_pivot
+
+    quarter_columns = []
+    for column in final_pivot.columns:
+        match = _QUARTER_COLUMN_RE.fullmatch(str(column))
+        if match:
+            quarter_columns.append(
+                (int(match.group(1)), int(match.group(2)), column))
+    if not quarter_columns:
+        return final_pivot
+
+    recent_columns = [
+        column for _, _, column in
+        sorted(quarter_columns, key=lambda item: (item[0], item[1]), reverse=True)
+        [:window_quarters]
+    ]
+    try:
+        categories = final_pivot.index.get_level_values('Category')
+    except (KeyError, ValueError):
+        categories = final_pivot.index.get_level_values(0)
+    operating_mask = pd.Series(
+        categories == OPERATING_METRICS_CATEGORY,
+        index=final_pivot.index,
+        dtype=bool,
+    )
+    if not operating_mask.any():
+        return final_pivot
+
+    # Empty/whitespace strings are presentation blanks just like NaN.  Numeric
+    # zero is intentionally nonblank and therefore keeps the row visible.
+    recent_values = final_pivot.loc[operating_mask, recent_columns].replace(
+        r'^\s*$', np.nan, regex=True)
+    has_recent_value = recent_values.notna().any(axis=1)
+    suppressed_index = has_recent_value.index[~has_recent_value]
+    if len(suppressed_index) == 0:
+        return final_pivot
+
+    attrs = dict(final_pivot.attrs)
+    result = final_pivot.drop(index=suppressed_index).copy()
+    result.attrs.update(attrs)
+    suppressed_labels = tuple(str(idx[1]) for idx in suppressed_index)
+    result.attrs['suppressed_operating_metrics'] = suppressed_labels
+    result.attrs['operating_display_recent_quarters'] = tuple(
+        str(column) for column in recent_columns)
+    print(
+        f"  [Operating Display] Hid {len(suppressed_labels)} merged metric(s) "
+        f"with no values in the latest {len(recent_columns)} quarter(s): "
+        + ', '.join(suppressed_labels)
+    )
+    return result
+
+
 def _native_annual_sort_output(final_pivot, is_financial=False, is_insurance=False):
     return _sort_final_output_pivot(
         final_pivot,
@@ -18659,7 +22262,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-14.native-extraction.v8-annual-consolidation-persist"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-18.native-extraction.v13-bs-instant-disclosure-semantics"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -18829,7 +22432,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-14.final-pivot.v19-geography-alias-consolidation"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-18.final-pivot.v29-provenance-gated-debt-capex"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -19497,6 +23100,14 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
         print(f"  [Cache] Loaded native annual extraction cache for {ticker.upper()} "
               f"({len(filings)} filing(s), {len(all_facts)} fact rows).")
     else:
+        progress.set(8.0, "Preparing deterministic statement taxonomy")
+        _prepared_xbrl, _learned_concepts = (
+            _prefetch_and_learn_statement_concepts(
+                filings, max_workers=max_workers, log_output=log_output))
+        if _learned_concepts:
+            print(f"  [FaceStmt] Deterministic pre-pass registered/merged "
+                  f"{_learned_concepts} concept(s) across "
+                  f"{_prepared_xbrl} annual filing(s).")
         if log_output:
             print(f"\n[Annual Phase 1] Processing {len(filings)} 10-K/10-K/A filings with {max_workers} workers...")
 
@@ -19620,6 +23231,7 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
 
     final_pivot = _apply_quality_result_fixes(final_pivot)
     final_pivot = _normalize_output_margin_rows(final_pivot)
+    final_pivot = _hide_stale_operating_measure_rows(final_pivot)
     final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native annual pre-write sort")
 
     progress.set(98.0, "Writing annual output file")
@@ -19633,15 +23245,18 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
             _save_pivot_xlsx(final_pivot, out_path)
         except ImportError:
             out_path = f"{out_dir}/{ticker}_annual_financials.csv"
-            _profile_call("write_csv", final_pivot.to_csv, out_path)
+            _profile_call("write_csv", final_pivot.to_csv, out_path,
+                          lineterminator="\n")
             print("  [xlsx] openpyxl not installed -- run 'pip install openpyxl'; saved annual CSV instead.")
         except Exception as xe:
             out_path = f"{out_dir}/{ticker}_annual_financials.csv"
-            _profile_call("write_csv", final_pivot.to_csv, out_path)
+            _profile_call("write_csv", final_pivot.to_csv, out_path,
+                          lineterminator="\n")
             print(f"  [xlsx] annual export failed ({xe}); saved CSV instead.")
     else:
         out_path = f"{out_dir}/{ticker}_annual_financials.csv"
-        _profile_call("write_csv", final_pivot.to_csv, out_path)
+        _profile_call("write_csv", final_pivot.to_csv, out_path,
+                      lineterminator="\n")
 
     print(f"Success! Annual data saved to {out_path}")
     return out_path
@@ -19819,6 +23434,14 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         print(f"  [Cache] Loaded native extraction cache for {ticker.upper()} "
               f"({len(filings)} filing(s), {len(all_facts)} fact rows).")
     else:
+        progress.set(8.0, "Preparing deterministic statement taxonomy")
+        _prepared_xbrl, _learned_concepts = (
+            _prefetch_and_learn_statement_concepts(
+                filings, max_workers=MAX_WORKERS, log_output=log_output))
+        if _learned_concepts:
+            print(f"  [FaceStmt] Deterministic pre-pass registered/merged "
+                  f"{_learned_concepts} concept(s) across "
+                  f"{_prepared_xbrl} filing(s).")
         if log_output:
             print(f"\n[Phase 1] Processing {len(filings)} filings with {MAX_WORKERS} workers...")
 
@@ -19971,6 +23594,13 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         cached_final = _final_pivot_cache_get(final_cache_key)
         if cached_final is not _FINAL_PIVOT_CACHE_MISS:
             final_pivot = cached_final
+            _fact_audit = final_pivot.attrs.get('fact_audit', pd.DataFrame())
+            _operating_alias_audit = final_pivot.attrs.get(
+                'operating_alias_audit', pd.DataFrame())
+            _source_output_periods = set(
+                final_pivot.attrs.get('source_periods', ()))
+            _eligible_operating_output_periods = set(
+                final_pivot.attrs.get('eligible_operating_source_periods', ()))
             progress.set(97.0, "Loaded final pivot cache")
             print(f"  [Cache] Loaded native final pivot cache for {ticker.upper()} "
                   f"({len(final_pivot)} rows).")
@@ -19987,22 +23617,44 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 )
             finally:
                 progress.stop_pulse()
+            _fact_audit = final_pivot.attrs.get('fact_audit', pd.DataFrame())
+            _operating_alias_audit = final_pivot.attrs.get(
+                'operating_alias_audit', pd.DataFrame())
+            _source_output_periods = set(
+                final_pivot.attrs.get('source_periods', ()))
+            _eligible_operating_output_periods = set(
+                final_pivot.attrs.get('eligible_operating_source_periods', ()))
             progress.set(82.0, "Quarterly statements built")
             progress.start_pulse(88.0, "Organizing output rows", expected_seconds=20.0)
-        
+
             # Filter out 4a Business Segments that have no data in the most recent 8 quarters
             if len(final_pivot.columns) > 0:
                 is_4a = final_pivot.index.get_level_values('Category') == '4a_Segments_Business'
+                is_operating_measure = (
+                    final_pivot.index.get_level_values('Label').astype(str)
+                    .str.startswith('Operating Measure - ')
+                )
                 check_limit = min(8, len(final_pivot.columns))
-                stale_4a_mask = is_4a & final_pivot.iloc[:, :check_limit].isna().all(axis=1)
+                stale_4a_mask = (
+                    is_4a & ~is_operating_measure
+                    & final_pivot.iloc[:, :check_limit].isna().all(axis=1)
+                )
                 final_pivot = final_pivot[~stale_4a_mask]
 
+                is_operating_measure = (
+                    final_pivot.index.get_level_values('Label').astype(str)
+                    .str.startswith('Operating Measure - ')
+                )
                 is_seg = final_pivot.index.get_level_values('Category').isin({'4a_Segments_Business', '4b_Segments_Geographic_Regions', '4c_Segments_Geographic_Countries', '4d_Segments_Cross_Tabulated'})
-                sparse_seg_mask = is_seg & (final_pivot.notna().sum(axis=1) <= 2)
+                sparse_seg_mask = (
+                    is_seg
+                    & ~is_operating_measure
+                    & (final_pivot.notna().sum(axis=1) <= 2)
+                )
                 final_pivot = final_pivot[~sparse_seg_mask]
 
             final_pivot = final_pivot.dropna(how='all')
-        
+
             _html_business_labels = {
                 re.sub(r'\s+', ' ', str(f.get('Label') or '')).strip().casefold()
                 for f in all_facts
@@ -20018,40 +23670,40 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 parts = [p.strip() for p in lbl.split(' - ')]
                 if not parts:
                     return False
-                
+
                 prefix = parts[0]
-            
+
                 # 1. Metric-based check: if it doesn't start with a "genuine" business segment metric, move to disclosures.
                 # This handles things like "Useful Life", "RPO Timing", etc.
                 if prefix not in GENUINE_SEGMENT_METRICS:
                     return True
-                
+
                 # 2. Member-based check: even if the metric is genuine, the member name might be noise.
                 if len(parts) >= 2:
                     member_full = ' - '.join(parts[1:]).lower()
-                
+
                     # Check for "Total" or "Consolidated" summaries that should be disclosures
                     if any(kw == member_full for kw in ('operating segments', 'reportable segments', 'consolidated', 'total', 'all segments')):
                         return True
-                
+
                     # Check against DISCLOSURE_PATTERNS (noise tags like "state and local jurisdiction")
                     if any(pat in member_full for pat in DISCLOSURE_PATTERNS):
                         return True
-                
-                    # Ratio guard: if member name contains "percent", "percentage", or "ratio" 
+
+                    # Ratio guard: if member name contains "percent", "percentage", or "ratio"
                     # but the metric prefix itself isn't a known ratio metric, it's a disclosure.
-                    # This catches items like "Revenue - Percentage of Net Sales" or 
+                    # This catches items like "Revenue - Percentage of Net Sales" or
                     # "Operating Income - Defined Contribution Plan Percent".
                     RATIO_KWS = {'percent', 'percentage', 'ratio', 'weighted average'}
                     if any(kw in member_full for kw in RATIO_KWS):
                         # Exception: if prefix is "Customer Concentration %", keep it in segments (though typically cat 7)
                         if 'Concentration %' not in prefix:
                             return True
-                
+
                     # Catch internal/technical tags
                     if '_' in member_full:
                         return True
-                    
+
                 return False
 
             new_idx = [
@@ -20059,8 +23711,10 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 for c, l in final_pivot.index
             ]
             final_pivot.index = pd.MultiIndex.from_tuples(new_idx, names=['Category', 'Label'])
-        
-            final_pivot = final_pivot.groupby(level=['Category', 'Label']).first()
+
+            final_pivot = _groupby_first_preserving_quality_attrs(
+                final_pivot)
+
             progress.set(85.0, "Preparing display order")
         
             # --- NEW: Dynamic Sort Order ---
@@ -20274,11 +23928,6 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 if cat == '5_KPI_Metrics': return (CAT_ORDER.get(cat, 99), kpi_order.get(label, 999), label)
                 return (CAT_ORDER.get(cat, 99), item_order.get(base, 999), 0 if ' - ' not in label else 1, label)
 
-            # Keep only the coarse income-statement nature split on the face; move
-            # finer product/service members back to the segment block. Then stitch
-            # any cross-era renamed segment members into one continuous series.
-            # (Both run before the sort so re-categorised rows land in the right
-            # section.)
             progress.stop_pulse()
             progress.set(88.0, "Output rows organized")
             progress.start_pulse(97.0, "Final accounting repairs", expected_seconds=55.0)
@@ -20292,16 +23941,13 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             final_pivot = _reconcile_equity_with_nci(final_pivot)
             final_pivot = _neutralize_ytd_undercapture(final_pivot)
             final_pivot = _recompute_cf_residuals(final_pivot)
-        
-            # Reconcile abandoned face-statement disaggregation members. A nature-
-            # of-revenue (product/service) line carrying no data in the recent
-            # window is not part of the filer's current face presentation, but it is
-            # often the older half of a series whose recent half now lives in the
-            # segment block -- so its history is spliced there before the row is
-            # removed, rather than discarded. (Genuine current members -- IBM's
-            # Services/Sales/Financing -- keep recent data and are retained.)
+
+            # Era stitching can leave an abandoned face-statement
+            # disaggregation or a mangled segment continuation. Resolve both
+            # after the accounting passes have populated every usable period.
             final_pivot = _stitch_or_drop_abandoned_face_disagg(final_pivot)
             final_pivot = _merge_prefix_continuation_members(final_pivot)
+
             final_pivot = _repair_q4_from_annual_ytd(final_pivot)
             final_pivot = _repair_balance_sheet_identity(final_pivot)
             final_pivot = _refresh_balance_sheet_closure(final_pivot)
@@ -20330,8 +23976,8 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 # Protect core curated tags: they are explicitly mapped granular data and should never be dropped.
                 if label in CONCEPT_MAP and not CONCEPT_MAP[label].get('auto', False):
                     continue
-                
-                # Recency Guard: if the row has data in the most recent 4 periods, it is an active, 
+
+                # Recency Guard: if the row has data in the most recent 4 periods, it is an active,
                 # newly-reported genuine metric (not abandoned garbage). Protect it!
                 if final_pivot.loc[(cat, label)].iloc[:4].notna().any():
                     continue
@@ -20339,7 +23985,7 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 cpt = label_to_concept.get((cat, label))
                 if cpt:
                     cpt_clean = cpt.split(':')[-1] if ':' in cpt else cpt.split('_')[-1]
-                
+
                     current_cpts = {cpt_clean}
                     rolled_up_target = None
                     for _ in range(4):
@@ -20355,7 +24001,7 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                             if rolled_up_target: break
                         if rolled_up_target: break
                         current_cpts = next_cpts
-                    
+
                     if rolled_up_target:
                         print(f"  [Sparse Rollup] Accurately rolling up abandoned sparse '{label}' into parent '{rolled_up_target}'")
                         final_pivot = final_pivot.drop((cat, label))
@@ -20363,9 +24009,28 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             final_pivot = _apply_quality_result_fixes(final_pivot)
             final_pivot = _sort_preserving_values(final_pivot, sort_key, is_item_order, is_financial, is_insurance, context="native quarterly final sort")
 
+            for _period, _display_date in _source_period_dates_from_audit(
+                    _fact_audit).items():
+                if _period in final_pivot.columns and not period_dates.get(_period):
+                    period_dates[_period] = _display_date
+
             if period_dates:
-                header_row = pd.DataFrame({col: period_dates.get(col, '') for col in final_pivot.columns}, index=pd.MultiIndex.from_tuples([('0_Period_Header', 'Period Ending')], names=['Category', 'Label']))
-                final_pivot = pd.concat([header_row, final_pivot])
+                final_pivot = _prepend_period_header_preserving_attrs(
+                    final_pivot, period_dates)
+            final_pivot.attrs['fact_audit'] = _fact_audit
+            final_pivot.attrs['operating_alias_audit'] = _operating_alias_audit
+            final_pivot.attrs['source_periods'] = sorted(_source_output_periods)
+            final_pivot.attrs['eligible_operating_source_periods'] = sorted(
+                _eligible_operating_output_periods)
+            final_pivot.attrs[_INCOMPLETE_DEBT_COMPONENT_PERIODS_ATTR] = sorted(
+                _fact_audit.attrs.get(
+                    _INCOMPLETE_DEBT_COMPONENT_PERIODS_ATTR, ()))
+            final_pivot.attrs[_ADDITIVE_CAPEX_DETAIL_PERIODS_ATTR] = list(
+                _fact_audit.attrs.get(
+                    _ADDITIVE_CAPEX_DETAIL_PERIODS_ATTR, ()))
+            final_pivot.attrs[_ADDITIVE_CAPEX_TOTALS_ATTR] = dict(
+                _fact_audit.attrs.get(
+                    _ADDITIVE_CAPEX_TOTALS_ATTR, {}))
 
             progress.stop_pulse()
             progress.set(97.0, "Final repairs complete")
@@ -20380,13 +24045,43 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 },
             )
 
+        _period_header_key = ('0_Period_Header', 'Period Ending')
+        if (_period_header_key in final_pivot.index
+                and isinstance(_fact_audit, pd.DataFrame)
+                and not _fact_audit.empty):
+            for _period, _display_date in _source_period_dates_from_audit(
+                    _fact_audit).items():
+                if _period not in final_pivot.columns:
+                    continue
+                _existing_date = final_pivot.at[_period_header_key, _period]
+                if pd.isna(_existing_date) or not str(_existing_date).strip():
+                    final_pivot.at[_period_header_key, _period] = _display_date
+
         final_pivot = _apply_quality_result_fixes(final_pivot)
         final_pivot = _normalize_output_margin_rows(final_pivot)
+        final_pivot = _hide_stale_operating_measure_rows(final_pivot)
+        final_pivot = _hide_unsupported_trailing_periods(
+            final_pivot, protected_periods=period_dates)
         final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native quarterly pre-write sort")
 
         progress.set(98.0, "Writing output file")
         out_dir = "output/financials"
         os.makedirs(out_dir, exist_ok=True)
+
+        if isinstance(_fact_audit, pd.DataFrame) and not _fact_audit.empty:
+            quality_dir = "output/quality"
+            os.makedirs(quality_dir, exist_ok=True)
+            audit_path = f"{quality_dir}/{ticker}_fact_audit.csv"
+            _profile_call("write_csv", _fact_audit.to_csv, audit_path,
+                          index=False, lineterminator="\n")
+        if (isinstance(_operating_alias_audit, pd.DataFrame)
+                and not _operating_alias_audit.empty):
+            quality_dir = "output/quality"
+            os.makedirs(quality_dir, exist_ok=True)
+            alias_audit_path = f"{quality_dir}/{ticker}_operating_alias_audit.csv"
+            _profile_call(
+                "write_csv", _operating_alias_audit.to_csv,
+                alias_audit_path, index=False, lineterminator="\n")
         
         if save_xlsx:
             # Create the excel sub-folder inside output/financials/
@@ -20399,17 +24094,20 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             except ImportError:
                 # Fallback to CSV in output/financials/
                 out_path = f"{out_dir}/{ticker}_financials.csv"
-                _profile_call("write_csv", final_pivot.to_csv, out_path)
+                _profile_call("write_csv", final_pivot.to_csv, out_path,
+                              lineterminator="\n")
                 _status_print("  [xlsx] openpyxl not installed -- run 'pip install openpyxl'; saved CSV instead.")
             except Exception as _xe:
                 # Fallback to CSV in output/financials/
                 out_path = f"{out_dir}/{ticker}_financials.csv"
-                _profile_call("write_csv", final_pivot.to_csv, out_path)
+                _profile_call("write_csv", final_pivot.to_csv, out_path,
+                              lineterminator="\n")
                 _status_print(f"  [xlsx] export failed ({_xe}); saved CSV instead.")
         else:
             # Save standard CSV in output/financials/
             out_path = f"{out_dir}/{ticker}_financials.csv"
-            _profile_call("write_csv", final_pivot.to_csv, out_path)
+            _profile_call("write_csv", final_pivot.to_csv, out_path,
+                          lineterminator="\n")
 
         if not log_output:
             progress.finish("Complete", f"Saved to {out_path}")
