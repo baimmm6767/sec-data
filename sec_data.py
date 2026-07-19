@@ -10161,6 +10161,128 @@ def _geo_values_scale_equivalent(left, right) -> bool:
     return any(abs(ratio - scale) <= 1e-8 * scale for scale in (1_000.0, 1_000_000.0))
 
 
+
+def _gb_promote_proven_geographic_revenue_history_facts(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Route stranded disclosure-era revenue into an existing geography series.
+
+    Historical filings can label the same geographic participant differently or
+    conservatively leave it in ``6_Disclosures`` while recent filings already
+    establish the canonical 4b/4c series.  Promote only when one existing
+    geography target is unambiguous:
+      * an exact normalized member may extend disjoint history; or
+      * a non-exact alias needs at least two close overlapping periods and no
+        material conflict.
+
+    The operation changes only category/label metadata.  Keeping annual and
+    quarterly facts in one group before candidate selection allows the normal
+    audited Q4 derivation to operate on a single analytical basis.
+    """
+    required = {'Category', 'Label', 'Value'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    geo_categories = {
+        '4b_Segments_Geographic_Regions',
+        '4c_Segments_Geographic_Countries',
+    }
+    out = df.copy()
+    targets = []
+    for idx, row in out.iterrows():
+        if row.get('Category') not in geo_categories:
+            continue
+        metric, member = _split_segment_display_label(row.get('Label'))
+        if _normalize_label_key(metric) != 'revenue' or not member:
+            continue
+        member_base, _basis = _split_geographic_basis_suffix(member)
+        targets.append({
+            'category': row.get('Category'),
+            'label': row.get('Label'),
+            'member': member_base,
+            'member_key': _normalize_label_key(
+                _gb_clean_member_footnote(member_base)),
+        })
+    if not targets:
+        return out
+
+    period_cols = [c for c in ('FY', 'Q', 'End', 'Duration') if c in out.columns]
+
+    def _series_for(category, label):
+        sub = out[out['Category'].eq(category) & out['Label'].eq(label)]
+        values = defaultdict(list)
+        for _, row in sub.iterrows():
+            key = tuple(row.get(c) for c in period_cols)
+            value = pd.to_numeric(pd.Series([row.get('Value')]),
+                                  errors='coerce').iloc[0]
+            if pd.notna(value):
+                values[key].append(float(value))
+        return values
+
+    target_series = {
+        (target['category'], target['label']): _series_for(
+            target['category'], target['label'])
+        for target in targets
+    }
+    changed = []
+    disclosure_rows = out.index[out['Category'].eq('6_Disclosures')].tolist()
+    for idx in disclosure_rows:
+        if idx not in out.index or out.at[idx, 'Category'] != '6_Disclosures':
+            continue
+        source_label = out.at[idx, 'Label']
+        metric, member = _split_segment_display_label(source_label)
+        if _normalize_label_key(metric) != 'revenue' or not member:
+            continue
+        member_base, _basis = _split_geographic_basis_suffix(member)
+        member_key = _normalize_label_key(
+            _gb_clean_member_footnote(member_base))
+        related = [target for target in targets
+                   if _gb_duplicate_members_related(
+                       f'Revenue - {member_base}',
+                       f"Revenue - {target['member']}")]
+        distinct = {(target['category'], target['label']) for target in related}
+        if len(distinct) != 1:
+            continue
+        target = related[0]
+        exact_member = member_key == target['member_key']
+        if not exact_member:
+            candidate_rows = out[
+                out['Category'].eq('6_Disclosures')
+                & out['Label'].eq(out.at[idx, 'Label'])]
+            candidate_series = defaultdict(list)
+            for _, row in candidate_rows.iterrows():
+                key = tuple(row.get(c) for c in period_cols)
+                value = pd.to_numeric(pd.Series([row.get('Value')]),
+                                      errors='coerce').iloc[0]
+                if pd.notna(value):
+                    candidate_series[key].append(float(value))
+            canonical_series = target_series[distinct.pop()]
+            overlaps = set(candidate_series) & set(canonical_series)
+            matches = conflicts = 0
+            for period in overlaps:
+                close = any(np.isclose(left, right, rtol=0.0015,
+                                       atol=2_000_000.0)
+                            for left in candidate_series[period]
+                            for right in canonical_series[period])
+                if close:
+                    matches += 1
+                else:
+                    conflicts += 1
+            if matches < 2 or conflicts:
+                continue
+        same_label_mask = (
+            out['Category'].eq('6_Disclosures')
+            & out['Label'].eq(source_label))
+        count = int(same_label_mask.sum())
+        out.loc[same_label_mask, 'Category'] = target['category']
+        out.loc[same_label_mask, 'Label'] = target['label']
+        changed.append((source_label, target['label'], count))
+    if changed:
+        details = ', '.join(
+            f'{old} -> {new} ({count})' for old, new, count in changed)
+        print('  [Geography] Promoted proven historical revenue facts: '
+              + details)
+    return out
+
+
 def _consolidate_geographic_alias_facts(df: pd.DataFrame) -> pd.DataFrame:
     """Canonicalize geographic aliases and quarantine exact scale duplicates.
 
@@ -10555,7 +10677,19 @@ def _gb_recover_atomic_dimensional_segment_asset_groups(
         work['_GBStart'] = pd.NaT
     work['_GBConcept'] = work['concept'].astype(str).str.rsplit(':', n=1).str[-1]
     work['_GBValue'] = pd.to_numeric(work['value'], errors='coerce')
-    work = work[work['_GBEnd'].notna() & work['_GBStart'].isna()
+    # edgartools normally leaves ``period_start`` empty for instant contexts,
+    # but some inline-XBRL context serializations expose the instant as equal
+    # start/end dates.  Both representations are point-in-time balances.
+    # Treating only NaT as instant discarded complete segment-asset groups
+    # while allowing an isolated corporate fact to survive downstream.
+    _instant_context = (
+        work['_GBStart'].isna()
+        | (work['_GBStart'].notna()
+           & work['_GBEnd'].notna()
+           & work['_GBStart'].dt.normalize().eq(
+               work['_GBEnd'].dt.normalize()))
+    )
+    work = work[work['_GBEnd'].notna() & _instant_context
                 & work['_GBValue'].notna() & work['_GBValue'].ge(0)].copy()
     if work.empty:
         return list(existing_facts or []), []
@@ -10588,7 +10722,22 @@ def _gb_recover_atomic_dimensional_segment_asset_groups(
         if not text:
             text = _normalize_member_label(clean_name(str(raw or '')))
         text = _gb_clean_member_footnote(str(text or '')).strip()
-        text = re.sub(r'\s+(?:non|nonsegment)$', '', text, flags=re.I).strip()
+        # Domain/container labels can be returned by taxonomy label lookup as
+        # ``Operating segments [Domain]`` rather than the member-style caption
+        # used by ``clean_name``.  Remove only terminal taxonomy-role suffixes;
+        # the remaining normalized text is then matched against categorical
+        # container noise below.
+        text = re.sub(r'\s*\[(?:domain|member)\]\s*$', '', text,
+                      flags=re.I).strip()
+        text = re.sub(r'\s+(?:domain|member)$', '', text,
+                      flags=re.I).strip()
+        text = re.sub(r'\s+non[- ]?segment$', '', text,
+                      flags=re.I).strip()
+        # Participant labels often end in the presentation word ``Segment``.
+        # Remove the singular suffix, but retain plural container captions such
+        # as ``Operating segments`` so they can be recognized as categorical
+        # noise rather than a participant.
+        text = re.sub(r'\s+segment$', '', text, flags=re.I).strip()
         return text
 
     def _canonical_from_existing(member):
@@ -13943,7 +14092,10 @@ def _gb_promote_proven_segment_operating_expenses(df: pd.DataFrame) -> pd.DataFr
             continue
 
         revenue_rows = [idx for idx in out.index
-                        if idx[0] == '4a_Segments_Business'
+                        if idx[0] in {
+                            '4a_Segments_Business',
+                            '4b_Segments_Geographic_Regions',
+                            '4c_Segments_Geographic_Countries'}
                         and _normalize_label_key(_split_segment_display_label(idx[1])[0]) == 'revenue'
                         and _gb_duplicate_members_related(f'Revenue - {member}', idx[1])]
         income_rows = [idx for idx in out.index
@@ -14411,22 +14563,27 @@ def _gb_promote_complete_segment_asset_basis(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _gb_reportable_segment_revenue_labels(df: pd.DataFrame, labels=None):
-    """Return revenue rows supported by another metric for the same member.
+def _gb_reportable_segment_revenue_indices(df: pd.DataFrame, labels=None):
+    """Return reportable revenue row indices across 4a/4b/4c.
 
-    Revenue disaggregation can coexist with reportable segments in 4a.  A
-    member with operating income, contribution, attributable expenses, assets,
-    or another segment-level performance measure is much stronger evidence of
-    the additive reportable basis than a revenue-only product/channel row.
-    Acronym/expanded member aliases are treated as one participant only when the
-    existing generic alias relation recognizes them.
+    Revenue can intentionally live in geography while the same participant's
+    operating expense/income/assets remain in business segments.  The support
+    relationship, not the output category, identifies the additive reportable
+    basis.
     """
     if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
         return []
-    if labels is None:
-        labels = [label for cat, label in df.index
-                  if cat == '4a_Segments_Business'
-                  and str(label).startswith('Revenue - ')]
+    revenue_categories = {
+        '4a_Segments_Business',
+        '4b_Segments_Geographic_Regions',
+        '4c_Segments_Geographic_Countries',
+    }
+    revenue_indices = [
+        idx for idx in df.index
+        if idx[0] in revenue_categories
+        and str(idx[1]).startswith('Revenue - ')
+        and (labels is None or idx[1] in set(labels))
+    ]
     support_metrics = {
         'operating income', 'sale and marketing', 'operating expense',
         'other cost and expense', 'cost of revenue', 'gross profit',
@@ -14441,13 +14598,23 @@ def _gb_reportable_segment_revenue_labels(df: pd.DataFrame, labels=None):
         metric, member = _split_segment_display_label(label)
         if _normalize_label_key(metric) in support_metrics and member:
             support_labels.append(label)
-    result = []
-    for revenue_label in labels:
-        if any(_gb_duplicate_members_related(revenue_label, support_label)
-               for support_label in support_labels):
-            result.append(revenue_label)
-    return result if len(result) >= 2 else []
+    result = [
+        idx for idx in revenue_indices
+        if any(_gb_duplicate_members_related(idx[1], support_label)
+               for support_label in support_labels)
+    ]
+    # At least two participants are required to establish a reportable basis.
+    unique_members = {
+        _normalize_label_key(_gb_clean_member_footnote(
+            _split_segment_display_label(idx[1])[1]))
+        for idx in result
+    }
+    return result if len(unique_members) >= 2 else []
 
+
+def _gb_reportable_segment_revenue_labels(df: pd.DataFrame, labels=None):
+    """Backward-compatible label view of the cross-category reportable basis."""
+    return [idx[1] for idx in _gb_reportable_segment_revenue_indices(df, labels)]
 
 def _gb_drop_fully_empty_segment_rows(df: pd.DataFrame) -> pd.DataFrame:
     """Remove abandoned segment/disclosure labels with no published value."""
@@ -14748,9 +14915,17 @@ def _gb_suppress_unproven_segment_footing_diagnostics(
     """
     if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
         return df
+    reportable_indices = _gb_reportable_segment_revenue_indices(df)
+    reportable_categories = {idx[0] for idx in reportable_indices}
+    revenue_categories = (
+        {'4a_Segments_Business', '4b_Segments_Geographic_Regions',
+         '4c_Segments_Geographic_Countries'}
+        if len(reportable_categories) >= 2
+        else {'4a_Segments_Business'}
+    )
     revenue_labels = [
         label for category, label in df.index
-        if category == '4a_Segments_Business'
+        if category in revenue_categories
         and str(label).startswith('Revenue - ')
         and str(label).count(' - ') == 1
     ]
@@ -14918,6 +15093,75 @@ def _gb_drop_nonmonetary_asset_disclosures(df: pd.DataFrame) -> pd.DataFrame:
               + ', '.join(sorted(dropped)))
     return out
 
+
+def _gb_merge_stranded_geographic_revenue_history(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Merge disclosure-era aliases into proven 4b/4c revenue rows.
+
+    This is the idempotent publication-boundary counterpart to the raw-fact
+    history promotion.  Exact member labels may fill disjoint periods.  A
+    non-exact alias requires repeated close overlap and no material conflict.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    geo_categories = {
+        '4b_Segments_Geographic_Regions',
+        '4c_Segments_Geographic_Countries',
+    }
+    targets = []
+    for idx in out.index:
+        if idx[0] not in geo_categories:
+            continue
+        metric, member = _split_segment_display_label(idx[1])
+        if _normalize_label_key(metric) != 'revenue' or not member:
+            continue
+        member_base, _basis = _split_geographic_basis_suffix(member)
+        targets.append((idx, member_base,
+                        _normalize_label_key(
+                            _gb_clean_member_footnote(member_base))))
+    if not targets:
+        return out
+
+    changed = []
+    for old_idx in list(out.index):
+        if old_idx not in out.index or old_idx[0] != '6_Disclosures':
+            continue
+        metric, member = _split_segment_display_label(old_idx[1])
+        if _normalize_label_key(metric) != 'revenue' or not member:
+            continue
+        member_base, _basis = _split_geographic_basis_suffix(member)
+        member_key = _normalize_label_key(
+            _gb_clean_member_footnote(member_base))
+        matches = [(target_idx, target_member, target_key)
+                   for target_idx, target_member, target_key in targets
+                   if target_idx in out.index
+                   and _gb_duplicate_members_related(
+                       f'Revenue - {member_base}',
+                       f'Revenue - {target_member}')]
+        distinct_targets = {target_idx for target_idx, _, _ in matches}
+        if len(distinct_targets) != 1:
+            continue
+        target_idx, _target_member, target_key = matches[0]
+        exact_member = member_key == target_key
+        old_values = pd.to_numeric(out.loc[old_idx], errors='coerce')
+        target_values = pd.to_numeric(out.loc[target_idx], errors='coerce')
+        overlap = old_values.notna() & target_values.notna()
+        if int(overlap.sum()):
+            close = np.isclose(old_values[overlap], target_values[overlap],
+                               rtol=0.0015, atol=2_000_000.0)
+            if not bool(close.all()):
+                continue
+        if not exact_member and int(overlap.sum()) < 2:
+            continue
+        out = _gb_rename_or_merge_pivot_row(out, old_idx, target_idx)
+        changed.append(f'{old_idx[1]} -> {target_idx[1]}')
+    if changed:
+        print('  [Geography] Merged historical revenue alias row(s): '
+              + '; '.join(sorted(changed)))
+    return out
+
+
 def _gb_apply_final_segment_publication_gates(df: pd.DataFrame) -> pd.DataFrame:
     """Idempotent output-boundary safety pass for fresh and cached pivots."""
     if df is None or df.empty:
@@ -14929,6 +15173,11 @@ def _gb_apply_final_segment_publication_gates(df: pd.DataFrame) -> pd.DataFrame:
     out = _gb_unify_complete_reportable_table_basis(out)
     out = _gb_promote_proven_segment_operating_expenses(out)
     out = _gb_split_mixed_reportable_revenue_geography(out)
+    out = _gb_merge_stranded_geographic_revenue_history(out)
+    # A revenue split can supply the missing same-member proof needed to promote
+    # a stranded segment expense row. Re-run the idempotent promotion after the
+    # geography merge; established rows and conflicting subtotals remain protected.
+    out = _gb_promote_proven_segment_operating_expenses(out)
     out = _gb_promote_complete_segment_asset_basis(out)
     out = _gb_remove_asset_capex_collisions(out)
     out = _gb_repair_instant_asset_quarter_anomalies(out)
@@ -15168,6 +15417,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     # Re-run after label-era reconciliation: several false rows are only
     # recognizable once old/new member names have been canonicalized.
     df = _gb_quarantine_conflicting_semantic_duplicates(df)
+    df = _gb_promote_proven_geographic_revenue_history_facts(df)
     df = _consolidate_geographic_alias_facts(df)
     df = _gb_reconcile_operating_metric_identities(df)
     # Operating-alias reconciliation can create final canonical labels; apply
@@ -18880,85 +19130,135 @@ def _refresh_granular_footing_checks(df: pd.DataFrame) -> pd.DataFrame:
     cf_pass = (ocf + icf + fcf_fin - netcf).abs() <= (netcf.abs() * 0.01).clip(lower=50e6)
     cf_flag = flag(cf_have, cf_pass)
 
-    # Segment revenue footing: find a clean non-overlapping basis per period.
-    all_segment_business_labels = [lbl for cat, lbl in df.index if cat == '4a_Segments_Business']
-    seg_labels = [lbl for lbl in all_segment_business_labels if _is_clean_top_level_segment_revenue_label(lbl)]
-    seg_flag = pd.Series(np.nan, index=cols)
-    # Basis code: 1=clean additive/ties, -1=clean additive/mismatch,
-    # 2=mixed or overlapping segment basis not forced, 0=no usable segment basis.
-    seg_basis_code = pd.Series(np.nan, index=cols)
-    seg_error_pct = pd.Series(np.nan, index=cols)
-    if len(seg_labels) >= 2:
+    # Segment revenue footing. Preserve the established single-category
+    # algorithm exactly; use the cross-category basis only when the proven
+    # reportable rows genuinely span multiple presentation categories.
+    reportable_indices = _gb_reportable_segment_revenue_indices(df)
+    reportable_categories = {idx[0] for idx in reportable_indices}
+    if len(reportable_categories) >= 2:
+        all_segment_revenue_indices = [
+            idx for idx in df.index
+            if idx[0] in {
+                '4a_Segments_Business',
+                '4b_Segments_Geographic_Regions',
+                '4c_Segments_Geographic_Countries'}
+            and _is_clean_top_level_segment_revenue_label(idx[1])
+        ]
+        seg_flag = pd.Series(np.nan, index=cols)
+        # Basis code: 1=clean additive/ties, -1=clean additive/mismatch,
+        # 2=mixed or overlapping segment basis not forced, 0=no usable basis.
+        seg_basis_code = pd.Series(np.nan, index=cols)
+        seg_error_pct = pd.Series(np.nan, index=cols)
         total = row('1_Income_Statement', 'Revenue')
-        seg_rows = {lbl: pd.to_numeric(df.loc[('4a_Segments_Business', lbl)], errors='coerce') for lbl in seg_labels}
-        # Resolve the analytical basis once from the complete row inventory.
-        # Re-running basis discovery on only the rows populated in one quarter
-        # can fall back to a product/channel subset when the reportable table is
-        # absent for that period, creating a false footing error (for example a discrete Q4).
-        reportable_basis = _gb_reportable_segment_revenue_labels(df, seg_labels)
-        def basis_groups(labels):
-            groups = []
-            if len(reportable_basis) >= 2:
-                present_reportable = [l for l in reportable_basis if l in labels]
-                if len(present_reportable) >= 2:
-                    groups.append(present_reportable)
-                # A proven reportable basis exists globally.  Do not substitute
-                # a different product/service basis merely because the filing
-                # omitted reportable rows for this particular quarter.
-                return groups
-            groups.append(labels)
-            for marker in ('(Post Change)', '(Pre Change)'):
-                g = [l for l in labels if marker.lower() in l.lower()]
-                if len(g) >= 2:
-                    groups.append(g)
-            # Prefer clean named segment rows without nested product/customer rows.
-            base = [l for l in labels if not any(k in l.lower() for k in (
-                'advertising', 'subscription', 'platform', 'devices', 'search', 'network',
-                'external customers', 'intersegment', 'elimination', 'product', 'service',
-                'other products', 'other services', 'cloud services', 'office products',
-                'server products', 'windows division', 'search advertising', 'contract'
-            ))]
-            if len(base) >= 2:
-                groups.append(base)
-            # Deduplicate preserving order.
-            out=[]; seen=set()
-            for g in groups:
-                key=tuple(g)
-                if key not in seen:
-                    seen.add(key); out.append(g)
-            return out
+        seg_rows = {
+            idx: pd.to_numeric(df.loc[idx], errors='coerce')
+            for idx in reportable_indices
+        }
         for col in cols:
             if pd.isna(total.get(col)) or float(total.get(col)) == 0:
                 continue
-            present = [l for l in seg_labels if pd.notna(seg_rows[l].get(col))]
-            best = None
-            for g in basis_groups(present):
-                if not (2 <= len(g) <= 8):
-                    continue
-                s = sum(float(seg_rows[l][col]) for l in g if pd.notna(seg_rows[l].get(col)))
-                ratio = abs(float(total[col]) - s) / abs(float(total[col]))
-                if best is None or ratio < best[0]:
-                    best = (ratio, g)
-            if best is not None:
-                seg_error_pct[col] = best[0] * 100.0
-                if best[0] <= 0.05:
-                    seg_flag[col] = 1.0
-                    seg_basis_code[col] = 1.0
-                else:
-                    # A clean-looking basis exists but does not tie closely.
-                    # Preserve this as a basis tag without forcing a broad
-                    # financials failure; historical segment tables can change
-                    # basis or include reconciling items.
-                    seg_basis_code[col] = -1.0
-            elif present:
-                seg_basis_code[col] = 2.0
-            else:
+            present = [idx for idx in reportable_indices
+                       if pd.notna(seg_rows[idx].get(col))]
+            if len(present) < 2:
                 seg_basis_code[col] = 0.0
-            # If no clean basis ties, leave the verification flag NaN rather
-            # than false-failing a mixed dimensional disclosure (UNH/MSFT-style matrices).
-    elif all_segment_business_labels:
-        total = row('1_Income_Statement', 'Revenue')
-        seg_basis_code[total.notna()] = 0.0
+                continue
+            segment_sum = sum(float(seg_rows[idx][col]) for idx in present)
+            ratio = abs(float(total[col]) - segment_sum) / abs(float(total[col]))
+            seg_error_pct[col] = ratio * 100.0
+            if ratio <= 0.05:
+                seg_flag[col] = 1.0
+                seg_basis_code[col] = 1.0
+            else:
+                seg_basis_code[col] = -1.0
+        if not reportable_indices and all_segment_revenue_indices:
+            seg_basis_code[total.notna()] = 0.0
+    else:
+        # Original single-category footing behavior (v68 and earlier).
+        all_segment_business_labels = [
+            lbl for cat, lbl in df.index if cat == '4a_Segments_Business']
+        seg_labels = [
+            lbl for lbl in all_segment_business_labels
+            if _is_clean_top_level_segment_revenue_label(lbl)]
+        seg_flag = pd.Series(np.nan, index=cols)
+        seg_basis_code = pd.Series(np.nan, index=cols)
+        seg_error_pct = pd.Series(np.nan, index=cols)
+        if len(seg_labels) >= 2:
+            total = row('1_Income_Statement', 'Revenue')
+            seg_rows = {
+                lbl: pd.to_numeric(
+                    df.loc[('4a_Segments_Business', lbl)], errors='coerce')
+                for lbl in seg_labels
+            }
+            reportable_basis = _gb_reportable_segment_revenue_labels(
+                df, seg_labels)
+
+            def basis_groups(labels):
+                groups = []
+                if len(reportable_basis) >= 2:
+                    present_reportable = [
+                        label for label in reportable_basis if label in labels]
+                    if len(present_reportable) >= 2:
+                        groups.append(present_reportable)
+                    return groups
+                groups.append(labels)
+                for marker in ('(Post Change)', '(Pre Change)'):
+                    group = [
+                        label for label in labels
+                        if marker.lower() in label.lower()]
+                    if len(group) >= 2:
+                        groups.append(group)
+                base = [
+                    label for label in labels
+                    if not any(keyword in label.lower() for keyword in (
+                        'advertising', 'subscription', 'platform', 'devices',
+                        'search', 'network', 'external customers',
+                        'intersegment', 'elimination', 'product', 'service',
+                        'other products', 'other services', 'cloud services',
+                        'office products', 'server products',
+                        'windows division', 'search advertising', 'contract'
+                    ))
+                ]
+                if len(base) >= 2:
+                    groups.append(base)
+                output = []
+                seen = set()
+                for group in groups:
+                    key = tuple(group)
+                    if key not in seen:
+                        seen.add(key)
+                        output.append(group)
+                return output
+
+            for col in cols:
+                if pd.isna(total.get(col)) or float(total.get(col)) == 0:
+                    continue
+                present = [
+                    label for label in seg_labels
+                    if pd.notna(seg_rows[label].get(col))]
+                best = None
+                for group in basis_groups(present):
+                    if not (2 <= len(group) <= 8):
+                        continue
+                    segment_sum = sum(
+                        float(seg_rows[label][col]) for label in group
+                        if pd.notna(seg_rows[label].get(col)))
+                    ratio = abs(float(total[col]) - segment_sum) / abs(float(total[col]))
+                    if best is None or ratio < best[0]:
+                        best = (ratio, group)
+                if best is not None:
+                    seg_error_pct[col] = best[0] * 100.0
+                    if best[0] <= 0.05:
+                        seg_flag[col] = 1.0
+                        seg_basis_code[col] = 1.0
+                    else:
+                        seg_basis_code[col] = -1.0
+                elif present:
+                    seg_basis_code[col] = 2.0
+                else:
+                    seg_basis_code[col] = 0.0
+        elif all_segment_business_labels:
+            total = row('1_Income_Statement', 'Revenue')
+            seg_basis_code[total.notna()] = 0.0
 
     checks = {
         'Metric: Income Statement Footing Verified': is_flag,
@@ -19626,6 +19926,29 @@ def _audit_segment_footing(df, ticker, ye_month):
     rev_n = pd.to_numeric(df.loc[('1_Income_Statement', 'Revenue')], errors='coerce')
     seg_cats = {'4a_Segments_Business', '4b_Segments_Geographic_Regions', '4c_Segments_Geographic_Countries', '4d_Segments_Cross_Tabulated'}
     all_failed_quarters = set()
+
+    # A proven reportable basis may intentionally span 4a and 4b/4c.  Validate
+    # that basis once across categories so the geography subset is not falsely
+    # flagged merely because a non-geographic peer remains in business segments.
+    cross_category_verified = set()
+    _reportable_indices = _gb_reportable_segment_revenue_indices(df)
+    _reportable_categories = {idx[0] for idx in _reportable_indices}
+    if len(_reportable_indices) >= 2 and len(_reportable_categories) >= 2:
+        _reportable_rows = {
+            idx: pd.to_numeric(df.loc[idx], errors='coerce')
+            for idx in _reportable_indices}
+        for _column in df.columns:
+            _total = rev_n.get(_column)
+            if pd.isna(_total) or float(_total) == 0:
+                continue
+            _present = [idx for idx in _reportable_indices
+                        if pd.notna(_reportable_rows[idx].get(_column))]
+            if len(_present) < 2:
+                continue
+            _sum = sum(float(_reportable_rows[idx][_column])
+                       for idx in _present)
+            if abs(float(_total) - _sum) / abs(float(_total)) <= 0.05:
+                cross_category_verified.add(_column)
     
     for cat in seg_cats:
         # Require exactly 1 ' - ' for 4a/4b/4c to prevent matching cross-tabulated sub-breakdowns that don't directly foot
@@ -19646,6 +19969,8 @@ def _audit_segment_footing(df, ticker, ye_month):
                               if label in supported_set]
 
         for q_col in df.columns:
+            if q_col in cross_category_verified:
+                continue
             if pd.isna(rev_n[q_col]) or rev_n[q_col] == 0: continue
             
             q_vals = {lbl: pd.to_numeric(df.loc[(c, lbl), q_col], errors='coerce') for (c, lbl) in seg_labels}
@@ -26381,7 +26706,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-19.native-extraction.v20-atomic-segment-assets-mixed-revenue"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-20.native-extraction.v21-amazon-asset-context-geo-history"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -26551,7 +26876,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-19.final-pivot.v36-mixed-revenue-geography"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-20.final-pivot.v37-amazon-geo-history-mixed-footing"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
