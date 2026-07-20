@@ -6101,6 +6101,8 @@ _GENERIC_BUSINESS_DRIVER_CONTEXT_RE = tuple(re.compile(p, re.I) for p in (
     r'\bfinancial\s+and\s+operational\s+highlights?\b',
     r'\boperating\s+and\s+financial\s+highlights?\b',
     r'\bassets?\s+under\s+custody(?:\s*\(auc\))?\b',
+    r'\bcomponents?\s+of\s+(?:assets?\s+under\s+custody|auc|total\s+platform\s+assets?)\b',
+    r'\bcomponents?\s+of\s+auc\s+by\s+type\s+of\s+asset\b',
     r'\btotal\s+platform\s+assets?\b',
 ))
 
@@ -6846,6 +6848,78 @@ _GB_ACTIVITY_ACCOUNTING_NOISE_RE = re.compile(
     r'foreign\s+exchange\s+activity|personnel|advertising\s+and\s+marketing|'
     r'depreciation|amortization)\b',
     re.I)
+
+# Exact accounting-caption guard used at both source admission and the final
+# publication boundary.  Some expense tables sit inside a broader KPI section
+# and therefore inherit snapshot/rollforward geometry; table-level activity
+# rejection alone cannot protect against those rows.  Keep this deliberately
+# caption-shaped so genuine drivers such as transaction volume or marketing
+# customers are unaffected.
+_GB_OPERATING_METRIC_ACCOUNTING_CAPTION_RE = re.compile(
+    r'^(?:brokerage(?:\s+and\s+transaction)?|marketing|'
+    r'technology\s+and\s+development|research\s+and\s+development|'
+    r'general\s+and\s+administrative|operations?|personnel|'
+    r'employee\s+compensation|professional\s+fees?|'
+    r'data\s+processing(?:\s+and\s+telecommunications)?|'
+    r'advertising(?:\s+and\s+marketing)?|foreign\s+exchange\s+activity|'
+    r'depreciation(?:\s+and\s+amortization)?|amortization)$', re.I)
+
+
+def _gb_is_accounting_caption_operating_metric(label: str) -> bool:
+    text = re.sub(r'^Operating\s+Measure\s*-\s*', '', str(label or ''),
+                  flags=re.I)
+    text = _gb_strip_trailing_footnote_marker(_gb_row_label(text)).strip()
+    return bool(_GB_OPERATING_METRIC_ACCOUNTING_CAPTION_RE.fullmatch(text))
+
+
+def _gb_mark_complete_operating_table_candidates(candidates):
+    """Tag a structurally complete KPI table as an atomic source group.
+
+    A complete comparative snapshot/rollforward is stronger than an isolated
+    older XBRL or HTML fact for the same period.  This marker only affects
+    source arbitration; it never creates a value and requires all key rows to
+    coexist in one parsed table instance.
+    """
+    rows = [dict(candidate) for candidate in (candidates or [])]
+    if not rows or not all(row.get('Prefix') == 'Operating Measure'
+                           for row in rows):
+        return rows
+    geometry = {str(row.get('TableGeometry') or '') for row in rows}
+    labels = [str(row.get('SourceLabel') or row.get('Label') or '')
+              for row in rows]
+    normalized = [_normalize_label_key(label) for label in labels]
+    complete = False
+    family = None
+    if 'snapshot' in geometry:
+        total = sum(bool(re.search(
+            r'\b(?:total|ending)\b.{0,45}\b(?:assets?|custody|platform)\b|'
+            r'\b(?:assets?|custody|platform)\b.{0,30}\btotal\b',
+            label, re.I)) for label in labels)
+        components = sum(bool(re.search(
+            r'\b(?:equities?|options?(?:\s+and\s+futures?)?|'
+            r'cryptocurrenc(?:y|ies)|cash|receivables?|securities|'
+            r'advisory|ria|futures?|holdings?)\b', label, re.I))
+                         for label in labels)
+        complete = total >= 1 and components >= 3 and len(rows) >= 4
+        family = 'snapshot'
+    elif 'rollforward' in geometry:
+        has_begin = any(bool(_GB_BEGINNING_RE.search(label)) for label in labels)
+        has_end = any(bool(_GB_ENDING_RE.search(label)) for label in labels)
+        has_deposits = any('deposit' in key for key in normalized)
+        has_market = any(bool(re.search(r'\b(?:market|gain|loss)\b', label, re.I))
+                         for label in labels)
+        complete = has_begin and has_end and has_deposits and has_market
+        family = 'rollforward'
+    if not complete:
+        return rows
+    identity = hashlib.sha1('|'.join(sorted(normalized)).encode('utf-8')).hexdigest()[:16]
+    for row in rows:
+        row['AtomicOperatingTable'] = True
+        row['AtomicOperatingFamily'] = family
+        row['AtomicOperatingIdentity'] = identity
+        row['AdmissionRule'] = 'complete_operating_metric_table'
+        row['Confidence'] = max(float(row.get('Confidence') or 0.0), 0.995)
+    return rows
 
 
 def _gb_operating_metric_family(label: str) -> str:
@@ -8027,7 +8101,8 @@ def _extract_generic_business_breakdown_from_table(
             period_basis = _GB_BASIS_DURATION_FLOW
             basis_confidence = 0.97
         if effective_prefix == 'Operating Measure':
-            if _GB_INVALID_OPERATING_ROW_LABEL_RE.search(label):
+            if (_GB_INVALID_OPERATING_ROW_LABEL_RE.search(label)
+                    or _gb_is_accounting_caption_operating_metric(label)):
                 continue
             period_basis, basis_confidence, rollforward_phase = (
                 _gb_infer_operating_row_semantics(
@@ -8291,6 +8366,11 @@ def _gb_existing_fact_blocks_html_candidate(existing_rows, candidate) -> bool:
         return False
     if (candidate.get('Prefix') == 'Assets'
             and candidate.get('PeriodBasis') == _GB_BASIS_INSTANT_END):
+        # A complete direct segment-assets table is a stronger source than an
+        # isolated dimensional fact.  Admit every table cell and let the
+        # complete-table gate replace competing single-member candidates.
+        if candidate.get('TableRole') == _GB_ROLE_SEGMENT_ASSETS:
+            return False
         for fact in existing_rows:
             basis = str(fact.get('SourcePeriodBasis') or '')
             role = str(fact.get('SourceTableRole') or '')
@@ -8317,6 +8397,39 @@ def _gb_existing_fact_blocks_html_candidate(existing_rows, candidate) -> bool:
                     and value_is_usable
                     and values_agree
                     and (kind == 'balance' or concept_kind == 'balance')):
+                return True
+        return False
+    if candidate.get('Prefix') == 'Operating Measure':
+        # A complete source table is stronger than an isolated fact selected
+        # from an earlier/partial parsing path.  Admit all its cells and let the
+        # trust/tag-rank arbitration select the atomic table consistently.
+        if bool(candidate.get('AtomicOperatingTable')):
+            return False
+        candidate_basis = str(candidate.get('PeriodBasis') or '')
+        candidate_duration = _gb_resolve_candidate_duration(
+            candidate, int(candidate.get('Duration') or 0))
+        for fact in existing_rows:
+            raw_value = pd.to_numeric(
+                pd.Series([fact.get('Value')]), errors='coerce').iloc[0]
+            if pd.isna(raw_value):
+                continue
+            fact_basis = str(fact.get('SourcePeriodBasis') or '')
+            try:
+                fact_duration = int(float(fact.get('Duration') or 0))
+            except (TypeError, ValueError, OverflowError):
+                fact_duration = 0
+            if candidate_basis in {_GB_BASIS_INSTANT_START,
+                                   _GB_BASIS_INSTANT_END}:
+                if fact_basis == candidate_basis or fact_duration == 0:
+                    return True
+                continue
+            # A YTD fact and a discrete-quarter fact can share FY/Q but are not
+            # substitutes.  Block only the same duration scope.
+            if (fact_basis == candidate_basis
+                    and abs(fact_duration - candidate_duration) <= 40):
+                return True
+            if (not fact_basis and fact_duration > 0
+                    and abs(fact_duration - candidate_duration) <= 40):
                 return True
         return False
     return True
@@ -8377,6 +8490,7 @@ def _extract_generic_business_breakdowns_from_textblocks(
 
     def _accept_candidates(candidates, candidate_end_dt, source_period_role,
                            source_table_fingerprint, source_geographic_basis=None):
+        candidates = _gb_mark_complete_operating_table_candidates(candidates)
         fallback_end_dt = pd.to_datetime(candidate_end_dt, errors='coerce')
         for candidate in candidates:
             effective_end_dt = _gb_period_end_from_value_header(
@@ -8418,7 +8532,7 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 'Start': start_dt.strftime('%Y-%m-%d'),
                 'Duration': duration,
                 'Filed': filed,
-                'TagRank': 998,
+                'TagRank': (0 if candidate.get('AtomicOperatingTable') else 998),
                 'DimCount': 0,
                 'IsCalculated': False,
                 'Concept': 'HTMLBusinessBreakdown',
@@ -8445,8 +8559,16 @@ def _extract_generic_business_breakdowns_from_textblocks(
                 ),
                 'SourceMetricFamily': candidate.get('MetricFamily'),
                 'SourceMetricIdentity': candidate.get('MetricIdentity'),
-                'SourceKind': 'html_table',
+                'SourceKind': ('html_atomic_operating_group'
+                               if candidate.get('AtomicOperatingTable')
+                               else 'html_table'),
                 'SourceAdmissionRule': candidate.get('AdmissionRule'),
+                'SourceAtomicOperatingTable': bool(
+                    candidate.get('AtomicOperatingTable')),
+                'SourceAtomicOperatingFamily': candidate.get(
+                    'AtomicOperatingFamily'),
+                'SourceAtomicOperatingIdentity': candidate.get(
+                    'AtomicOperatingIdentity'),
                 'SourceSemanticType': candidate.get('SemanticType'),
                 'SourceAnalyticalBasis': candidate.get('AnalyticalBasis'),
                 'SourceDirectness': 'reported',
@@ -8587,6 +8709,39 @@ def _extract_generic_business_breakdowns_from_textblocks(
         value_positions = numeric_positions[-len(date_headers):]
         if len(value_positions) < 2:
             return None
+
+        # The wrapper must prove a complete asset reconciliation before any
+        # member cell is admitted.  This prevents a partial one-member table
+        # from surviving when one nested child was dropped or misread.
+        row_labels = [_gb_row_label(value) for value in body.iloc[:, label_pos]]
+        member_positions = [
+            pos for pos, label in enumerate(row_labels)
+            if label and not _GB_CONSOLIDATED_HEADER_RE.match(label.casefold())
+        ]
+        total_positions = [
+            pos for pos, label in enumerate(row_labels)
+            if label and _GB_CONSOLIDATED_HEADER_RE.match(label.casefold())
+        ]
+        if len(member_positions) < 3 or not total_positions:
+            return None
+        for value_pos in value_positions:
+            member_values = []
+            for row_pos in member_positions:
+                value, _decimals = _gb_parse_number(body.iloc[row_pos, value_pos])
+                if value is not None:
+                    member_values.append(float(value))
+            total_values = []
+            for row_pos in total_positions:
+                value, _decimals = _gb_parse_number(body.iloc[row_pos, value_pos])
+                if value is not None:
+                    total_values.append(float(value))
+            if len(member_values) < 3 or not total_values:
+                return None
+            total_value = total_values[-1]
+            tolerance = max(2.0, abs(total_value) * 0.002)
+            if abs(sum(member_values) - total_value) > tolerance:
+                return None
+
         headers = date_headers[-len(value_positions):]
         rebuilt = pd.DataFrame({'Segment': body.iloc[:, label_pos].tolist()})
         for header, pos in zip(headers, value_positions):
@@ -8619,15 +8774,49 @@ def _extract_generic_business_breakdowns_from_textblocks(
             seen_tags.add(tag_key)
             context = _gb_clean_text(
                 f'{anchor_text} {_gb_nearby_table_context(table_tag)} {fallback_context[:600]}')
+            # The SEC may place the date header and member rows in
+            # separate sibling tables rather than one nested wrapper.  Build a
+            # bounded anchor bundle up to the next asset-table section, while
+            # retaining the original table for ordinary one-grid filings.
+            bundle_tags = []
+            stop_re = re.compile(
+                r'property\s+and\s+equipment.{0,30}by\s+segment|'
+                r'total\s+net\s+additions|'
+                r'depreciation\s+and\s+amortization.{0,30}by\s+segment',
+                re.I)
             try:
-                parsed_tables = pd.read_html(StringIO(str(table_tag)))
+                iterator = node.parent.next_elements
             except Exception:
+                iterator = ()
+            for element in iterator:
+                name = getattr(element, 'name', None)
+                if name is None:
+                    text = _gb_clean_text(element)
+                    if bundle_tags and stop_re.search(text):
+                        break
+                    continue
+                if name != 'table':
+                    continue
+                if id(element) in {id(tag) for tag in bundle_tags}:
+                    continue
+                bundle_tags.append(element)
+                if len(bundle_tags) >= 12:
+                    break
+            if table_tag not in bundle_tags:
+                bundle_tags.insert(0, table_tag)
+            parsed_tables = []
+            for bundled in bundle_tags:
+                try:
+                    parsed_tables.extend(pd.read_html(StringIO(str(bundled)))[:6])
+                except Exception:
+                    continue
+            if not parsed_tables:
                 continue
             reconstructed = _reconstruct_segment_asset_anchor_grid(
                 parsed_tables, anchor_text)
             if reconstructed is not None:
                 _accept_table_safely(reconstructed, context)
-            for parsed in parsed_tables[:6]:
+            for parsed in parsed_tables[:12]:
                 _accept_table_safely(parsed, context)
 
     for raw_value in text_blocks['value'].to_numpy(copy=False):
@@ -9794,8 +9983,28 @@ def _gb_add_operating_integrity_checks(
         equation_attempted = period_rows.get(
             'SourceRollforwardErrorPct', pd.Series(np.nan, index=period_rows.index)
         ).notna()
+        labels = period_rows.get(
+            'Label', pd.Series('', index=period_rows.index)
+        ).fillna('').astype(str)
+        has_rollforward = bool(labels.str.contains(
+            r'beginning|ending|net\s+deposits?|market\s+(?:gains?|losses?)',
+            case=False, regex=True).any())
+        required_rollforward = {
+            'beginning': labels.str.contains(r'beginning', case=False, regex=True).any(),
+            'ending': labels.str.contains(r'ending', case=False, regex=True).any(),
+            'deposits': labels.str.contains(r'net\s+deposits?', case=False, regex=True).any(),
+            'market': labels.str.contains(
+                r'market\s+(?:gains?|losses?)', case=False, regex=True).any(),
+        }
+        rollforward_complete = all(required_rollforward.values())
         if conflicts.any():
             verified_flag = 0.0
+        elif has_rollforward and not rollforward_complete:
+            # A reduced equation is not evidence.  Missing operands make the
+            # period not testable rather than verified or failed.
+            verified_flag = np.nan
+            verified = pd.Series(False, index=period_rows.index)
+            equation_attempted = pd.Series(False, index=period_rows.index)
         elif verified.any():
             verified_flag = 1.0
         elif equation_attempted.any():
@@ -9812,7 +10021,9 @@ def _gb_add_operating_integrity_checks(
         errors = pd.to_numeric(period_rows.get(
             'SourceRollforwardErrorPct', pd.Series(np.nan, index=period_rows.index)),
             errors='coerce').dropna()
-        if not errors.empty:
+        if has_rollforward and not rollforward_complete:
+            result.at[('8_Integrity_Checks', 'Metric: Operating Measure Rollforward Error %'), period] = np.nan
+        elif not errors.empty:
             result.at[('8_Integrity_Checks', 'Metric: Operating Measure Rollforward Error %'), period] = float(errors.max())
     return result
 
@@ -10630,6 +10841,123 @@ def _reconcile_html_business_breakdown_facts(all_facts):
 
 
 
+
+def _gb_xml_local_name(name) -> str:
+    text = str(name or '')
+    return text.rsplit(':', 1)[-1].rsplit('}', 1)[-1].casefold()
+
+
+def _gb_recover_atomic_inline_segment_asset_groups(
+        html_text, existing_facts, ye_month: int, filed,
+        filing_url=None, member_labeler=None):
+    """Recover a complete segment-asset group from raw inline XBRL.
+
+    This is a source-boundary fallback for filings whose library DataFrame
+    flattens or drops one of the nested business-segment dimensions.  It reads
+    only contexts and numeric facts from the filing itself, then delegates the
+    accounting proof, repeated-date requirement and atomic replacement to the
+    same dimensional-group engine used by normal XBRL facts.
+    """
+    raw = html_text.decode('utf-8', 'ignore') if isinstance(
+        html_text, (bytes, bytearray)) else str(html_text or '')
+    if (not raw or 'contextref' not in raw.casefold()
+            or not re.search(r'\bsegment\s+assets?\b|total\s+segment\s+assets?',
+                             _gb_clean_text(re.sub(r'<[^>]+>', ' ', raw)), re.I)):
+        return list(existing_facts or []), []
+    try:
+        soup = BeautifulSoup(raw, 'html.parser')
+    except Exception:
+        return list(existing_facts or []), []
+
+    contexts = {}
+    for tag in soup.find_all(lambda node: getattr(node, 'name', None)
+                             and _gb_xml_local_name(node.name) == 'context'):
+        context_id = str(tag.get('id') or tag.get('ID') or '').strip()
+        if not context_id:
+            continue
+        instant = tag.find(lambda node: getattr(node, 'name', None)
+                           and _gb_xml_local_name(node.name) == 'instant')
+        if instant is None:
+            continue
+        end = pd.to_datetime(_gb_clean_text(instant.get_text(' ', strip=True)),
+                             errors='coerce')
+        if pd.isna(end):
+            continue
+        dimensions = []
+        for member_tag in tag.find_all(
+                lambda node: getattr(node, 'name', None)
+                and _gb_xml_local_name(node.name) == 'explicitmember'):
+            dimension = str(member_tag.get('dimension') or '').strip()
+            member = _gb_clean_text(member_tag.get_text(' ', strip=True))
+            if dimension and member:
+                dimensions.append((dimension, member))
+        contexts[context_id] = {
+            'period_instant': pd.Timestamp(end).strftime('%Y-%m-%d'),
+            'dimensions': dimensions,
+        }
+    if not contexts:
+        return list(existing_facts or []), []
+
+    records = []
+    dimension_names = set()
+    for fact_tag in soup.find_all(lambda node: getattr(node, 'name', None)
+                                  and _gb_xml_local_name(node.name)
+                                  in {'nonfraction', 'fraction'}):
+        context_ref = str(fact_tag.get('contextref')
+                          or fact_tag.get('contextRef') or '').strip()
+        context = contexts.get(context_ref)
+        if context is None:
+            continue
+        concept = str(fact_tag.get('name') or '').strip()
+        concept_short = concept.rsplit(':', 1)[-1]
+        if _gb_segment_asset_concept_kind(concept_short, 0) != 'balance':
+            continue
+        raw_value = _gb_clean_text(fact_tag.get_text(' ', strip=True))
+        value, _display_decimals = _gb_parse_number(raw_value)
+        if value is None:
+            continue
+        try:
+            scale = int(float(fact_tag.get('scale') or 0))
+        except (TypeError, ValueError, OverflowError):
+            scale = 0
+        numeric = float(value) * (10.0 ** scale)
+        sign = str(fact_tag.get('sign') or '').strip()
+        if sign == '-':
+            numeric = -abs(numeric)
+        if not np.isfinite(numeric) or numeric < 0:
+            continue
+        record = {
+            'concept': concept or concept_short,
+            'value': numeric,
+            'period_instant': context['period_instant'],
+            'period_start': context['period_instant'],
+            'is_calculated': False,
+        }
+        for dimension, member in context['dimensions']:
+            # Preserve readable axis text because the role classifier uses the
+            # dimension name; the exact QName remains in the cell value.
+            column = 'dim_' + re.sub(r'[^A-Za-z0-9_:-]+', '_', dimension)
+            record[column] = member
+            dimension_names.add(column)
+        records.append(record)
+    if not records or not dimension_names:
+        return list(existing_facts or []), []
+    facts = pd.DataFrame(records)
+    for column in dimension_names:
+        if column not in facts.columns:
+            facts[column] = np.nan
+    out, recovered = _gb_recover_atomic_dimensional_segment_asset_groups(
+        facts, existing_facts, ye_month, filed,
+        member_labeler=member_labeler, filing_url=filing_url)
+    if recovered:
+        for fact in recovered:
+            fact['SourceKind'] = 'inline_xbrl_atomic_group'
+            fact['SourceAdmissionRule'] = (
+                'atomic_inline_xbrl_segment_assets_reconciliation')
+        print(f'  [Asset Group] Raw inline-XBRL fallback recovered '
+              f'{len(recovered)} segment-asset cell(s).')
+    return out, recovered
+
 def _gb_recover_atomic_dimensional_segment_asset_groups(
         facts_df: pd.DataFrame, existing_facts, ye_month: int, filed,
         member_labeler=None, filing_url=None):
@@ -10738,6 +11066,10 @@ def _gb_recover_atomic_dimensional_segment_asset_groups(
         # as ``Operating segments`` so they can be recognized as categorical
         # noise rather than a participant.
         text = re.sub(r'\s+segment$', '', text, flags=re.I).strip()
+        # Corporate reconciliation members are frequently rendered as
+        # ``Corporate non-segment [Member]``.  After role suffix removal the
+        # residual ``Non`` is taxonomy syntax, not part of the participant name.
+        text = re.sub(r'\s+non$', '', text, flags=re.I).strip()
         return text
 
     def _canonical_from_existing(member):
@@ -11765,9 +12097,49 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 member_labeler=_clean_member_tag,
                 filing_url=_get_filing_url_once()))
     except Exception as _atomic_asset_error:
+        _atomic_asset_facts = []
         _debug_print(
             f"  [Asset Group] Dimensional recovery skipped "
             f"({type(_atomic_asset_error).__name__}: {_atomic_asset_error})")
+
+    # Library DataFrames can flatten/drop one nested segment dimension even
+    # though the raw inline-XBRL contexts are complete.  Fall back to those
+    # original contexts only when the normal dimensional proof found no atomic
+    # group.  fetch_html is cached and the fallback itself still requires the
+    # same repeated-date, sum-to-consolidated accounting identity.
+    _inline_asset_hint = False
+    if not _atomic_asset_facts:
+        try:
+            _hint_dim_cols = [column for column in facts_df.columns
+                              if str(column).startswith('dim_')
+                              and any(token in str(column).casefold()
+                                      for token in ('segment', 'businessunit',
+                                                    'businessline'))]
+            if _hint_dim_cols:
+                _hint_concepts = facts_df.get(
+                    'concept', pd.Series('', index=facts_df.index)
+                ).astype(str).str.rsplit(':', n=1).str[-1]
+                _hint_asset = _hint_concepts.map(
+                    lambda concept: _gb_segment_asset_concept_kind(
+                        concept, 0) == 'balance')
+                _hint_dimensioned = facts_df[_hint_dim_cols].notna().any(axis=1)
+                _inline_asset_hint = bool((_hint_asset & _hint_dimensioned).any())
+        except Exception:
+            _inline_asset_hint = False
+    if not _atomic_asset_facts and _inline_asset_hint:
+        try:
+            _raw_filing_html = fetch_html(filing)
+            extracted, _inline_atomic_asset_facts = (
+                _gb_recover_atomic_inline_segment_asset_groups(
+                    _raw_filing_html, extracted, ye_month, _filing_date_raw,
+                    filing_url=_get_filing_url_once(),
+                    member_labeler=_clean_member_tag))
+            if _inline_atomic_asset_facts:
+                _atomic_asset_facts = _inline_atomic_asset_facts
+        except Exception as _inline_asset_error:
+            _debug_print(
+                f"  [Asset Group] Inline-XBRL recovery skipped "
+                f"({type(_inline_asset_error).__name__}: {_inline_asset_error})")
 
     has_interest = any(x['Label'] == 'Interest Expense' for x in extracted)
     if not has_interest:
@@ -14781,6 +15153,38 @@ def _gb_repair_instant_asset_quarter_anomalies(df: pd.DataFrame) -> pd.DataFrame
                 repaired.append(
                     f"{idx[1]} {year}-Q4 x{int(multiplier):,}")
 
+        # Stage 1b: quarantine an isolated, extreme trough bracketed by direct
+        # point-in-time balances.  This catches a quarterly capex/additions cell
+        # that inherited an Assets label after provenance was lost.  Requiring
+        # both neighboring quarters to exceed the cell by 50x prevents ordinary
+        # acquisitions, disposals or business volatility from being rewritten.
+        ordered_periods = sorted(periods)
+        for pos in range(1, len(ordered_periods) - 1):
+            period = ordered_periods[pos]
+            previous = ordered_periods[pos - 1]
+            following = ordered_periods[pos + 1]
+            # Only adjacent fiscal quarters form a valid bracket.
+            serial = lambda item: item[0] * 4 + item[1]
+            if serial(period) - serial(previous) != 1 or serial(following) - serial(period) != 1:
+                continue
+            column = periods.get(period)
+            previous_column = periods.get(previous)
+            following_column = periods.get(following)
+            values = [series.get(previous_column), series.get(column),
+                      series.get(following_column)]
+            if any(pd.isna(value) for value in values):
+                continue
+            previous_value, current_value, following_value = map(float, values)
+            if current_value <= 0:
+                continue
+            if (previous_value >= current_value * 50.0
+                    and following_value >= current_value * 50.0
+                    and min(previous_value, following_value)
+                    / max(previous_value, following_value) >= 0.20):
+                series[column] = np.nan
+                repaired.append(
+                    f"{idx[1]} {period[0]}-Q{period[1]} isolated-flow quarantine")
+
         # Stage 2: repeated cumulative-instant signature.
         cumulative_flags = []
         for year in years:
@@ -15162,6 +15566,168 @@ def _gb_merge_stranded_geographic_revenue_history(
     return out
 
 
+
+def _gb_merge_temporal_operating_scope_expansions(df: pd.DataFrame) -> pd.DataFrame:
+    """Merge a historical narrow caption into a later expanded caption.
+
+    This is limited to non-overlapping operating-metric histories where the old
+    token set is a strict subset of the new token set and every shared period,
+    if any, agrees.  It handles presentation evolutions such as Options ->
+    Options and futures without treating contemporaneous scope differences as
+    aliases.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    rows = [idx for idx in out.index if idx[0] == OPERATING_METRICS_CATEGORY]
+    changed = []
+    for old_idx in list(rows):
+        if old_idx not in out.index:
+            continue
+        old_tokens = set(_gb_operating_alias_tokens(old_idx[1], {}))
+        if not old_tokens:
+            continue
+        old_values = pd.to_numeric(out.loc[old_idx], errors='coerce')
+        old_periods = [str(c) for c in out.columns if pd.notna(old_values[c])
+                       and re.fullmatch(r'\d{4}-Q[1-4]', str(c))]
+        if not old_periods:
+            continue
+        for new_idx in list(rows):
+            if new_idx == old_idx or new_idx not in out.index:
+                continue
+            new_tokens = set(_gb_operating_alias_tokens(new_idx[1], {}))
+            if not (old_tokens < new_tokens) or len(new_tokens - old_tokens) > 2:
+                continue
+            new_values = pd.to_numeric(out.loc[new_idx], errors='coerce')
+            overlap = old_values.notna() & new_values.notna()
+            if overlap.any() and not np.isclose(
+                    old_values[overlap], new_values[overlap],
+                    rtol=0.0015, atol=2_000_000.0).all():
+                continue
+            new_periods = [str(c) for c in out.columns if pd.notna(new_values[c])
+                           and re.fullmatch(r'\d{4}-Q[1-4]', str(c))]
+            if not new_periods:
+                continue
+            def key(period):
+                y, q = period.split('-Q')
+                return int(y), int(q)
+            # Require a true historical handoff, not overlapping current scopes.
+            if max(map(key, old_periods)) >= max(map(key, new_periods)):
+                continue
+            out.loc[new_idx, :] = new_values.combine_first(old_values).values
+            out = out.drop(index=old_idx)
+            changed.append(f'{old_idx[1]} -> {new_idx[1]}')
+            break
+    if changed:
+        print('  [Operating Alias] Merged temporal scope-expansion history: '
+              + '; '.join(changed))
+    return out
+
+
+def _gb_promote_complete_significant_expense_details(df: pd.DataFrame) -> pd.DataFrame:
+    """Complete a proven single-segment significant-expense table.
+
+    Promotion requires at least two already-published significant expense
+    details and exactly one reportable business member evidenced by revenue,
+    D&A, or the actual Other Segment Items subtotal.  Only bounded personnel
+    and advertising synonyms are admitted from disclosures; consolidated
+    statement rows remain untouched.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    significant = []
+    member_evidence = []
+    for idx in out.index:
+        if idx[0] != '4a_Segments_Business':
+            continue
+        metric, member = _split_segment_display_label(idx[1])
+        metric_key = _normalize_label_key(metric)
+        if metric_key == 'significant segment expense' and member:
+            significant.append(idx)
+        if (metric_key in {'depreciation amortization',
+                           'depreciation and amortization',
+                           'other segment item'} and member
+                and pd.to_numeric(out.loc[idx], errors='coerce').notna().any()):
+            # Revenue disaggregation often uses product/service captions in the
+            # member position.  D&A and the filed Other Segment Items subtotal
+            # provide the conservative single-reportable-member proof instead.
+            member_evidence.append(_gb_clean_member_footnote(member).strip())
+    if len(significant) < 2:
+        return out
+    normalized_members = {
+        _normalize_label_key(member): member for member in member_evidence
+        if member and not _GB_SIGNIFICANT_EXPENSE_DETAIL_RE.fullmatch(member)
+    }
+    if len(normalized_members) != 1:
+        return out
+    member_key, display_member = next(iter(normalized_members.items()))
+    promoted = []
+    for old_idx in list(out.index):
+        if old_idx[0] != '6_Disclosures':
+            continue
+        metric, member = _split_segment_display_label(old_idx[1])
+        if not member or _normalize_label_key(member) != member_key:
+            continue
+        metric_key = _normalize_label_key(metric)
+        if ((('salar' in metric_key and 'benefit' in metric_key)
+             or ('employee' in metric_key and 'compensation' in metric_key))
+                or metric_key in {'personnel expense', 'personnel'}):
+            detail = 'Personnel'
+        elif metric_key in {'marketing expense', 'advertising expense',
+                            'advertising and marketing'}:
+            detail = 'Advertising and marketing'
+        elif metric_key in {'litigation settlement charge',
+                            'litigation and settlement charge',
+                            'provision for litigation', 'litigation expense'}:
+            detail = 'Provision for litigation'
+        else:
+            continue
+        target = ('4a_Segments_Business',
+                  f'Significant Segment Expenses - {detail}')
+        out = _gb_rename_or_merge_pivot_row(out, old_idx, target)
+        promoted.append(f'{old_idx[1]} -> {target[1]}')
+    if promoted:
+        print('  [Segment Expense] Completed significant-expense detail table: '
+              + '; '.join(promoted))
+    return out
+
+
+
+def _gb_drop_accounting_caption_operating_metrics(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Remove expense captions that leaked into the KPI output category."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    drop = [idx for idx in df.index
+            if idx[0] == OPERATING_METRICS_CATEGORY
+            and _gb_is_accounting_caption_operating_metric(idx[1])]
+    if not drop:
+        return df
+    out = df.drop(index=drop).copy()
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    print('  [Operating Metric Gate] Removed accounting-caption row(s): '
+          + ', '.join(idx[1] for idx in drop))
+    return out
+
+def _gb_drop_fully_empty_output_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove final rows with no numeric period value, except the period header."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    drop = []
+    for idx in df.index:
+        if idx[0] == '0_Period_Header':
+            continue
+        if not pd.to_numeric(df.loc[idx], errors='coerce').notna().any():
+            drop.append(idx)
+    if not drop:
+        return df
+    out = df.drop(index=drop).copy()
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    print(f'  [Publication Gate] Removed {len(drop)} fully empty final row(s).')
+    return out
+
+
 def _gb_apply_final_segment_publication_gates(df: pd.DataFrame) -> pd.DataFrame:
     """Idempotent output-boundary safety pass for fresh and cached pivots."""
     if df is None or df.empty:
@@ -15169,6 +15735,7 @@ def _gb_apply_final_segment_publication_gates(df: pd.DataFrame) -> pd.DataFrame:
     attrs = dict(getattr(df, 'attrs', {}) or {})
     out = _gb_repair_discrete_q4_operating_openings(df)
     out = _gb_consolidate_pivot_operating_gain_loss_rows(out)
+    out = _gb_merge_temporal_operating_scope_expansions(out)
     out = _gb_reunify_reportable_segment_basis(out)
     out = _gb_unify_complete_reportable_table_basis(out)
     out = _gb_promote_proven_segment_operating_expenses(out)
@@ -15185,12 +15752,15 @@ def _gb_apply_final_segment_publication_gates(df: pd.DataFrame) -> pd.DataFrame:
     out = _gb_relabel_proven_other_cost_subtotals(out)
     out = _gb_normalize_proven_segment_member_suffixes(out)
     out = _gb_reclassify_significant_expense_details(out)
+    out = _gb_promote_complete_significant_expense_details(out)
     out = _gb_reconcile_company_defined_segment_measure_aliases(out)
     out = _gb_consolidate_pivot_segment_duplicates(out)
     out = _gb_drop_invalid_asset_series_from_pivot(out)
     out = _gb_drop_nonmonetary_asset_disclosures(out)
     out = _gb_suppress_unproven_segment_footing_diagnostics(out)
+    out = _gb_drop_accounting_caption_operating_metrics(out)
     out = _gb_drop_fully_empty_segment_rows(out)
+    out = _gb_drop_fully_empty_output_rows(out)
     out.attrs.update(attrs)
     return out
 
@@ -15370,6 +15940,120 @@ def _gb_drop_invalid_asset_series_from_pivot(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+
+def _gb_materialize_proven_segment_revenue_q4_facts(df: pd.DataFrame) -> pd.DataFrame:
+    """Create a discrete Q4 only from a complete same-label annual basis.
+
+    Historical taxonomy changes can leave the annual value in disclosures while
+    Q1-Q3 have already been promoted to a canonical segment/geography row.  The
+    generic pivot's concept-level subtraction then cannot pair them.  Resolve
+    the exact display identity first, require all four source scopes, and append
+    one calculated quarterly fact without changing any reported value.
+    """
+    required = {'Category', 'Label', 'FY', 'Q', 'Value', 'Duration', 'End'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    target_categories = {
+        '4a_Segments_Business', '4b_Segments_Geographic_Regions',
+        '4c_Segments_Geographic_Countries'}
+    target_by_label = {}
+    for label, group in out[out['Category'].isin(target_categories)].groupby(
+            'Label', sort=False):
+        metric, _member = _split_segment_display_label(label)
+        if _normalize_label_key(metric) != 'revenue':
+            continue
+        categories = list(dict.fromkeys(group['Category'].astype(str)))
+        if len(categories) == 1:
+            target_by_label[str(label)] = categories[0]
+    additions = []
+    for label, target_category in target_by_label.items():
+        series = out[
+            out['Label'].astype(str).eq(label)
+            & out['Category'].isin(target_categories | {'6_Disclosures'})
+        ].copy()
+        if series.empty:
+            continue
+        series['_GBDur'] = pd.to_numeric(series['Duration'], errors='coerce')
+        series['_GBVal'] = pd.to_numeric(series['Value'], errors='coerce')
+        series['_GBEnd'] = pd.to_datetime(series['End'], errors='coerce')
+        for fy, year_rows in series.groupby('FY', dropna=False, sort=False):
+            try:
+                fy_int = int(float(fy))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            annual = year_rows[
+                year_rows['Q'].astype(str).eq('Q4')
+                & year_rows['_GBDur'].between(300, 400)
+                & year_rows['_GBVal'].notna()
+            ].copy()
+            if annual.empty:
+                continue
+            existing_q4 = year_rows[
+                year_rows['Q'].astype(str).eq('Q4')
+                & year_rows['_GBDur'].between(45, 125)
+                & year_rows['_GBVal'].notna()
+            ]
+            if not existing_q4.empty:
+                continue
+            quarter_rows = {}
+            for q in ('Q1', 'Q2', 'Q3'):
+                candidates = year_rows[
+                    year_rows['Q'].astype(str).eq(q)
+                    & year_rows['_GBDur'].between(45, 125)
+                    & year_rows['_GBVal'].notna()
+                ].copy()
+                if candidates.empty:
+                    break
+                if 'Filed' in candidates.columns:
+                    candidates['_GBFiled'] = pd.to_datetime(
+                        candidates['Filed'], errors='coerce')
+                    candidates = candidates.sort_values(
+                        ['_GBFiled', '_GBDur'], ascending=[False, True])
+                quarter_rows[q] = candidates.iloc[0]
+            if len(quarter_rows) != 3:
+                continue
+            if 'Filed' in annual.columns:
+                annual['_GBFiled'] = pd.to_datetime(
+                    annual['Filed'], errors='coerce')
+                annual = annual.sort_values(
+                    ['_GBFiled', '_GBDur'], ascending=[False, False])
+            annual_row = annual.iloc[0]
+            annual_value = float(annual_row['_GBVal'])
+            q_sum = sum(float(quarter_rows[q]['_GBVal'])
+                        for q in ('Q1', 'Q2', 'Q3'))
+            q4_value = annual_value - q_sum
+            tolerance = max(2_000_000.0, abs(annual_value) * 0.0015)
+            if q4_value < -tolerance or q4_value > annual_value + tolerance:
+                continue
+            if abs(q4_value) <= tolerance:
+                q4_value = 0.0
+            q3_end = pd.to_datetime(quarter_rows['Q3'].get('End'), errors='coerce')
+            annual_end = pd.to_datetime(annual_row.get('End'), errors='coerce')
+            if pd.isna(q3_end) or pd.isna(annual_end) or annual_end <= q3_end:
+                continue
+            derived = annual_row.copy()
+            derived['Category'] = target_category
+            derived['Value'] = float(q4_value)
+            derived['FY'] = fy_int
+            derived['Q'] = 'Q4'
+            derived['Start'] = (q3_end + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+            derived['End'] = annual_end.strftime('%Y-%m-%d')
+            derived['Duration'] = int((annual_end - q3_end).days)
+            derived['IsCalculated'] = True
+            derived['SourceKind'] = 'derived_discrete_q4'
+            derived['SourceAdmissionRule'] = 'annual_minus_q1_q2_q3_same_segment_identity'
+            derived['SourceDirectness'] = 'calculated'
+            derived['SourceDerivation'] = 'annual_minus_q1_q2_q3'
+            additions.append(derived[out.columns])
+    if not additions:
+        return out
+    result = pd.concat([out, pd.DataFrame(additions)], ignore_index=True,
+                       sort=False)
+    print(f'  [Segment Q4] Materialized {len(additions)} proven discrete-Q4 fact(s).')
+    return result
+
+
 def build_pivoted_data(all_facts, ticker, ye_month, company_name=None, is_financial=False, is_insurance=False, is_oil_gas=False, is_reit=False):
     with _ProfileTimer("build_pivoted_data_total"):
         return _build_pivoted_data_impl(
@@ -15419,6 +16103,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df = _gb_quarantine_conflicting_semantic_duplicates(df)
     df = _gb_promote_proven_geographic_revenue_history_facts(df)
     df = _consolidate_geographic_alias_facts(df)
+    df = _gb_materialize_proven_segment_revenue_q4_facts(df)
     df = _gb_reconcile_operating_metric_identities(df)
     # Operating-alias reconciliation can create final canonical labels; apply
     # the semantic duplicate gate once more before candidate selection.
@@ -26706,7 +27391,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-20.native-extraction.v21-amazon-asset-context-geo-history"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-20.native-extraction.v23-inline-assets-atomic-om"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -26876,7 +27561,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-20.final-pivot.v37-amazon-geo-history-mixed-footing"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-20.final-pivot.v39-release-boundary-cleanup"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -27677,6 +28362,8 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
     final_pivot = _gb_apply_final_segment_publication_gates(final_pivot)
     final_pivot = _normalize_output_margin_rows(final_pivot)
     final_pivot = _hide_stale_operating_measure_rows(final_pivot)
+    final_pivot = _gb_drop_accounting_caption_operating_metrics(final_pivot)
+    final_pivot = _gb_drop_fully_empty_output_rows(final_pivot)
     final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native annual pre-write sort")
 
     progress.set(98.0, "Writing annual output file")
@@ -28509,6 +29196,11 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         final_pivot = _hide_stale_operating_measure_rows(final_pivot)
         final_pivot = _hide_unsupported_trailing_periods(
             final_pivot, protected_periods=period_dates)
+        # Absolute output boundary: later quality/integrity/concentration stages
+        # can create rows after the segment publication gate.  Remove only rows
+        # with no numeric period value, preserving explicit zeros and headers.
+        final_pivot = _gb_drop_accounting_caption_operating_metrics(final_pivot)
+        final_pivot = _gb_drop_fully_empty_output_rows(final_pivot)
         final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native quarterly pre-write sort")
 
         progress.set(98.0, "Writing output file")
