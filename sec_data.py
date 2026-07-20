@@ -15942,21 +15942,479 @@ def _gb_drop_invalid_asset_series_from_pivot(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _gb_materialize_proven_segment_revenue_q4_facts(df: pd.DataFrame) -> pd.DataFrame:
-    """Create a discrete Q4 only from a complete same-label annual basis.
+    """Create a discrete segment/geography Q4 from a proven annual basis.
 
-    Historical taxonomy changes can leave the annual value in disclosures while
-    Q1-Q3 have already been promoted to a canonical segment/geography row.  The
-    generic pivot's concept-level subtraction then cannot pair them.  Resolve
-    the exact display identity first, require all four source scopes, and append
-    one calculated quarterly fact without changing any reported value.
+    The ordinary path uses annual and Q1-Q3 facts already routed to segment,
+    geography, or disclosures.  A second, deliberately narrow bridge admits an
+    older income-statement revenue-disaggregation lineage only when the exact
+    label has become a well-established segment/geography series and the source
+    handoff is numerically continuous.  This covers taxonomy/presentation
+    migrations without treating arbitrary face-statement components as
+    reportable segments.
+
+    No reported value is changed.  A calculated row is appended only when:
+      * one exact display identity maps to one target category;
+      * annual and all three discrete quarters are present and non-conflicting;
+      * source-unit metadata, when available, agrees;
+      * annual and quarterly inputs share one filing-revision cohort;
+      * the result is non-negative and bounded by revision-coherent revenue;
+      * a face-disaggregation bridge has strong modern target evidence and a
+        continuous historical-to-modern handoff; and
+      * every complete member in the same face-disaggregation cohort passes.
+
+    The final cohort rule is important for accounting-basis changes: if one
+    member produces an impossible Q4, no sibling from that filed breakdown is
+    partially published under a mixed basis.
     """
     required = {'Category', 'Label', 'FY', 'Q', 'Value', 'Duration', 'End'}
     if df is None or df.empty or not required.issubset(df.columns):
         return df
+
     out = df.copy()
     target_categories = {
         '4a_Segments_Business', '4b_Segments_Geographic_Regions',
         '4c_Segments_Geographic_Countries'}
+    ordinary_source_categories = target_categories | {'6_Disclosures'}
+
+    def _quarter_key(row):
+        try:
+            fy = int(float(row.get('FY')))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        match = re.fullmatch(r'Q([1-4])', str(row.get('Q') or '').strip(), re.I)
+        if not match:
+            return None
+        return fy, int(match.group(1))
+
+    def _numeric_value(row):
+        value = pd.to_numeric(pd.Series([row.get('Value')]), errors='coerce').iloc[0]
+        return None if pd.isna(value) else float(value)
+
+    def _source_text_value(value):
+        try:
+            if value is None or pd.isna(value):
+                return ''
+        except (TypeError, ValueError):
+            pass
+        return str(value).strip().casefold()
+
+    def _is_reported(row):
+        """Return whether the row is a source fact rather than a derived value.
+
+        ``IsCalculated`` is not reliable for this decision.  In edgartools it
+        can be true for a directly reported dimensional fact merely because the
+        concept participates in a calculation relationship.  UBER's reported
+        offering-revenue facts are one example.  Prefer explicit provenance and
+        use the legacy boolean only when no source metadata survived.
+        """
+        directness = _source_text_value(row.get('SourceDirectness'))
+        source_kind = _source_text_value(row.get('SourceKind'))
+        derivation = _source_text_value(row.get('SourceDerivation'))
+        admission = _source_text_value(row.get('SourceAdmissionRule'))
+
+        if directness == 'calculated':
+            return False
+        if source_kind.startswith('derived'):
+            return False
+        if derivation:
+            return False
+        if admission.startswith('annual_minus_') or admission.startswith('derived_'):
+            return False
+
+        # A concrete source kind/directness/admission rule is stronger than the
+        # overloaded IsCalculated flag and proves this is a source-backed fact.
+        if directness or source_kind or admission:
+            return True
+
+        raw_calculated = row.get('IsCalculated', False)
+        if pd.isna(raw_calculated):
+            return True
+        if isinstance(raw_calculated, str):
+            calculated = raw_calculated.strip().casefold() in {
+                '1', 'true', 'yes', 'on'}
+        else:
+            calculated = bool(raw_calculated)
+        return not calculated
+
+    def _is_proven_exact_discrete_derivation(row):
+        """Admit a bounded exact-concept quarter derivation, never an annual.
+
+        These rows are produced by the script's cumulative-period engine only
+        after it proves compatible dates, dimensions, and one exact XBRL concept.
+        They are valid operands for annual-minus-Q1-Q2-Q3, but they must not be
+        mistaken for the directly reported annual source.
+        """
+        try:
+            duration = int(float(row.get('Duration')))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not 45 <= duration <= 125:
+            return False
+        derivation = _source_text_value(row.get('SourceDerivation'))
+        operand_columns = None
+        if derivation in {
+                'exact_concept_ytd6_minus_q2',
+                'exact_concept_ytd6_minus_q1'}:
+            operand_columns = (
+                'SourceDerivationYTDConcept',
+                'SourceDerivationQuarterConcept')
+        elif derivation == 'exact_concept_ytd9_minus_ytd6':
+            operand_columns = (
+                'SourceDerivationYTDConcept',
+                'SourceDerivationBaselineConcept')
+        if operand_columns is None:
+            return False
+        concept = _source_text_value(row.get('Concept'))
+        if not concept:
+            return False
+        operands = [_source_text_value(row.get(column))
+                    for column in operand_columns]
+        return all(operand and operand == concept for operand in operands)
+
+    def _is_eligible_face_disaggregation(row):
+        """Admit only proven dimensional/table revenue disaggregation facts."""
+        if row.get('Category') != '1_Income_Statement':
+            return False
+        if not (_is_reported(row)
+                or _is_proven_exact_discrete_derivation(row)):
+            return False
+        metric, member = _split_segment_display_label(row.get('Label'))
+        if _normalize_label_key(metric) != 'revenue' or not str(member).strip():
+            return False
+        basis = str(row.get('SourceAnalyticalBasis') or '').casefold().strip()
+        role = str(row.get('SourceTableRole') or '').casefold().strip()
+        try:
+            dim_count = int(float(row.get('DimCount') or 0))
+        except (TypeError, ValueError, OverflowError):
+            dim_count = 0
+        proven_basis = basis in {
+            'revenue_disaggregation', 'product_service_disaggregation'}
+        proven_source = (
+            role == str(_GB_ROLE_REVENUE_DISAGG).casefold()
+            or (role == 'xbrl_dimensional_fact' and dim_count > 0)
+        )
+        return proven_basis and proven_source
+
+    def _values_agree(rows):
+        values = [_numeric_value(row) for _, row in rows.iterrows()]
+        values = [value for value in values if value is not None]
+        if len(values) <= 1:
+            return True
+        scale = max(max(abs(value) for value in values), 1.0)
+        tolerance = max(2_000_000.0, scale * 0.0015)
+        return max(values) - min(values) <= tolerance
+
+    def _units_compatible(rows):
+        def _unit_text(row, column):
+            value = row.get(column)
+            try:
+                if value is None or pd.isna(value):
+                    return ''
+            except (TypeError, ValueError):
+                pass
+            return str(value).strip().casefold()
+
+        for column in ('SourceUnitSignature', 'SourceUnitKind'):
+            values = {
+                text for row in rows
+                if (text := _unit_text(row, column))
+            }
+            if len(values) > 1:
+                return False
+        scales = []
+        for row in rows:
+            raw = row.get('SourceUnitScale')
+            if raw is None or str(raw).strip() == '':
+                continue
+            try:
+                value = abs(float(raw))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if value > 0 and np.isfinite(value):
+                scales.append(value)
+        if len(scales) > 1:
+            base = scales[0]
+            if any(not np.isclose(value, base, rtol=1e-12, atol=0.0)
+                   for value in scales[1:]):
+                return False
+        return True
+
+    def _select_candidate(candidates, target_category, expected_duration,
+                          preferred_concept=None, filed_not_after=None):
+        """Select one authoritative compatible value.
+
+        Lower-priority fallback sources must not veto an exact target-category
+        fact.  Likewise, an older comparative value must not veto the issuer's
+        latest restated value.  Conflicts still fail closed inside the winning
+        source/revision cohort.
+
+        When Q1-Q3 establish one exact XBRL concept, an annual candidate using
+        that same concept is preferred.  This prevents an ASC 606-only annual
+        fact from conflicting with a broader reported-revenue lineage that also
+        includes lease or other non-contract revenue.
+        """
+        if candidates is None or candidates.empty:
+            return None, 'missing'
+        usable = candidates.copy()
+        usable['_GBVal'] = pd.to_numeric(usable['Value'], errors='coerce')
+        usable['_GBDur'] = pd.to_numeric(usable['Duration'], errors='coerce')
+        usable = usable[usable['_GBVal'].notna() & usable['_GBDur'].notna()]
+        if usable.empty:
+            return None, 'missing'
+
+        # Historical comparative quarters may retain the accounting basis that
+        # was current when they were filed, while a later 10-K retrospectively
+        # revises only the annual comparative value.  When a revision cutoff is
+        # supplied, keep the latest source candidate available by that date so
+        # annual-minus-Q1-Q2-Q3 never mixes accounting revisions.
+        cutoff = pd.to_datetime(filed_not_after, errors='coerce')
+        if pd.notna(cutoff) and 'Filed' in usable.columns:
+            usable['_GBFiled'] = pd.to_datetime(
+                usable['Filed'], errors='coerce')
+            revision_cohort = usable[
+                usable['_GBFiled'].notna()
+                & usable['_GBFiled'].le(cutoff)
+            ].copy()
+            if not revision_cohort.empty:
+                usable = revision_cohort
+
+        usable['_GBSourceRank'] = usable['Category'].map(
+            lambda category: 0 if category == target_category
+            else (1 if category in target_categories
+                  else (2 if category == '6_Disclosures' else 3)))
+        best_source_rank = usable['_GBSourceRank'].min()
+        usable = usable[usable['_GBSourceRank'].eq(best_source_rank)].copy()
+
+        # Concept coherence resolves conflicts only inside the authoritative
+        # source tier.  It must never promote a lower-priority disclosure over
+        # an exact segment/geography annual fact.
+        preferred_concept = _source_text_value(preferred_concept)
+        if preferred_concept and 'Concept' in usable.columns:
+            concept_keys = usable['Concept'].map(_source_text_value)
+            exact_concept = concept_keys.eq(preferred_concept)
+            if exact_concept.any():
+                usable = usable.loc[exact_concept].copy()
+
+        usable['_GBReportedRank'] = usable.apply(
+            lambda row: 0 if _is_reported(row) else 1, axis=1)
+        best_reported_rank = usable['_GBReportedRank'].min()
+        usable = usable[usable['_GBReportedRank'].eq(best_reported_rank)].copy()
+
+        usable['_GBDurationDistance'] = (
+            usable['_GBDur'] - expected_duration).abs()
+        if 'Filed' in usable.columns:
+            usable['_GBFiled'] = pd.to_datetime(
+                usable['Filed'], errors='coerce')
+            latest_filed = usable['_GBFiled'].max()
+            if pd.notna(latest_filed):
+                latest = usable[usable['_GBFiled'].eq(latest_filed)]
+                if not latest.empty:
+                    usable = latest.copy()
+        else:
+            usable['_GBFiled'] = pd.NaT
+
+        # Only peers in the winning source/revision cohort are substitutes.
+        # A lower-priority disclosure or an older comparative restatement is
+        # evidence, but it must not create a false conflict with the selected
+        # authoritative lineage.
+        if not _values_agree(usable):
+            return None, 'conflict'
+
+        usable = usable.sort_values(
+            ['_GBDurationDistance', '_GBFiled'],
+            ascending=[True, False])
+        return usable.iloc[0], None
+
+    def _historical_revision_cutoff(
+            quarter_rows, annual_candidates, preferred_concept=None):
+        """Return the revision date shared by historical comparative quarters.
+
+        For a normal current-year series, Q1-Q3 are filed before any annual
+        report for that fiscal year, so no annual candidate exists before the
+        earliest quarter filing and this returns ``None``.  For older periods
+        re-presented in later 10-Qs, an original annual filing often predates the
+        comparative quarter filings.  Selecting the latest annual available by
+        that date preserves the same accounting basis across all four quarters.
+        """
+        filed_dates = []
+        for row in quarter_rows.values():
+            filed = pd.to_datetime(row.get('Filed'), errors='coerce')
+            if pd.isna(filed):
+                return None
+            filed_dates.append(pd.Timestamp(filed))
+        if len(filed_dates) != 3 or annual_candidates is None or annual_candidates.empty:
+            return None
+        cutoff = min(filed_dates)
+        candidate_pool = annual_candidates
+        preferred_concept = _source_text_value(preferred_concept)
+        if preferred_concept and 'Concept' in candidate_pool.columns:
+            concept_keys = candidate_pool['Concept'].map(_source_text_value)
+            exact_concept = concept_keys.eq(preferred_concept)
+            if exact_concept.any():
+                candidate_pool = candidate_pool.loc[exact_concept].copy()
+        if 'Filed' not in candidate_pool.columns:
+            return None
+        annual_filed = pd.to_datetime(
+            candidate_pool['Filed'], errors='coerce')
+        if not annual_filed.notna().any():
+            return None
+        return cutoff if annual_filed.le(cutoff).any() else None
+
+    def _face_cohort(row, target_category, fy_int):
+        axis = ''
+        for column in ('SourceAxisSignature', 'SourceDimensionAxes',
+                       'SourceTableFingerprint'):
+            axis = str(row.get(column) or '').strip()
+            if axis:
+                break
+        if not axis:
+            axis = str(row.get('SourceAnalyticalBasis') or 'revenue_disaggregation')
+        filing = str(row.get('Accession') or row.get('Filed')
+                     or row.get('End') or '')
+        return (target_category, fy_int, _normalize_label_key(axis), filing)
+
+    def _top_level_revenue_label(label):
+        text = str(label or '')
+        if not text.startswith('Revenue - ') or text.count(' - ') != 1:
+            return False
+        member = text.split(' - ', 1)[1].casefold()
+        return not bool(re.search(
+            r'\b(?:intersegment|elimination|consolidated|total)\b', member))
+
+    def _face_bridge_proven(label, target_category, face_rows, target_rows):
+        """Prove one revenue lineage across face and segment/geography routes.
+
+        Two valid presentation patterns exist:
+          * handoff: an older face-disaggregation series ends and a target
+            segment/geography series continues it; or
+          * concurrent duplication: the same offering revenue remains in an
+            ASC 606 disaggregation note while also being published in the
+            segment note.  Some issuers use this second pattern.
+
+        The previous bridge accepted only the first pattern.  It therefore
+        rejected valid continuing duplicates even though multiple quarters matched
+        exactly.  Four value- and unit-consistent overlapping discrete periods
+        are stronger lineage evidence than a caption-only handoff and are now
+        sufficient.  Fewer overlaps still require the original continuity
+        proof below.
+        """
+        if face_rows.empty or target_rows.empty:
+            return False
+        target_periods = {
+            key for _, row in target_rows.iterrows()
+            if (key := _quarter_key(row)) is not None
+        }
+        if len(target_periods) < 4:
+            return False
+
+        face_discrete = face_rows[
+            pd.to_numeric(face_rows['Duration'], errors='coerce').between(45, 125)
+        ].copy()
+        target_discrete = target_rows[
+            pd.to_numeric(target_rows['Duration'], errors='coerce').between(45, 125)
+        ].copy()
+        if target_discrete.empty:
+            return False
+
+        # Any overlapping discrete periods must agree.  A same-caption conflict
+        # is evidence of different scope, not a rename/handoff.  Conversely, a
+        # full four-quarter run of agreeing values proves a concurrent duplicate
+        # lineage even when neither source route ends before the other begins.
+        face_by_period = defaultdict(list)
+        target_by_period = defaultdict(list)
+        for idx, row in face_discrete.iterrows():
+            key = _quarter_key(row)
+            if key is not None:
+                face_by_period[key].append(idx)
+        for idx, row in target_discrete.iterrows():
+            key = _quarter_key(row)
+            if key is not None:
+                target_by_period[key].append(idx)
+
+        overlapping_periods = sorted(set(face_by_period) & set(target_by_period))
+        overlap_values = []
+        for key in overlapping_periods:
+            combined = pd.concat([
+                face_discrete.loc[face_by_period[key]],
+                target_discrete.loc[target_by_period[key]],
+            ], axis=0)
+            if not _values_agree(combined):
+                return False
+            if not _units_compatible(
+                    [row for _, row in combined.iterrows()]):
+                return False
+            numeric = pd.to_numeric(combined['Value'], errors='coerce').dropna()
+            if not numeric.empty:
+                overlap_values.append(float(numeric.median()))
+
+        if len(overlapping_periods) >= 4:
+            serials = [year * 4 + quarter for year, quarter in overlapping_periods]
+            distinct_values = len({round(value, 6) for value in overlap_values})
+            # Require a genuine multi-quarter run rather than four duplicate
+            # contexts for one date or a constant placeholder series.
+            if (max(serials) - min(serials) >= 3
+                    and distinct_values >= 2):
+                return True
+
+        face_points = []
+        for _, row in face_discrete.iterrows():
+            key = _quarter_key(row)
+            value = _numeric_value(row)
+            if key is not None and value is not None:
+                face_points.append((key, value))
+        target_points = []
+        for _, row in target_discrete.iterrows():
+            key = _quarter_key(row)
+            value = _numeric_value(row)
+            if key is not None and value is not None:
+                target_points.append((key, value))
+        if not target_points:
+            return False
+
+        # The target must continue beyond the old face lineage.  This mirrors
+        # the final abandoned-face splice but proves the transition before Q4
+        # derivation, while fact provenance still exists.
+        if face_points:
+            last_face_key, last_face_value = max(face_points, key=lambda item: item[0])
+            later_targets = [item for item in target_points if item[0] > last_face_key]
+            if not later_targets:
+                return False
+            first_target_key, first_target_value = min(
+                later_targets, key=lambda item: item[0])
+            serial = lambda key: key[0] * 4 + key[1]
+            if serial(first_target_key) - serial(last_face_key) > 6:
+                return False
+            if last_face_value == 0 or first_target_value == 0:
+                return bool(overlapping_periods)
+            ratio = abs(first_target_value / last_face_value)
+            if not (0.15 <= ratio <= 6.0):
+                return False
+            return True
+
+        # Annual-only face histories need a comparable quarterly run-rate.
+        face_annual = face_rows[
+            pd.to_numeric(face_rows['Duration'], errors='coerce').between(300, 400)
+        ].copy()
+        annual_points = []
+        for _, row in face_annual.iterrows():
+            key = _quarter_key(row)
+            value = _numeric_value(row)
+            if key is not None and value is not None:
+                annual_points.append((key, value / 4.0))
+        if not annual_points:
+            return False
+        last_face_key, run_rate = max(annual_points, key=lambda item: item[0])
+        later_targets = [item for item in target_points if item[0] > last_face_key]
+        if not later_targets or run_rate == 0:
+            return False
+        first_target_key, first_target_value = min(
+            later_targets, key=lambda item: item[0])
+        serial = lambda key: key[0] * 4 + key[1]
+        if serial(first_target_key) - serial(last_face_key) > 6:
+            return False
+        ratio = abs(first_target_value / run_rate)
+        return 0.15 <= ratio <= 6.0
+
     target_by_label = {}
     for label, group in out[out['Category'].isin(target_categories)].groupby(
             'Label', sort=False):
@@ -15966,72 +16424,255 @@ def _gb_materialize_proven_segment_revenue_q4_facts(df: pd.DataFrame) -> pd.Data
         categories = list(dict.fromkeys(group['Category'].astype(str)))
         if len(categories) == 1:
             target_by_label[str(label)] = categories[0]
-    additions = []
-    for label, target_category in target_by_label.items():
-        series = out[
-            out['Label'].astype(str).eq(label)
-            & out['Category'].isin(target_categories | {'6_Disclosures'})
+
+    consolidated_q4 = {}
+    total_rows = out[
+        out['Category'].eq('1_Income_Statement')
+        & out['Label'].astype(str).eq('Revenue')
+    ].copy()
+    if not total_rows.empty:
+        total_rows['_GBDur'] = pd.to_numeric(total_rows['Duration'], errors='coerce')
+        for fy, group in total_rows.groupby('FY', dropna=False, sort=False):
+            try:
+                fy_int = int(float(fy))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            candidates = group[
+                group['Q'].astype(str).eq('Q4')
+                & group['_GBDur'].between(45, 125)
+            ]
+            selected, error = _select_candidate(candidates, '1_Income_Statement', 90)
+            if selected is not None and error is None:
+                value = _numeric_value(selected)
+                if value is not None:
+                    consolidated_q4[fy_int] = value
+
+    revision_total_cache = {}
+
+    def _consolidated_q4_for_revision(fy_int, filed_not_after=None):
+        """Return consolidated Q4 on the same source-revision basis.
+
+        The ordinary cached value remains the default.  A historical revision
+        cutoff rebuilds Q4 from the annual and Q1-Q3 total-revenue facts that
+        were available in that same filing era.
+        """
+        cutoff = pd.to_datetime(filed_not_after, errors='coerce')
+        if pd.isna(cutoff):
+            return consolidated_q4.get(fy_int)
+        cache_key = (int(fy_int), pd.Timestamp(cutoff).strftime('%Y-%m-%d'))
+        if cache_key in revision_total_cache:
+            return revision_total_cache[cache_key]
+
+        year_rows = total_rows[
+            pd.to_numeric(total_rows['FY'], errors='coerce').eq(int(fy_int))
         ].copy()
+        if year_rows.empty:
+            revision_total_cache[cache_key] = None
+            return None
+        year_rows['_GBDur'] = pd.to_numeric(
+            year_rows['Duration'], errors='coerce')
+        year_rows['_GBVal'] = pd.to_numeric(
+            year_rows['Value'], errors='coerce')
+
+        quarter_rows = {}
+        for q in ('Q1', 'Q2', 'Q3'):
+            candidates = year_rows[
+                year_rows['Q'].astype(str).eq(q)
+                & year_rows['_GBDur'].between(45, 125)
+                & year_rows['_GBVal'].notna()
+            ].copy()
+            selected, error = _select_candidate(
+                candidates, '1_Income_Statement', 90,
+                filed_not_after=cutoff)
+            if selected is None:
+                revision_total_cache[cache_key] = None
+                return None
+            quarter_rows[q] = selected
+
+        quarter_concepts = {
+            _source_text_value(row.get('Concept'))
+            for row in quarter_rows.values()
+            if _source_text_value(row.get('Concept'))
+        }
+        preferred_concept = (
+            next(iter(quarter_concepts))
+            if len(quarter_concepts) == 1 else None)
+
+        annual_candidates = year_rows[
+            year_rows['Q'].astype(str).eq('Q4')
+            & year_rows['_GBDur'].between(300, 400)
+            & year_rows['_GBVal'].notna()
+        ].copy()
+        annual_row, error = _select_candidate(
+            annual_candidates, '1_Income_Statement', 365,
+            preferred_concept=preferred_concept,
+            filed_not_after=cutoff)
+        if annual_row is None:
+            revision_total_cache[cache_key] = None
+            return None
+        source_rows = [annual_row] + [
+            quarter_rows[q] for q in ('Q1', 'Q2', 'Q3')]
+        if not _units_compatible(source_rows):
+            revision_total_cache[cache_key] = None
+            return None
+        annual_value = _numeric_value(annual_row)
+        quarter_values = [
+            _numeric_value(quarter_rows[q]) for q in ('Q1', 'Q2', 'Q3')]
+        if annual_value is None or any(value is None for value in quarter_values):
+            revision_total_cache[cache_key] = None
+            return None
+        q4_value = float(annual_value - sum(quarter_values))
+        tolerance = max(2_000_000.0, abs(annual_value) * 0.0015)
+        if q4_value < -tolerance or q4_value > annual_value + tolerance:
+            revision_total_cache[cache_key] = None
+            return None
+        if abs(q4_value) <= tolerance:
+            q4_value = 0.0
+        revision_total_cache[cache_key] = q4_value
+        return q4_value
+
+    proposals = []
+    failed_face_cohorts = set()
+    face_bridge_cache = {}
+
+    for label, target_category in target_by_label.items():
+        label_mask = out['Label'].astype(str).eq(label)
+        ordinary = out[
+            label_mask & out['Category'].isin(ordinary_source_categories)
+        ].copy()
+        face = out[label_mask & out['Category'].eq('1_Income_Statement')].copy()
+        if not face.empty:
+            eligible_mask = face.apply(_is_eligible_face_disaggregation, axis=1)
+            face = face.loc[eligible_mask].copy()
+        target_rows = out[
+            label_mask & out['Category'].eq(target_category)
+        ].copy()
+        bridge_key = (label, target_category)
+        face_bridge_cache[bridge_key] = _face_bridge_proven(
+            label, target_category, face, target_rows)
+        series = pd.concat([ordinary, face], axis=0, sort=False)
         if series.empty:
             continue
         series['_GBDur'] = pd.to_numeric(series['Duration'], errors='coerce')
         series['_GBVal'] = pd.to_numeric(series['Value'], errors='coerce')
         series['_GBEnd'] = pd.to_datetime(series['End'], errors='coerce')
+
         for fy, year_rows in series.groupby('FY', dropna=False, sort=False):
             try:
                 fy_int = int(float(fy))
             except (TypeError, ValueError, OverflowError):
                 continue
-            annual = year_rows[
+            annual_candidates = year_rows[
                 year_rows['Q'].astype(str).eq('Q4')
                 & year_rows['_GBDur'].between(300, 400)
                 & year_rows['_GBVal'].notna()
             ].copy()
-            if annual.empty:
-                continue
+
+            # A directly reported discrete Q4 always wins.  Check it before
+            # resolving annual candidates so an irrelevant annual conflict can
+            # never suppress a filed quarterly value.
             existing_q4 = year_rows[
                 year_rows['Q'].astype(str).eq('Q4')
                 & year_rows['_GBDur'].between(45, 125)
                 & year_rows['_GBVal'].notna()
-            ]
-            if not existing_q4.empty:
+            ].copy()
+            existing_row, existing_error = _select_candidate(
+                existing_q4, target_category, 90)
+            if existing_row is not None:
                 continue
+            if existing_error == 'conflict':
+                continue
+
             quarter_rows = {}
+            failed = False
             for q in ('Q1', 'Q2', 'Q3'):
                 candidates = year_rows[
                     year_rows['Q'].astype(str).eq(q)
                     & year_rows['_GBDur'].between(45, 125)
                     & year_rows['_GBVal'].notna()
                 ].copy()
-                if candidates.empty:
+                selected, error = _select_candidate(
+                    candidates, target_category, 90)
+                if selected is None:
+                    failed = True
                     break
-                if 'Filed' in candidates.columns:
-                    candidates['_GBFiled'] = pd.to_datetime(
-                        candidates['Filed'], errors='coerce')
-                    candidates = candidates.sort_values(
-                        ['_GBFiled', '_GBDur'], ascending=[False, True])
-                quarter_rows[q] = candidates.iloc[0]
-            if len(quarter_rows) != 3:
+                quarter_rows[q] = selected
+            if failed:
                 continue
-            if 'Filed' in annual.columns:
-                annual['_GBFiled'] = pd.to_datetime(
-                    annual['Filed'], errors='coerce')
-                annual = annual.sort_values(
-                    ['_GBFiled', '_GBDur'], ascending=[False, False])
-            annual_row = annual.iloc[0]
-            annual_value = float(annual_row['_GBVal'])
-            q_sum = sum(float(quarter_rows[q]['_GBVal'])
+
+            quarter_concepts = {
+                _source_text_value(row.get('Concept'))
+                for row in quarter_rows.values()
+                if _source_text_value(row.get('Concept'))
+            }
+            preferred_annual_concept = (
+                next(iter(quarter_concepts))
+                if len(quarter_concepts) == 1 else None)
+
+            revision_cutoff = _historical_revision_cutoff(
+                quarter_rows, annual_candidates,
+                preferred_concept=preferred_annual_concept)
+            annual_row, annual_error = _select_candidate(
+                annual_candidates, target_category, 365,
+                preferred_concept=preferred_annual_concept,
+                filed_not_after=revision_cutoff)
+            if annual_row is None:
+                if annual_error == 'conflict':
+                    for _, candidate in annual_candidates.iterrows():
+                        if _is_eligible_face_disaggregation(candidate):
+                            failed_face_cohorts.add(
+                                _face_cohort(candidate, target_category, fy_int))
+                continue
+
+            annual_is_face = _is_eligible_face_disaggregation(annual_row)
+            face_cohort = (
+                _face_cohort(annual_row, target_category, fy_int)
+                if annual_is_face else None)
+            if annual_is_face and not face_bridge_cache.get(bridge_key, False):
+                failed_face_cohorts.add(face_cohort)
+                continue
+
+            source_rows = [annual_row] + [quarter_rows[q] for q in ('Q1', 'Q2', 'Q3')]
+            if not _units_compatible(source_rows):
+                if annual_is_face:
+                    failed_face_cohorts.add(face_cohort)
+                continue
+
+            annual_value = _numeric_value(annual_row)
+            if annual_value is None:
+                continue
+            q_sum = sum(_numeric_value(quarter_rows[q])
                         for q in ('Q1', 'Q2', 'Q3'))
             q4_value = annual_value - q_sum
             tolerance = max(2_000_000.0, abs(annual_value) * 0.0015)
             if q4_value < -tolerance or q4_value > annual_value + tolerance:
+                if annual_is_face:
+                    failed_face_cohorts.add(face_cohort)
                 continue
             if abs(q4_value) <= tolerance:
                 q4_value = 0.0
+
+            coherent_total_q4 = _consolidated_q4_for_revision(
+                fy_int, revision_cutoff)
+            if annual_is_face and coherent_total_q4 is not None:
+                total_tolerance = max(
+                    2_000_000.0, abs(coherent_total_q4) * 0.003)
+                if q4_value > coherent_total_q4 + total_tolerance:
+                    failed_face_cohorts.add(face_cohort)
+                    continue
+
             q3_end = pd.to_datetime(quarter_rows['Q3'].get('End'), errors='coerce')
             annual_end = pd.to_datetime(annual_row.get('End'), errors='coerce')
             if pd.isna(q3_end) or pd.isna(annual_end) or annual_end <= q3_end:
+                if annual_is_face:
+                    failed_face_cohorts.add(face_cohort)
                 continue
+            derived_duration = int((annual_end - q3_end).days)
+            if not 45 <= derived_duration <= 125:
+                if annual_is_face:
+                    failed_face_cohorts.add(face_cohort)
+                continue
+
             derived = annual_row.copy()
             derived['Category'] = target_category
             derived['Value'] = float(q4_value)
@@ -16039,19 +16680,264 @@ def _gb_materialize_proven_segment_revenue_q4_facts(df: pd.DataFrame) -> pd.Data
             derived['Q'] = 'Q4'
             derived['Start'] = (q3_end + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
             derived['End'] = annual_end.strftime('%Y-%m-%d')
-            derived['Duration'] = int((annual_end - q3_end).days)
+            derived['Duration'] = derived_duration
             derived['IsCalculated'] = True
             derived['SourceKind'] = 'derived_discrete_q4'
-            derived['SourceAdmissionRule'] = 'annual_minus_q1_q2_q3_same_segment_identity'
+            derived['SourceAdmissionRule'] = (
+                'annual_face_disaggregation_minus_q1_q2_q3_exact_target_lineage'
+                if annual_is_face
+                else 'annual_minus_q1_q2_q3_same_segment_identity')
             derived['SourceDirectness'] = 'calculated'
             derived['SourceDerivation'] = 'annual_minus_q1_q2_q3'
-            additions.append(derived[out.columns])
+            proposals.append({
+                'row': derived[out.columns],
+                'label': label,
+                'target_category': target_category,
+                'fy': fy_int,
+                'face_cohort': face_cohort,
+                'annual_is_face': annual_is_face,
+                'revision_cutoff': revision_cutoff,
+                'coherent_total_q4': coherent_total_q4,
+            })
+
+    # A face-disaggregation table is one accounting basis.  Do not publish two
+    # apparently valid siblings when a third complete sibling proved that the
+    # annual and quarterly histories are incompatible (for example, after a
+    # retrospective accounting-policy change).
+    by_face_cohort = defaultdict(list)
+    for proposal in proposals:
+        if proposal['annual_is_face']:
+            by_face_cohort[proposal['face_cohort']].append(proposal)
+    for cohort, cohort_proposals in by_face_cohort.items():
+        if cohort in failed_face_cohorts:
+            continue
+        top_level = [proposal for proposal in cohort_proposals
+                     if _top_level_revenue_label(proposal['label'])]
+        if len(top_level) < 2:
+            continue
+        fy_int = top_level[0]['fy']
+        coherent_totals = [
+            float(proposal['coherent_total_q4'])
+            for proposal in top_level
+            if proposal.get('coherent_total_q4') is not None
+        ]
+        if coherent_totals:
+            scale = max(max(abs(value) for value in coherent_totals), 1.0)
+            agreement_tolerance = max(2_000_000.0, scale * 0.0015)
+            if max(coherent_totals) - min(coherent_totals) > agreement_tolerance:
+                failed_face_cohorts.add(cohort)
+                continue
+            total_q4 = float(np.median(coherent_totals))
+        else:
+            total_q4 = consolidated_q4.get(fy_int)
+        if total_q4 is None:
+            continue
+        component_sum = sum(float(proposal['row']['Value'])
+                            for proposal in top_level)
+        tolerance = max(2_000_000.0, abs(total_q4) * 0.005)
+        if component_sum > total_q4 + tolerance:
+            failed_face_cohorts.add(cohort)
+
+    additions = [proposal['row'] for proposal in proposals
+                 if not (proposal['annual_is_face']
+                         and proposal['face_cohort'] in failed_face_cohorts)]
+    rejected = sum(
+        1 for proposal in proposals
+        if proposal['annual_is_face']
+        and proposal['face_cohort'] in failed_face_cohorts)
+    if rejected:
+        print(f'  [Segment Q4] Rejected {rejected} cross-category Q4 candidate(s) '
+              'because the complete revenue-disaggregation cohort did not pass.')
     if not additions:
         return out
     result = pd.concat([out, pd.DataFrame(additions)], ignore_index=True,
                        sort=False)
     print(f'  [Segment Q4] Materialized {len(additions)} proven discrete-Q4 fact(s).')
     return result
+
+
+
+def _gb_materialize_value_proven_renamed_segment_q4_facts(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Publish a stranded historical Q4 under a proven continuing member name.
+
+    Some issuers change reportable-member captions between filing eras.  The
+    annual-minus-quarter derivation can correctly create Q4 under the historical
+    member, while Q1-Q3 of the same economic series have already been carried
+    under the continuing member.
+
+    This fact-stage bridge runs before any pivot or member cleanup.  It copies
+    only a missing business-segment revenue Q4 when:
+      * historical donor and continuing target match in Q1, Q2 and Q3;
+      * all three matches pass reported-rounding tolerance;
+      * the continuing member has at least four later segment quarters;
+      * the historical member has at most one later segment quarter;
+      * donor-to-target matching is one-to-one;
+      * the target has no existing discrete Q4.
+
+    No issuer or member-name dictionary is used.
+    """
+    required = {
+        'Category', 'Label', 'FY', 'Q', 'Value', 'Duration', 'Filed'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+
+    out = df.copy()
+    labels = out['Label'].fillna('').astype(str)
+    work = out[
+        labels.str.startswith('Revenue - ')
+        & labels.map(lambda value: value.count(' - ') == 1)
+        & out['Category'].isin({
+            '1_Income_Statement', '4a_Segments_Business'})
+    ].copy()
+    if work.empty:
+        return out
+
+    work['_GBValue'] = pd.to_numeric(work['Value'], errors='coerce')
+    work['_GBFY'] = pd.to_numeric(work['FY'], errors='coerce')
+    work['_GBDuration'] = pd.to_numeric(work['Duration'], errors='coerce')
+    work['_GBFiled'] = pd.to_datetime(work['Filed'], errors='coerce')
+    work['_GBQuarter'] = pd.to_numeric(
+        work['Q'].astype(str).str.extract(r'([1-4])', expand=False),
+        errors='coerce')
+    work = work[
+        work['_GBValue'].notna()
+        & work['_GBFY'].notna()
+        & work['_GBQuarter'].notna()
+    ].copy()
+    if work.empty:
+        return out
+
+    work['_GBFY'] = work['_GBFY'].astype(int)
+    work['_GBQuarter'] = work['_GBQuarter'].astype(int)
+    work['_GBSerial'] = work['_GBFY'] * 4 + work['_GBQuarter']
+    work['_GBSourceRank'] = np.where(
+        work['Category'].eq('4a_Segments_Business'), 0, 1)
+
+    def _values_agree(left, right):
+        scale = max(abs(float(left)), abs(float(right)), 1.0)
+        tolerance = max(2_000_000.0, scale * 0.0015)
+        return abs(float(left) - float(right)) <= tolerance
+
+    def _best_period_row(rows):
+        if rows.empty:
+            return None
+        ordered = rows.sort_values(
+            ['_GBSourceRank', '_GBFiled', '_GBDuration'],
+            ascending=[True, False, True])
+        return ordered.iloc[0]
+
+    proposals = []
+    for fiscal_year in sorted(work['_GBFY'].unique()):
+        year_rows = work[work['_GBFY'].eq(fiscal_year)]
+        donor_q4 = year_rows[
+            year_rows['Category'].eq('4a_Segments_Business')
+            & year_rows['_GBQuarter'].eq(4)
+            & year_rows['_GBDuration'].between(45, 125)
+        ].copy()
+        if donor_q4.empty:
+            continue
+        donor_q4 = donor_q4.sort_values(
+            ['_GBFiled', '_GBDuration'],
+            ascending=[False, True]).drop_duplicates('Label', keep='first')
+
+        target_labels = []
+        for target_label in work.loc[
+                work['Category'].eq('4a_Segments_Business'),
+                'Label'].dropna().unique():
+            current = year_rows[year_rows['Label'].eq(target_label)]
+            existing_q4 = current[
+                current['_GBQuarter'].eq(4)
+                & current['_GBDuration'].between(45, 125)]
+            if not existing_q4.empty:
+                continue
+            later_count = work[
+                work['Category'].eq('4a_Segments_Business')
+                & work['Label'].eq(target_label)
+                & work['_GBSerial'].gt(fiscal_year * 4 + 4)
+            ][['_GBFY', '_GBQuarter']].drop_duplicates().shape[0]
+            if later_count >= 4:
+                target_labels.append(target_label)
+
+        pairs = []
+        for _, donor_q4_row in donor_q4.iterrows():
+            donor_label = donor_q4_row['Label']
+            donor_later_count = work[
+                work['Category'].eq('4a_Segments_Business')
+                & work['Label'].eq(donor_label)
+                & work['_GBSerial'].gt(fiscal_year * 4 + 4)
+            ][['_GBFY', '_GBQuarter']].drop_duplicates().shape[0]
+            if donor_later_count > 1:
+                continue
+
+            donor_values = {}
+            donor_complete = True
+            for quarter in (1, 2, 3):
+                donor_row = _best_period_row(year_rows[
+                    year_rows['Label'].eq(donor_label)
+                    & year_rows['_GBQuarter'].eq(quarter)
+                    & year_rows['_GBDuration'].between(45, 125)])
+                if donor_row is None:
+                    donor_complete = False
+                    break
+                donor_values[quarter] = float(donor_row['_GBValue'])
+            if not donor_complete:
+                continue
+
+            for target_label in target_labels:
+                if target_label == donor_label:
+                    continue
+                target_values = {}
+                target_complete = True
+                for quarter in (1, 2, 3):
+                    target_row = _best_period_row(year_rows[
+                        year_rows['Label'].eq(target_label)
+                        & year_rows['_GBQuarter'].eq(quarter)
+                        & year_rows['_GBDuration'].between(45, 125)])
+                    if target_row is None:
+                        target_complete = False
+                        break
+                    target_values[quarter] = float(target_row['_GBValue'])
+                if (target_complete
+                        and all(_values_agree(
+                            donor_values[quarter], target_values[quarter])
+                            for quarter in (1, 2, 3))):
+                    pairs.append(
+                        (donor_label, target_label, donor_q4_row.copy()))
+
+        donor_counts = {}
+        target_counts = {}
+        for donor_label, target_label, _row in pairs:
+            donor_counts[donor_label] = donor_counts.get(donor_label, 0) + 1
+            target_counts[target_label] = target_counts.get(target_label, 0) + 1
+
+        for donor_label, target_label, donor_q4_row in pairs:
+            if (donor_counts.get(donor_label) == 1
+                    and target_counts.get(target_label) == 1):
+                proposals.append(
+                    (fiscal_year, donor_label, target_label, donor_q4_row))
+
+    if not proposals:
+        return out
+
+    additions = []
+    for fiscal_year, donor_label, target_label, donor_q4_row in proposals:
+        derived = donor_q4_row.copy()
+        derived['Category'] = '4a_Segments_Business'
+        derived['Label'] = target_label
+        derived['SourceKind'] = 'derived_discrete_q4_renamed_member'
+        derived['SourceAdmissionRule'] = 'value_proven_renamed_member_q4'
+        derived['SourceDerivation'] = 'value_proven_renamed_member_q4'
+        derived['SourceDirectness'] = 'calculated'
+        derived['SourceCanonicalizedFrom'] = donor_label
+        additions.append(derived[out.columns])
+        print(
+            f'  [Segment Rename Q4] Materialized {target_label} '
+            f'{fiscal_year}-Q4 from value-proven historical member '
+            f'{donor_label}.')
+
+    return pd.concat(
+        [out, pd.DataFrame(additions)], ignore_index=True, sort=False)
 
 
 def build_pivoted_data(all_facts, ticker, ye_month, company_name=None, is_financial=False, is_insurance=False, is_oil_gas=False, is_reit=False):
@@ -16104,6 +16990,10 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df = _gb_promote_proven_geographic_revenue_history_facts(df)
     df = _consolidate_geographic_alias_facts(df)
     df = _gb_materialize_proven_segment_revenue_q4_facts(df)
+    # Resolve value-proven reportable-member renames while the original facts,
+    # filing dates and Q4 provenance are still available.  Waiting until the
+    # final pivot lets earlier member cleanup consume the historical Q4.
+    df = _gb_materialize_value_proven_renamed_segment_q4_facts(df)
     df = _gb_reconcile_operating_metric_identities(df)
     # Operating-alias reconciliation can create final canonical labels; apply
     # the semantic duplicate gate once more before candidate selection.
@@ -16371,6 +17261,33 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             ['Category', 'Label', 'FY', 'Concept'],
             sort=False, dropna=False)['Value']
     }
+    # Preserve the corresponding annual rows and their filing vintages before
+    # latest-filed dedup removes older accounting revisions.  Q4 subtraction
+    # needs the row metadata—not only the competing values—to keep annual and
+    # YTD operands inside one revision cohort.
+    _annual_rows_by_concept = {}
+    for key, annual_rows in df.loc[_all_ann_mask].groupby(
+            ['Category', 'Label', 'FY', 'Concept'],
+            sort=False, dropna=False):
+        records = []
+        seen = set()
+        for _, annual_row in annual_rows.sort_values(
+                '_Filed_dt', ascending=False).iterrows():
+            identity = (
+                float(annual_row['Value']),
+                str(annual_row.get('Filed') or ''),
+                str(annual_row.get('Accession') or ''),
+                str(annual_row.get('Start') or ''),
+                str(annual_row.get('End') or ''),
+                float(pd.to_numeric(
+                    pd.Series([annual_row.get('Duration')]),
+                    errors='coerce').fillna(-1).iloc[0]),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            records.append(annual_row.copy())
+        _annual_rows_by_concept[key] = records
     # (B) Circularity-aware dedup
     # Step 1: Compute per-quarter-deduplicated quarterly sums.
     #   CRITICAL: Before drop_duplicates, the same quarter may have facts from
@@ -16807,6 +17724,84 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                     return True
             return False
 
+        def _revision_coherent_annual(ytd_value, annual_concept):
+            """Choose the annual fact from the same filing-vintage cohort.
+
+            Latest-filed-wins is unsafe when a later filing retrospectively
+            restates the annual statement but the selected nine-month fact still
+            comes from an earlier accounting-policy revision.
+
+            If an annual fact was already available when the YTD fact was filed,
+            select the latest such annual.  Otherwise this is the normal current-
+            year sequence, so select the earliest compatible annual filed after
+            the YTD fact.  Conflicting values inside the selected filing cohort
+            fail closed.
+            """
+            if ytd_value is None:
+                return None
+            ytd_row = ytd_value[1]
+            preserved_rows = _annual_rows_by_concept.get(
+                (cat, label, fy, annual_concept), [])
+            if preserved_rows:
+                candidates = pd.DataFrame(
+                    [row.copy() for row in preserved_rows])
+                candidates['Dist'] = (
+                    pd.to_numeric(
+                        candidates['Duration'], errors='coerce') - 365
+                ).abs()
+            else:
+                candidates = annual_candidates[
+                    annual_candidates['Concept'].eq(annual_concept)
+                ].copy()
+            if candidates.empty:
+                return None
+            candidates = candidates[
+                candidates.apply(
+                    lambda row: _cumulative_pair_compatible(
+                        ytd_row, row), axis=1)]
+            if candidates.empty:
+                return None
+
+            ytd_filed = pd.to_datetime(
+                ytd_row.get('_Filed_dt'), errors='coerce')
+            candidates['_GBAnnualFiled'] = pd.to_datetime(
+                candidates['_Filed_dt'], errors='coerce')
+
+            if pd.notna(ytd_filed):
+                available = candidates[
+                    candidates['_GBAnnualFiled'].notna()
+                    & candidates['_GBAnnualFiled'].le(ytd_filed)]
+                if not available.empty:
+                    chosen_date = available['_GBAnnualFiled'].max()
+                    candidates = available[
+                        available['_GBAnnualFiled'].eq(chosen_date)].copy()
+                else:
+                    subsequent = candidates[
+                        candidates['_GBAnnualFiled'].notna()
+                        & candidates['_GBAnnualFiled'].gt(ytd_filed)]
+                    if not subsequent.empty:
+                        chosen_date = subsequent['_GBAnnualFiled'].min()
+                        candidates = subsequent[
+                            subsequent['_GBAnnualFiled'].eq(chosen_date)].copy()
+
+            candidate_values = pd.to_numeric(
+                candidates['Value'], errors='coerce').dropna()
+            if candidate_values.empty:
+                return None
+            anchor_value = float(candidate_values.iloc[0])
+            for candidate_value in candidate_values.iloc[1:]:
+                scale = max(
+                    abs(anchor_value), abs(float(candidate_value)), 1.0)
+                if abs(anchor_value - float(candidate_value)) > (
+                        scale * 0.001 + 1.0):
+                    return None
+
+            candidates = candidates.sort_values(
+                ['Dist', '_GBAnnualFiled', 'IsCalculated', 'TagRank'],
+                ascending=[True, False, True, True])
+            selected_row = candidates.iloc[0].copy()
+            return float(selected_row['Value']), selected_row
+
         def _pair_diagnostics(ytd_value, annual_value,
                               ytd_concept, annual_concept,
                               allow_exact_direct_mismatch=False):
@@ -16851,8 +17846,13 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         for concept in sorted(ytd_concepts & annual_concepts):
             ytd_value = get_best_val(
                 'Q3', 273, 40, concept_filter=concept, exact_concept=True)
-            annual_value = get_best_val(
-                'Q4', 365, 50, concept_filter=concept, exact_concept=True)
+            annual_value = (
+                _revision_coherent_annual(ytd_value, concept)
+                if cat == '1_Income_Statement'
+                else get_best_val(
+                    'Q4', 365, 50, concept_filter=concept,
+                    exact_concept=True)
+            )
             if ytd_value is not None and annual_value is not None:
                 diagnostics = _pair_diagnostics(
                     ytd_value, annual_value, concept, concept,
@@ -16873,9 +17873,15 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                     ytd_value = get_best_val(
                         'Q3', 273, 40, concept_filter=ytd_concept,
                         exact_concept=True)
-                    annual_value = get_best_val(
-                        'Q4', 365, 50, concept_filter=annual_concept,
-                        exact_concept=True)
+                    annual_value = (
+                        _revision_coherent_annual(
+                            ytd_value, annual_concept)
+                        if cat == '1_Income_Statement'
+                        else get_best_val(
+                            'Q4', 365, 50,
+                            concept_filter=annual_concept,
+                            exact_concept=True)
+                    )
                     if ytd_value is not None and annual_value is not None:
                         diagnostics = _pair_diagnostics(
                             ytd_value, annual_value,
@@ -20085,6 +21091,181 @@ def _merge_prefix_continuation_members(df: pd.DataFrame) -> pd.DataFrame:
             else:
                 df = df.rename(index={(cat, lbl): (cat, surv_lbl)})
     return df
+
+
+
+def _gb_bridge_value_proven_renamed_segment_q4(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Gap-fill a stranded historical Q4 into a proven renamed segment.
+
+    A discrete Q4 can be materialized under the historical reportable-member
+    name before abandoned face-disaggregation history is spliced into the
+    current member name.  At that point the current row has Q1-Q3 but a blank
+    Q4, while the retired row has the same Q1-Q3 plus the valid Q4.
+
+    Transfer is deliberately narrow:
+      * business-segment revenue rows only;
+      * the same fiscal year's Q1-Q3 must all be present and agree within
+        reported-rounding tolerance;
+      * the donor must have Q4 and the target must be blank;
+      * the target must continue for at least four later quarters;
+      * the donor must not continue into that later era;
+      * donor/target matching must be one-to-one;
+      * the transferred value cannot materially exceed consolidated revenue.
+
+    This is a value-and-time-series proof, not a name dictionary.  It handles
+    genuine member renames without hardcoding issuers or segment captions.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+
+    category = '4a_Segments_Business'
+    revenue_rows = [
+        idx for idx in df.index
+        if idx[0] == category
+        and str(idx[1]).startswith('Revenue - ')
+        and str(idx[1]).count(' - ') == 1
+    ]
+    if len(revenue_rows) < 2:
+        return df
+
+    period_columns = {}
+    for column in df.columns:
+        match = re.fullmatch(r'(\d{4})-Q([1-4])', str(column))
+        if match:
+            period_columns[(int(match.group(1)), int(match.group(2)))] = column
+    if not period_columns:
+        return df
+
+    values = {
+        idx: pd.to_numeric(df.loc[idx], errors='coerce')
+        for idx in revenue_rows
+    }
+    total_revenue = (
+        pd.to_numeric(
+            df.loc[('1_Income_Statement', 'Revenue')], errors='coerce')
+        if ('1_Income_Statement', 'Revenue') in df.index
+        else pd.Series(np.nan, index=df.columns, dtype=float)
+    )
+
+    def _agree(left, right):
+        if pd.isna(left) or pd.isna(right):
+            return False
+        scale = max(abs(float(left)), abs(float(right)), 1.0)
+        tolerance = max(2_000_000.0, scale * 0.0015)
+        return abs(float(left) - float(right)) <= tolerance
+
+    proposals = []
+    for (year, quarter), q4_column in sorted(period_columns.items()):
+        if quarter != 4:
+            continue
+        q_columns = [
+            period_columns.get((year, q)) for q in (1, 2, 3)
+        ]
+        if any(column is None for column in q_columns):
+            continue
+
+        later_columns = [
+            column for (period_year, period_quarter), column
+            in period_columns.items()
+            if period_year * 4 + period_quarter > year * 4 + 4
+        ]
+        if len(later_columns) < 4:
+            continue
+
+        donors = []
+        targets = []
+        for idx in revenue_rows:
+            row = values[idx]
+            if pd.notna(row.get(q4_column)):
+                donors.append(idx)
+            elif sum(pd.notna(row.get(column)) for column in later_columns) >= 4:
+                targets.append(idx)
+
+        candidate_pairs = []
+        for donor in donors:
+            donor_values = values[donor]
+            # A retired label may have a few comparative repetitions, but it
+            # must not remain a continuing current-era series.
+            donor_later_count = sum(
+                pd.notna(donor_values.get(column)) for column in later_columns)
+            if donor_later_count > 1:
+                continue
+
+            donor_q4 = donor_values.get(q4_column)
+            if pd.isna(donor_q4):
+                continue
+
+            # Consolidated revenue can legitimately be on a later retrospective
+            # accounting-policy basis than the historical segment series.  A
+            # current-total ceiling would therefore compare different revision
+            # cohorts.  Use the donor's own three-quarter run rate instead.
+            quarter_values = [
+                float(donor_values.get(column))
+                for column in q_columns
+                if pd.notna(donor_values.get(column))
+            ]
+            if len(quarter_values) != 3:
+                continue
+            reference = float(np.median(np.abs(quarter_values)))
+            if reference <= 0:
+                continue
+            q4_numeric = float(donor_q4)
+            if q4_numeric < -2_000_000.0:
+                continue
+            q4_ratio = abs(q4_numeric) / reference
+            if not 0.15 <= q4_ratio <= 6.0:
+                continue
+
+            for target in targets:
+                if donor == target:
+                    continue
+                target_values = values[target]
+                if all(_agree(donor_values.get(column),
+                              target_values.get(column))
+                       for column in q_columns):
+                    candidate_pairs.append((donor, target, q4_column))
+
+        if not candidate_pairs:
+            continue
+
+        donor_counts = {}
+        target_counts = {}
+        for donor, target, _column in candidate_pairs:
+            donor_counts[donor] = donor_counts.get(donor, 0) + 1
+            target_counts[target] = target_counts.get(target, 0) + 1
+
+        for donor, target, column in candidate_pairs:
+            if donor_counts.get(donor) != 1 or target_counts.get(target) != 1:
+                continue
+            proposals.append((donor, target, column))
+
+    if not proposals:
+        return df
+
+    out = df.copy()
+    changed = []
+    used_targets = set()
+    for donor, target, column in proposals:
+        target_key = (target, column)
+        if target_key in used_targets:
+            continue
+        donor_value = pd.to_numeric(
+            pd.Series([out.at[donor, column]]), errors='coerce').iloc[0]
+        target_value = pd.to_numeric(
+            pd.Series([out.at[target, column]]), errors='coerce').iloc[0]
+        if pd.isna(donor_value) or pd.notna(target_value):
+            continue
+        out.at[target, column] = float(donor_value)
+        used_targets.add(target_key)
+        changed.append(
+            f"{donor[1]} -> {target[1]} {column}")
+
+    if changed:
+        print('  [Segment Rename Q4] Bridged value-proven historical Q4: '
+              + '; '.join(changed))
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
 
 
 def _refresh_balance_sheet_closure(df: pd.DataFrame) -> pd.DataFrame:
@@ -27561,7 +28742,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-20.final-pivot.v39-release-boundary-cleanup"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-20.final-pivot.v51-income-statement-revision-coherent-q4"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -29078,6 +30259,11 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             # disaggregation or a mangled segment continuation. Resolve both
             # after the accounting passes have populated every usable period.
             final_pivot = _stitch_or_drop_abandoned_face_disagg(final_pivot)
+            # Q4 derivation can create a valid cell under a retired member name
+            # immediately before the current-name face history is spliced.  Use
+            # exact Q1-Q3 continuity to bridge only that stranded Q4.
+            final_pivot = _gb_bridge_value_proven_renamed_segment_q4(
+                final_pivot)
             final_pivot = _merge_prefix_continuation_members(final_pivot)
 
             final_pivot = _repair_q4_from_annual_ytd(final_pivot)
