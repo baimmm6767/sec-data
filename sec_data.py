@@ -3455,9 +3455,9 @@ CONCEPT_MAP = {
     'Cash Reconciliation: Total': {'tags': ['CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents'], 'cat': '3_Cash_Flow'},
     
     # Remaining Performance Obligations
-    'RPO - Totals': {'tags': ['RevenueRemainingPerformanceObligation'], 'cat': '6_Disclosures'},
-    'RPO - Next 12 Months': {'tags': ['RevenueRemainingPerformanceObligationExpectedTimingOfSatisfactionPeriod1'], 'cat': '6_Disclosures'},
-    'RPO - Next 12 Months (%)': {'tags': ['RevenueRemainingPerformanceObligationPercentage'], 'cat': '6_Disclosures'},
+    'RPO - Totals': {'tags': ['RevenueRemainingPerformanceObligation'], 'cat': '4e_Operating_Metrics'},
+    'RPO - Next 12 Months': {'tags': ['RevenueRemainingPerformanceObligationExpectedTimingOfSatisfactionPeriod1'], 'cat': '4e_Operating_Metrics'},
+    'RPO - Next 12 Months (%)': {'tags': ['RevenueRemainingPerformanceObligationPercentage'], 'cat': '4e_Operating_Metrics'},
 
     # Accounts-receivable allowance rollforwards.  These concepts are three
     # different measures, not interchangeable tags for one generic receivable
@@ -34137,7 +34137,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-21.final-pivot.v68-source-locked-q4-bs-geography"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-21.final-pivot.v69-post-route-geography-source-lock"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -35931,6 +35931,14 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         final_pivot = _gb_drop_fully_empty_output_rows(final_pivot)
         final_pivot = _gb_route_proven_geographic_metric_families(
             final_pivot)
+        # Authoritative geography source lock must run AFTER final category
+        # routing.  Before this point a proven geographic row can still live
+        # under 4a_Segments_Business, while the source-lock intentionally
+        # operates only on the final 4b/4c geography categories.  Running it
+        # here also covers warm final-pivot-cache reads, because this boundary
+        # is always executed before CSV/XLSX publication.
+        final_pivot = _gb_restore_audit_backed_geographic_revenue(
+            final_pivot, _fact_audit)
         final_pivot = _gb_relocate_revenue_hedging_residual(
             final_pivot, _fact_audit)
         final_pivot = _gb_repair_annual_neutral_top_level_segment_revenue(
