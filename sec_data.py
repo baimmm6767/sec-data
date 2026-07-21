@@ -24128,12 +24128,16 @@ def _refresh_granular_footing_checks(df: pd.DataFrame) -> pd.DataFrame:
 
     # Balance sheet closure.
     assets, liab, eq = row('2_Balance_Sheet', 'Total Assets'), row('2_Balance_Sheet', 'Total Liabilities'), row('2_Balance_Sheet', 'Total Equity')
+    temp_eq = _balance_sheet_temporary_equity_series(df).fillna(0)
     bs_have = assets.notna() & liab.notna() & eq.notna()
     bs_economically_valid = (assets > 0) & (liab >= 0)
+    bs_residual = pd.concat([
+        (assets - liab - eq).abs(),
+        (assets - liab - eq - temp_eq).abs(),
+    ], axis=1).min(axis=1)
     bs_pass = (
         bs_economically_valid
-        & ((assets - liab - eq).abs()
-           <= (assets.abs() * 0.005).clip(lower=50e6))
+        & (bs_residual <= (assets.abs() * 0.005).clip(lower=50e6))
     )
     bs_flag = flag(bs_have, bs_pass)
 
@@ -25947,6 +25951,334 @@ def _gb_repair_annual_neutral_top_level_segment_revenue(
     return out
 
 
+
+def _balance_sheet_temporary_equity_series(df: pd.DataFrame) -> pd.Series:
+    """Return source-presented temporary/mezzanine equity by period.
+
+    Temporary equity sits between liabilities and permanent equity.  It must
+    participate in the balance-sheet identity, but it must never be folded into
+    Total Liabilities or permanent Total Equity merely to force closure.
+
+    Captions are grouped into two economically distinct families:
+    redeemable NCI and parent/preferred temporary equity.  Alternative measures
+    inside one family are not additive; carrying amount is preferred over fair
+    value and lower-priority captions only gap-fill missing periods.
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    cols = df.columns
+    BS = '2_Balance_Sheet'
+    families = defaultdict(list)
+    for cat, label in df.index:
+        if cat != BS:
+            continue
+        ll = re.sub(r'\s+', ' ', str(label or '')).strip().lower()
+        if not ll or 'nonredeemable' in ll:
+            continue
+        if ll.startswith('redeemable noncontrolling interest'):
+            family = 'redeemable_nci'
+        elif (
+            ll.startswith('temporary equity')
+            or ll.startswith('redeemable convertible preferred')
+            or ('temporary equity' in ll and 'carrying amount' in ll)
+        ):
+            family = 'temporary_parent_or_preferred'
+        else:
+            continue
+        values = pd.to_numeric(df.loc[(cat, label)], errors='coerce')
+        if not values.notna().any():
+            continue
+        # Balance-sheet carrying amount is the preferred measurement.  Fair
+        # value is an alternative disclosure and must not be added to it.
+        priority = (
+            0 if 'carrying amount' in ll
+            else 1 if 'balance' in ll
+            else 2 if 'fair value' in ll
+            else 3
+        )
+        families[family].append((priority, -int(values.notna().sum()), ll, values))
+    if not families:
+        return pd.Series(np.nan, index=cols, dtype=float)
+    family_series = []
+    for candidates in families.values():
+        candidates.sort(key=lambda item: item[:3])
+        combined = pd.Series(np.nan, index=cols, dtype=float)
+        for _priority, _coverage, _label, values in candidates:
+            combined = combined.combine_first(values)
+        family_series.append(combined)
+    present = pd.concat(family_series, axis=1).notna().any(axis=1)
+    total = sum((row.fillna(0) for row in family_series),
+                start=pd.Series(0.0, index=cols))
+    return total.where(present)
+
+
+def _gb_restore_source_backed_balance_sheet_totals(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None) -> pd.DataFrame:
+    """Restore a filed liabilities total absorbed by mezzanine equity.
+
+    The old identity repair could replace Liabilities with Assets - Equity.
+    When temporary equity is separately presented, that arithmetic absorbs the
+    mezzanine balance into liabilities.  Restore only when the selected audit
+    fact is the concrete ``Liabilities`` concept, the direct total plus
+    temporary equity closes tightly, and the overwritten delta is itself
+    explained by temporary equity.  This is a source-lock, not a general
+    preference for audit values over accounting repairs.
+    """
+    if (df is None or df.empty or not isinstance(fact_audit, pd.DataFrame)
+            or fact_audit.empty):
+        return df
+    required = {'Category', 'Label', 'Period', 'Value', 'Concept'}
+    if not required.issubset(fact_audit.columns):
+        return df
+    BS, INT = '2_Balance_Sheet', '8_Integrity_Checks'
+    needed = [(BS, 'Total Assets'), (BS, 'Total Liabilities'),
+              (BS, 'Total Equity')]
+    if any(idx not in df.index for idx in needed):
+        return df
+    audit = fact_audit[
+        fact_audit['Category'].eq(BS)
+        & fact_audit['Label'].eq('Total Liabilities')
+        & fact_audit['Concept'].astype(str).eq('Liabilities')
+        & fact_audit['Period'].isin(df.columns)
+    ].copy()
+    if audit.empty:
+        return df
+    if 'DimCount' in audit.columns:
+        audit = audit[pd.to_numeric(audit['DimCount'], errors='coerce').fillna(0).eq(0)]
+    if audit.empty:
+        return df
+    if 'Filed' in audit.columns:
+        audit['_FiledSort'] = pd.to_datetime(audit['Filed'], errors='coerce')
+        audit = audit.sort_values('_FiledSort', ascending=False)
+    audit = audit.drop_duplicates('Period', keep='first')
+    source_liabilities = pd.to_numeric(
+        audit.set_index('Period')['Value'], errors='coerce')
+    assets = pd.to_numeric(df.loc[(BS, 'Total Assets')], errors='coerce')
+    liabilities = pd.to_numeric(df.loc[(BS, 'Total Liabilities')], errors='coerce')
+    equity = pd.to_numeric(df.loc[(BS, 'Total Equity')], errors='coerce')
+    temporary = _balance_sheet_temporary_equity_series(df).fillna(0)
+    out = df.copy()
+    restored = []
+    for period, direct_l in source_liabilities.items():
+        if period not in out.columns or pd.isna(direct_l):
+            continue
+        a, current_l, e, temp = (
+            assets.get(period), liabilities.get(period), equity.get(period),
+            temporary.get(period, 0.0))
+        if any(pd.isna(x) for x in (a, current_l, e)) or abs(temp) <= 1e6:
+            continue
+        tight_tol = max(abs(float(a)) * 0.002, 5e6)
+        direct_resid = abs(float(a) - float(direct_l) - float(e) - float(temp))
+        current_resid = abs(float(a) - float(current_l) - float(e) - float(temp))
+        delta = float(current_l) - float(direct_l)
+        explained_tol = max(abs(float(temp)) * 0.02, 2e6)
+        delta_explained = abs(delta - float(temp)) <= explained_tol
+        if (direct_resid <= tight_tol and delta_explained
+                and current_resid > direct_resid + explained_tol):
+            out.at[(BS, 'Total Liabilities'), period] = float(direct_l)
+            marker = (INT, 'Metric: Total Liabilities Reconstructed')
+            if marker in out.index:
+                out.at[marker, period] = np.nan
+            restored.append((period, float(current_l), float(direct_l), float(temp)))
+    for period, old, new, temp in restored:
+        print(
+            f"  [BS Source Lock] {period}: restored filed Total Liabilities "
+            f"{old/1e9:.3f}B -> {new/1e9:.3f}B; "
+            f"{temp/1e9:.3f}B temporary equity remains separate."
+        )
+    out.attrs.update(df.attrs)
+    return out
+
+
+
+def _gb_restore_double_decumulated_core_q4(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None) -> pd.DataFrame:
+    """Restore a core Q4 value that was quarterized a second time.
+
+    A later KPI heuristic historically subtracted Q1+Q2+Q3 from an already
+    discrete Q4.  Restore only the exact signature ``source - final = Q1+Q2+Q3``
+    and only when the selected source is itself a discrete-duration or
+    explicitly derived discrete Q4 fact.  Large but genuine Q4 values are
+    otherwise untouched.
+    """
+    if (df is None or df.empty or not isinstance(fact_audit, pd.DataFrame)
+            or fact_audit.empty):
+        return df
+    required = {'Category', 'Label', 'Period', 'Value'}
+    if not required.issubset(fact_audit.columns):
+        return df
+    labels = {
+        'Total Operating Expenses', 'Pretax Income',
+        'Gross Profit', 'Operating Income',
+    }
+    audit = fact_audit[
+        fact_audit['Category'].eq('1_Income_Statement')
+        & fact_audit['Label'].isin(labels)
+        & fact_audit['Period'].astype(str).str.endswith('-Q4')
+        & fact_audit['Period'].isin(df.columns)
+    ].copy()
+    if audit.empty:
+        return df
+    if 'Filed' in audit.columns:
+        audit['_FiledSort'] = pd.to_datetime(audit['Filed'], errors='coerce')
+        audit = audit.sort_values('_FiledSort', ascending=False)
+    audit = audit.drop_duplicates(['Label', 'Period'], keep='first')
+    out = df.copy()
+    restored = []
+    for row in audit.itertuples(index=False):
+        label, period = str(row.Label), str(row.Period)
+        idx = ('1_Income_Statement', label)
+        if idx not in out.index:
+            continue
+        source = pd.to_numeric(pd.Series([row.Value]), errors='coerce').iloc[0]
+        current = pd.to_numeric(
+            pd.Series([out.at[idx, period]]), errors='coerce').iloc[0]
+        if pd.isna(source) or pd.isna(current) or np.isclose(
+                source, current, rtol=1e-9, atol=0.02):
+            continue
+        fy = period[:4]
+        quarters = []
+        for q in ('Q1', 'Q2', 'Q3'):
+            col = f'{fy}-{q}'
+            if col not in out.columns:
+                quarters = []
+                break
+            value = pd.to_numeric(
+                pd.Series([out.at[idx, col]]), errors='coerce').iloc[0]
+            if pd.isna(value):
+                quarters = []
+                break
+            quarters.append(float(value))
+        if len(quarters) != 3:
+            continue
+        qsum = sum(quarters)
+        if qsum <= 0 or float(source) <= 0:
+            continue
+        derivation = str(getattr(row, 'SourceDerivation', '') or '').lower()
+        duration = pd.to_numeric(
+            pd.Series([getattr(row, 'Duration', np.nan)]),
+            errors='coerce').iloc[0]
+        discrete_evidence = (
+            (pd.notna(duration) and 45 <= float(duration) <= 125)
+            or 'annual_minus' in derivation
+            or 'quarterization' in derivation
+            or 'derived_discrete' in str(
+                getattr(row, 'SourcePeriodRole', '') or '').lower()
+        )
+        if not discrete_evidence:
+            continue
+        tolerance = max(abs(float(source)) * 1e-9, 1.0)
+        if abs((float(source) - float(current)) - qsum) <= tolerance:
+            out.at[idx, period] = float(source)
+            restored.append((period, label, float(current), float(source)))
+    for period, label, old, new in restored:
+        print(
+            f"  [Q4 Source Lock] {period}: restored '{label}' "
+            f"{old/1e9:.3f}B -> {new/1e9:.3f}B after detecting a second "
+            "Q1-Q3 subtraction."
+        )
+    out.attrs.update(df.attrs)
+    return out
+
+
+def _gb_restore_audit_backed_geographic_revenue(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None) -> pd.DataFrame:
+    """Restore direct geographic XBRL facts when the complete family closes.
+
+    HTML rescue may inspect only one presentation category and can therefore
+    choose a mixed current/comparative numeric column.  A direct dimensional
+    XBRL family spanning region and country categories is authoritative when
+    at least three members share the period and the complete family ties to
+    consolidated revenue.  The function only restores existing rows and only
+    when the audit-backed family improves the footing materially.
+    """
+    if (df is None or df.empty or not isinstance(fact_audit, pd.DataFrame)
+            or fact_audit.empty):
+        return df
+    required = {'Category', 'Label', 'Period', 'Value'}
+    if not required.issubset(fact_audit.columns):
+        return df
+    rev_idx = ('1_Income_Statement', 'Revenue')
+    if rev_idx not in df.index:
+        return df
+    geo_cats = {'4b_Segments_Geographic_Regions',
+                '4c_Segments_Geographic_Countries'}
+    audit = fact_audit[
+        fact_audit['Category'].isin(geo_cats)
+        & fact_audit['Label'].astype(str).str.startswith('Revenue - ')
+        & fact_audit['Period'].isin(df.columns)
+    ].copy()
+    if audit.empty:
+        return df
+    if 'SourceKind' in audit.columns:
+        audit = audit[audit['SourceKind'].astype(str).str.lower().eq('xbrl')]
+    if 'SourceAdmissionRule' in audit.columns:
+        audit = audit[
+            audit['SourceAdmissionRule'].astype(str).eq(
+                'recognized_geographic_axis')]
+    if 'DimCount' in audit.columns:
+        audit = audit[pd.to_numeric(audit['DimCount'], errors='coerce').fillna(0).gt(0)]
+    if 'Duration' in audit.columns:
+        duration = pd.to_numeric(audit['Duration'], errors='coerce')
+        audit = audit[duration.between(45, 125, inclusive='both')]
+    if audit.empty:
+        return df
+    if 'Filed' in audit.columns:
+        audit['_FiledSort'] = pd.to_datetime(audit['Filed'], errors='coerce')
+        audit = audit.sort_values('_FiledSort', ascending=False)
+    audit = audit.drop_duplicates(
+        ['Category', 'Label', 'Period'], keep='first')
+    out = df.copy()
+    consolidated = pd.to_numeric(out.loc[rev_idx], errors='coerce')
+    repaired = []
+    for period, group in audit.groupby('Period', sort=False):
+        total = consolidated.get(period)
+        if pd.isna(total) or float(total) == 0 or len(group) < 3:
+            continue
+        members = []
+        direct_values = []
+        current_values = []
+        complete = True
+        for row in group.itertuples(index=False):
+            idx = (str(row.Category), str(row.Label))
+            value = pd.to_numeric(pd.Series([row.Value]), errors='coerce').iloc[0]
+            if idx not in out.index or pd.isna(value):
+                complete = False
+                break
+            current = pd.to_numeric(
+                pd.Series([out.at[idx, period]]), errors='coerce').iloc[0]
+            if pd.isna(current):
+                complete = False
+                break
+            members.append(idx)
+            direct_values.append(float(value))
+            current_values.append(float(current))
+        if not complete or len(members) < 3:
+            continue
+        direct_sum = sum(direct_values)
+        current_sum = sum(current_values)
+        tight_tol = max(abs(float(total)) * 0.005, 5e6)
+        direct_resid = abs(float(total) - direct_sum)
+        current_resid = abs(float(total) - current_sum)
+        changed = [i for i, (a, b) in enumerate(
+            zip(direct_values, current_values))
+                   if not np.isclose(a, b, rtol=1e-9, atol=0.02)]
+        if (changed and direct_resid <= tight_tol
+                and direct_resid + max(1e6, tight_tol * 0.10) < current_resid):
+            for i in changed:
+                out.at[members[i], period] = direct_values[i]
+                repaired.append((period, members[i][1], current_values[i],
+                                 direct_values[i]))
+    for period, label, old, new in repaired:
+        print(
+            f"  [Geography Source Lock] {period}: restored '{label}' "
+            f"{old/1e9:.3f}B -> {new/1e9:.3f}B from the complete direct "
+            "geographic XBRL family."
+        )
+    out.attrs.update(df.attrs)
+    return out
+
+
 def _refresh_balance_sheet_closure(df: pd.DataFrame) -> pd.DataFrame:
     """Recompute 'Metric: Balance Sheet Closure Verified' on the final pivot.
 
@@ -25982,14 +26314,14 @@ def _refresh_balance_sheet_closure(df: pd.DataFrame) -> pd.DataFrame:
     # reconciles under EITHER reading; taking the better residual can only rescue
     # a period, never turn an already-closing one into a failure (verified:
     # rescues PLTR 2019-Q4, zero regressions incl. TSLA/O redeemable-NCI periods).
-    _temp_mask = (df.index.get_level_values(0) == BS) & df.index.get_level_values(1).str.contains(
-        r'^Temporary Equity|Redeemable Noncontrolling Interest|^Redeemable Convertible Preferred',
-        case=False, regex=True, na=False)
-    if _temp_mask.any():
-        _tempsum = df[_temp_mask].apply(pd.to_numeric, errors='coerce').fillna(0).sum(axis=0)
-        resid = pd.concat([(ta - ident).abs(), (ta - ident - _tempsum).abs()], axis=1).min(axis=1)
-    else:
-        resid = (ta - ident).abs()
+    _tempsum = _balance_sheet_temporary_equity_series(df).fillna(0)
+    _ordinary_resid = (ta - ident).abs()
+    _temporary_resid = (ta - ident - _tempsum).abs()
+    # Some taxonomies expose a redeemable caption even when the selected total
+    # already incorporates it.  Use the better supported structure per period;
+    # this preserves those issuers while still requiring separate mezzanine
+    # equity where it demonstrably closes the statement.
+    resid = pd.concat([_ordinary_resid, _temporary_resid], axis=1).min(axis=1)
     tol = (ta.abs() * 0.02).clip(lower=50e6)
     existing = pd.to_numeric(df.loc[idx_clo], errors='coerce')
     refreshed = 0
@@ -26054,6 +26386,7 @@ def _repair_balance_sheet_identity(df: pd.DataFrame) -> pd.DataFrame:
         return (pd.to_numeric(df.loc[idx], errors='coerce')
                 if idx in df.index else pd.Series(np.nan, index=df.columns))
     ta, tl, te = _num('Total Assets'), _num('Total Liabilities'), _num('Total Equity')
+    temp_eq = _balance_sheet_temporary_equity_series(df).fillna(0)
     eq_rows = [l for l in EQ_COMP if (BS, l) in df.index]
     core_present = (BS, 'Common Stock') in df.index or (BS, 'Additional Paid-In Capital') in df.index
     has_re = ((BS, 'Retained Earnings') in df.index
@@ -26068,24 +26401,35 @@ def _repair_balance_sheet_identity(df: pd.DataFrame) -> pd.DataFrame:
         if pd.isna(a) or pd.isna(l) or pd.isna(e):
             continue
         tol = max(abs(a) * 0.02, 50e6)
-        resid = a - (l + e)
+        reported_temp = float(temp_eq.get(c, 0.0) or 0.0)
+        resid_without_temp = a - (l + e)
+        resid_with_temp = a - (l + e + reported_temp)
+        if abs(resid_with_temp) < abs(resid_without_temp):
+            temp = reported_temp
+            resid = resid_with_temp
+        else:
+            temp = 0.0
+            resid = resid_without_temp
         if abs(resid) <= tol:
             continue
         ec = eq_comp.get(c) if eq_rows else np.nan
         npres = int(n_eq.get(c, 0)) if eq_rows else 0
         # (2) equity total on the wrong basis: components close it, captured total does not
         if (pd.notna(ec) and core_present and has_re and npres >= 2
-                and abs(a - l - ec) <= tol and abs(e - ec) > tol and abs(a - l - ec) < abs(resid)):
+                and abs(a - l - temp - ec) <= tol and abs(e - ec) > tol
+                and abs(a - l - temp - ec) < abs(resid)):
             df.at[(BS, 'Total Equity'), c] = ec
             fixed_te[c] = (e, ec)
             continue
         # (1) liabilities under-captured: modest positive gap the equity side cannot explain
         if resid > tol and resid < abs(a) * 0.15 and e > 0 and (not eq_rows or ec <= e + tol):
-            df.at[(BS, 'Total Liabilities'), c] = a - e
-            fixed_tl[c] = (l, a - e)
+            recovered = a - e - temp
+            df.at[(BS, 'Total Liabilities'), c] = recovered
+            fixed_tl[c] = (l, recovered)
     for c, (old, new) in sorted(fixed_tl.items()):
         print(f"  [BS Identity] {c}: Total Liabilities {old/1e9:.2f}B -> {new/1e9:.2f}B "
-              f"(recovered from Assets - Equity; a liability line is uncaptured)")
+              f"(recovered from Assets - Equity - temporary equity; "
+              f"a liability line is uncaptured)")
     if fixed_tl:
         df.loc[(INT, 'Metric: Total Liabilities Reconstructed'), list(fixed_tl)] = 1.0
     for c, (old, new) in sorted(fixed_te.items()):
@@ -28229,33 +28573,9 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
             add_val('8_Integrity_Checks', 'Metric: Segment Sum Verified (Revenue)', coverage[coverage.notna()])
 
     # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    # Q4 DE-CUMULATION FIX
-    # If Q4 was derived as an annual total but now has quarterly
-    # neighbors (derived in calculate_kpis), detect and fix it.
-    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    latest_vals = {}
-    for r in kpi_rows:
-        latest_vals[(r['Category'], r['Label'], r['Period'])] = r['Value']
-
-    for label in ['Total Operating Expenses', 'Pretax Income', 'Gross Profit', 'Operating Income']:
-        idx_base = ('1_Income_Statement', label)
-        fy_list = set(col.split('-')[0] for col in pivoted.columns if '-' in str(col))
-        for fy in fy_list:
-            q1, q2, q3, q4 = f"{fy}-Q1", f"{fy}-Q2", f"{fy}-Q3", f"{fy}-Q4"
-
-            def get_v(p):
-                if (idx_base[0], label, p) in latest_vals:
-                    return latest_vals[(idx_base[0], label, p)]
-                if idx_base in pivoted.index and p in pivoted.columns:
-                    return pivoted.loc[idx_base, p]
-                return np.nan
-
-            v1, v2, v3, v4 = get_v(q1), get_v(q2), get_v(q3), get_v(q4)
-            if pd.notna(v4) and pd.notna(v1) and pd.notna(v2) and pd.notna(v3):
-                q_sum = v1 + v2 + v3
-                if v4 > 1.5 * q_sum and v4 > 0 and q_sum > 0:
-                    discrete_q4 = v4 - q_sum
-                    add_val('1_Income_Statement', label, {q4: discrete_q4})
+    # Core statement period interpretation is finalized before KPI creation.
+    # Do not infer annual-vs-quarterly basis from magnitude here: a genuinely
+    # large discrete Q4 can exceed Q1-Q3 and must remain unchanged.
 
     return pd.DataFrame(kpi_rows)
 
@@ -29083,18 +29403,12 @@ def _mergeable_names(lbl1, lbl2):
 
 
 def _reconcile_equity_with_nci(df: pd.DataFrame) -> pd.DataFrame:
-    """Fold noncontrolling interest into Total Equity when it closes the balance.
+    """Fold only nonredeemable NCI into a parent-only Total Equity.
 
-    Some consolidators (e.g. Interactive Brokers, Palantir) report "Total Equity"
-    as the parent-only figure (us-gaap:StockholdersEquity) and present
-    noncontrolling interest as a separate balance-sheet line. The accounting
-    identity Assets = Liabilities + Total Equity then fails by exactly the NCI
-    amount. When a balance-sheet NCI row exists and adding it to Total Equity
-    demonstrably closes the balance across the majority of periods, fold NCI in so
-    "Total Equity" means total equity including NCI (the standard definition).
-
-    Guarded to fire ONLY when it provably closes the balance, so companies that
-    already report an NCI-inclusive total (gap ~ 0) or have no NCI are untouched.
+    Redeemable NCI and other temporary equity are excluded categorically and
+    participate separately in A = L + temporary equity + permanent equity.
+    Among eligible nonredeemable NCI rows, choose the candidate that repeatedly
+    closes the residual; never use the first label containing ``NCI``.
     """
     BS = '2_Balance_Sheet'
     idx = df.index
@@ -29106,49 +29420,59 @@ def _reconcile_equity_with_nci(df: pd.DataFrame) -> pd.DataFrame:
     equity = _row('Total Equity')
     if assets is None or liab is None or equity is None:
         return df
-    # Locate the balance-sheet NCI row by label (auto-learned; label varies).
-    nci_key = None
+    temporary = _balance_sheet_temporary_equity_series(df).fillna(0)
+    candidates = []
     for cat, label in idx:
         if cat != BS:
             continue
-        ll = label.lower()
-        if ('noncontrolling' in ll or 'minority interest' in ll) and 'attributable to' not in ll.split('noncontrolling')[0]:
-            # exclude IS-style "net income attributable to ..." that may share words; BS only here
-            nci_key = (cat, label)
-            break
-    if nci_key is None:
-        # fallback: any BS row mentioning noncontrolling/minority
-        for cat, label in idx:
-            if cat == BS and ('noncontrolling' in label.lower() or 'minority interest' in label.lower()):
-                nci_key = (cat, label); break
-    if nci_key is None:
+        ll = re.sub(r'\s+', ' ', str(label or '')).strip().lower()
+        if not ('noncontrolling' in ll or 'minority interest' in ll):
+            continue
+        if ('redeemable noncontrolling' in ll and 'nonredeemable' not in ll):
+            continue
+        if 'temporary equity' in ll:
+            continue
+        if 'net income' in ll or 'attributable to parent' in ll:
+            continue
+        values = pd.to_numeric(df.loc[(cat, label)], errors='coerce')
+        if values.notna().any():
+            candidates.append(((cat, label), values))
+    if not candidates:
         return df
-    nci = pd.to_numeric(df.loc[nci_key], errors='coerce')
 
-    gap = assets - liab - equity
-    both = assets.notna() & liab.notna() & equity.notna() & nci.notna()
-    if both.sum() == 0:
+    ordinary_gap = assets - liab - equity
+    temporary_gap = ordinary_gap - temporary
+    use_temporary = temporary_gap.abs() < ordinary_gap.abs()
+    base_gap = ordinary_gap.where(~use_temporary, temporary_gap)
+    base_mask = assets.notna() & liab.notna() & equity.notna()
+    best = None
+    for key, nci in candidates:
+        both = base_mask & nci.notna()
+        material = both & (base_gap.abs() > assets.abs().clip(lower=1) * 0.001)
+        if not material.any():
+            continue
+        closes = ((base_gap - nci).abs()
+                  <= (assets.abs().clip(lower=1) * 0.002))
+        rate = float((closes & material).sum()) / float(material.sum())
+        improvement = float(base_gap[material].abs().sum()) - float(
+            (base_gap - nci)[material].abs().sum())
+        score = (rate, improvement)
+        if best is None or score > best[0]:
+            best = (score, key, nci, material, closes)
+    if best is None or best[0][0] < 0.60 or best[0][1] <= 0:
         return df
-    # Materiality: gap is non-trivial relative to assets.
-    material = (gap.abs() > assets.abs().clip(lower=1) * 0.001) & both
-    if material.sum() == 0:
-        return df
-    # Does adding NCI close the gap? (residual after adding NCI is ~0)
-    closes = (gap - nci).abs() <= (assets.abs().clip(lower=1) * 0.002)
-    # Only proceed if NCI explains the gap for the majority of material periods.
-    m = material & nci.notna()
-    if m.sum() == 0 or (closes & m).sum() < (m.sum() * 0.6):
-        return df
-    # Fold NCI into Total Equity ONLY for periods where the gap is material and
-    # adding NCI closes the balance. Periods that already report an NCI-inclusive
-    # total (gap ~ 0) are left untouched.
+    _score, nci_key, nci, material, closes = best
     add_mask = material & nci.notna() & closes
     if add_mask.any():
-        cur = df.loc[('2_Balance_Sheet', 'Total Equity')].copy()
+        df = df.copy()
+        cur = df.loc[(BS, 'Total Equity')].copy()
         cur.loc[add_mask] = (equity[add_mask] + nci[add_mask])
-        df.loc[('2_Balance_Sheet', 'Total Equity')] = cur.values
+        df.loc[(BS, 'Total Equity')] = cur.values
+        print(
+            f"  [Equity NCI] Folded '{nci_key[1]}' into Total Equity for "
+            f"{int(add_mask.sum())} period(s); temporary equity remained separate."
+        )
     return df
-
 
 def _surface_income_statement_dda(df: pd.DataFrame, is_oil_gas: bool = False, is_reit: bool = False) -> pd.DataFrame:
     """Surface depreciation & (for oil & gas) depletion & amortization on the income
@@ -33813,7 +34137,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-21.final-pivot.v67-audit-backed-segment-publication"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-21.final-pivot.v68-source-locked-q4-bs-geography"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -35478,6 +35802,8 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
 
             final_pivot = _repair_q4_from_annual_ytd(final_pivot)
             final_pivot = _repair_balance_sheet_identity(final_pivot)
+            final_pivot = _gb_restore_source_backed_balance_sheet_totals(
+                final_pivot, _fact_audit)
             final_pivot = _refresh_balance_sheet_closure(final_pivot)
 
             # Final, authoritative segment-partition repair. MUST run last: it
@@ -35486,6 +35812,10 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             # geographic) via the pure accounting identity, with no later pass
             # able to overwrite it before the CSV is written.
             final_pivot = _reconcile_segment_partition_from_total(final_pivot)
+            final_pivot = _gb_restore_double_decumulated_core_q4(
+                final_pivot, _fact_audit)
+            final_pivot = _gb_restore_audit_backed_geographic_revenue(
+                final_pivot, _fact_audit)
             final_pivot = _apply_quality_result_fixes(final_pivot)
             final_pivot = _gb_apply_final_segment_publication_gates(final_pivot)
 
