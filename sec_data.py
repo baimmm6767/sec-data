@@ -24070,18 +24070,29 @@ def _refresh_granular_footing_checks(df: pd.DataFrame) -> pd.DataFrame:
         'parent_discontinued': ni - (base_cont - nci + discontinued),
         'consolidated_discontinued': ni - (base_cont + discontinued),
     }, index=cols)
-    _ni_best_residual = _ni_baseline_residuals.bfill(axis=1).iloc[:, 0]
+    # Some output periods legitimately have no pretax/tax/net-income footing
+    # candidates, leaving all four residual choices as NA.  pandas 3.14 raises
+    # ValueError when ``idxmin(axis=1)`` sees an all-NA row, whereas older
+    # releases returned an NA-like result.  Restrict argmin selection to rows
+    # with at least one numeric candidate and leave all-NA periods unresolved.
+    # ``ni_have`` is false for those periods, so they correctly remain outside
+    # the equity-method admission test instead of crashing the whole run.
+    _ni_best_residual = pd.Series(np.nan, index=cols, dtype=float)
     if not _ni_baseline_residuals.empty:
-        _ni_best_column = _ni_baseline_residuals.abs().idxmin(axis=1)
-        _ni_best_residual = pd.Series(
-            [
-                _ni_baseline_residuals.at[column, choice]
-                if pd.notna(choice) else np.nan
-                for column, choice in _ni_best_column.items()
-            ],
-            index=cols,
-            dtype=float,
-        )
+        _ni_abs_residuals = _ni_baseline_residuals.abs()
+        _ni_has_candidate = _ni_abs_residuals.notna().any(axis=1)
+        if bool(_ni_has_candidate.any()):
+            _ni_best_column = _ni_abs_residuals.loc[
+                _ni_has_candidate
+            ].idxmin(axis=1)
+            _ni_best_residual.loc[_ni_has_candidate] = pd.Series(
+                [
+                    _ni_baseline_residuals.at[column, choice]
+                    for column, choice in _ni_best_column.items()
+                ],
+                index=_ni_best_column.index,
+                dtype=float,
+            )
     _eq_scale = equity_method.abs().clip(lower=1.0)
     _eq_tolerance = (_eq_scale * 0.01).clip(lower=1e6)
     _eq_signature = (
