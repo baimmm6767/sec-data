@@ -34955,7 +34955,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-22.final-pivot.v71-rpo-source-ledger"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-22.final-pivot.v72-rpo-ledger-pinned"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -35711,6 +35711,13 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
     if not all_facts:
         return None
 
+    # Keep the pre-filter RPO ledger outside DataFrame.attrs throughout the
+    # publication pipeline.  Pandas operations are not required to preserve
+    # attrs, and company-specific repair paths can therefore lose the ledger.
+    # Rebuilding once from the immutable raw facts makes cold and warm-cache
+    # behavior identical and avoids repeatedly copying a large attrs DataFrame.
+    _rpo_source_ledger = _gb_build_rpo_source_ledger(pd.DataFrame(all_facts))
+
     final_cache_key = _final_pivot_cache_key(
         ticker, company, "US_NATIVE_ANNUAL_FINAL", limit, ye_month, use_arelle, filings,
         company_name=company_name, is_financial=is_financial, is_insurance=is_insurance,
@@ -35738,7 +35745,10 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
 
         progress.set(90.0, "Annual FY statements built")
         annual_period_dates = dict(final_pivot.attrs.get('period_dates') or {})
-        _rpo_source_ledger = final_pivot.attrs.get('rpo_source_ledger')
+        # ``build_annual_pivoted_data`` also captures this ledger, but the local
+        # raw-fact copy is authoritative and remains available even if an
+        # intermediate DataFrame operation drops attrs.
+        final_pivot.attrs.pop('rpo_source_ledger', None)
         annual_period_dates.update({k: v for k, v in period_dates.items() if k in final_pivot.columns})
         if annual_period_dates:
             header_row = pd.DataFrame(
@@ -35747,8 +35757,10 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
                                                 names=['Category', 'Label'])
             )
             final_pivot = pd.concat([header_row, final_pivot])
-            if _rpo_source_ledger is not None:
+            if isinstance(_rpo_source_ledger, pd.DataFrame):
                 final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
+        if isinstance(_rpo_source_ledger, pd.DataFrame):
+            final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
         _final_pivot_cache_set(
             final_cache_key, final_pivot,
             metadata={
@@ -35760,16 +35772,21 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
             },
         )
 
-    _rpo_source_ledger = final_pivot.attrs.get('rpo_source_ledger')
+    # Cached pivots from older builds may lack the attribute; the local ledger
+    # above is rebuilt from raw facts and is therefore independent of cache
+    # contents.  Detach any cached copy while publication transforms run.
+    final_pivot.attrs.pop('rpo_source_ledger', None)
     final_pivot = _apply_quality_result_fixes(final_pivot)
-    if _rpo_source_ledger is not None:
-        final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
     final_pivot = _gb_apply_final_segment_publication_gates(final_pivot)
     final_pivot = _normalize_output_margin_rows(final_pivot)
     final_pivot = _hide_stale_operating_measure_rows(final_pivot)
     final_pivot = _gb_normalize_rpo_operating_metrics(
         final_pivot, final_pivot.attrs.get('fact_audit'),
         rpo_source_ledger=_rpo_source_ledger)
+    # The checkpoint cache already owns the provenance ledger.  Detach it from
+    # the publication frame after normalization so later pandas concat/sort
+    # operations never compare nested DataFrames inside attrs.
+    final_pivot.attrs.pop('rpo_source_ledger', None)
     final_pivot = _gb_drop_accounting_caption_operating_metrics(final_pivot)
     final_pivot = _gb_drop_fully_empty_output_rows(final_pivot)
     final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native annual pre-write sort")
@@ -36248,6 +36265,12 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
 
     # -- Final processing & output --------------------------------------------
     if all_facts:
+        # Pin RPO provenance outside DataFrame.attrs.  The raw fact list is the
+        # immutable source of truth and is available on both cold and warm
+        # final-pivot-cache paths.  Relying on attrs survival caused Google and
+        # other issuers to fall back to the lossy selected-fact audit.
+        _rpo_source_ledger = _gb_build_rpo_source_ledger(pd.DataFrame(all_facts))
+
         final_cache_key = _final_pivot_cache_key(
             ticker, company, f"{profile.pipeline}_FINAL", limit, ye_month,
             use_arelle, list(filings),
@@ -36265,6 +36288,10 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 final_pivot.attrs.get('source_periods', ()))
             _eligible_operating_output_periods = set(
                 final_pivot.attrs.get('eligible_operating_source_periods', ()))
+            # Keep the raw-fact ledger in the local variable above; an older
+            # cache may not contain it, and a cached attrs copy would otherwise
+            # be repeatedly propagated by subsequent DataFrame operations.
+            final_pivot.attrs.pop('rpo_source_ledger', None)
             progress.set(97.0, "Loaded final pivot cache")
             print(f"  [Cache] Loaded native final pivot cache for {ticker.upper()} "
                   f"({len(final_pivot)} rows).")
@@ -36288,6 +36315,10 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 final_pivot.attrs.get('source_periods', ()))
             _eligible_operating_output_periods = set(
                 final_pivot.attrs.get('eligible_operating_source_periods', ()))
+            # The builder's attrs copy is equivalent to the raw-fact ledger
+            # already pinned above.  Detach it before the long publication
+            # sequence so pandas cannot lose or repeatedly deep-copy it.
+            final_pivot.attrs.pop('rpo_source_ledger', None)
             progress.set(82.0, "Quarterly statements built")
             progress.start_pulse(88.0, "Organizing output rows", expected_seconds=20.0)
 
@@ -36719,6 +36750,11 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             final_pivot.attrs[_ADDITIVE_CAPEX_TOTALS_ATTR] = dict(
                 _fact_audit.attrs.get(
                     _ADDITIVE_CAPEX_TOTALS_ATTR, {}))
+            # Cache the dedicated raw RPO ledger explicitly.  Its persistence
+            # must not depend on which company-specific DataFrame operations
+            # happened to preserve attrs.
+            if isinstance(_rpo_source_ledger, pd.DataFrame):
+                final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
 
             progress.stop_pulse()
             progress.set(97.0, "Final repairs complete")
@@ -36745,10 +36781,11 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
                 if pd.isna(_existing_date) or not str(_existing_date).strip():
                     final_pivot.at[_period_header_key, _period] = _display_date
 
-        _rpo_source_ledger = final_pivot.attrs.get('rpo_source_ledger')
+        # Use the raw-fact ledger pinned before the cache branch.  Do not read
+        # it back from attrs: older caches and company-specific transforms may
+        # legitimately have no such attribute.
+        final_pivot.attrs.pop('rpo_source_ledger', None)
         final_pivot = _apply_quality_result_fixes(final_pivot)
-        if _rpo_source_ledger is not None:
-            final_pivot.attrs['rpo_source_ledger'] = _rpo_source_ledger
         final_pivot = _gb_apply_final_segment_publication_gates(final_pivot)
         final_pivot = _gb_apply_audit_backed_segment_publication_repairs(
             final_pivot, _fact_audit)
@@ -36759,6 +36796,9 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         final_pivot = _gb_normalize_rpo_operating_metrics(
             final_pivot, _fact_audit,
             rpo_source_ledger=_rpo_source_ledger)
+        # The final-pivot cache already stores the raw ledger.  The public
+        # dataframe only needs its normalized rows, not a nested DataFrame attr.
+        final_pivot.attrs.pop('rpo_source_ledger', None)
         # Absolute output boundary: later quality/integrity/concentration stages
         # can create rows after the segment publication gate.  Remove only rows
         # with no numeric period value, preserving explicit zeros and headers.
