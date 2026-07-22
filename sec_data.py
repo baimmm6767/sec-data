@@ -20717,8 +20717,56 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     # Preserve them internally for direct quarters as well as cumulative facts:
     # an exact-concept H1-Q1 calculation may otherwise lose the Q1 candidate
     # simply because a later filing supplied a same-label zero under another tag.
-    _non_operating_facts = _non_operating_source.drop_duplicates(
-        subset=['Label', 'End', 'Duration', 'Concept'], keep='first')
+    # Direct-quarter candidates retain the historical identity.  Cumulative
+    # candidates additionally preserve their dimensional/source aspect because
+    # an annual fact can be filed twice under the same concept/value with
+    # different axis signatures.  Q4 subtraction must retain the variant that
+    # matches the YTD fact instead of allowing the one-dimensional display
+    # preference to erase the compatible two-axis source (Alphabet Cloud FY22).
+    _non_operating_duration = pd.to_numeric(
+        _non_operating_source.get(
+            'Duration', pd.Series(np.nan, index=_non_operating_source.index)),
+        errors='coerce')
+    _non_operating_cumulative_mask = _non_operating_duration.ge(150)
+    _non_operating_direct = _non_operating_source.loc[
+        ~_non_operating_cumulative_mask].drop_duplicates(
+            subset=['Label', 'End', 'Duration', 'Concept'], keep='first')
+    _cumulative_identity = [key for key in (
+        'Label', 'Start', 'End', 'Duration', 'Concept',
+        'SourceAxisSignature', 'SourceDimensionAxes',
+        'SourceMemberSignature', 'SourceDimensionMembers',
+        'SourceUnitSignature', 'SourcePeriodBasis',
+        'SourceSemanticType', 'SourceTableRole', 'SourceAnalyticalBasis',
+    ) if key in _non_operating_source.columns]
+    _non_operating_cumulative = _non_operating_source.loc[
+        _non_operating_cumulative_mask].drop_duplicates(
+            subset=_cumulative_identity, keep='first')
+    # Preserve alternate aspects only when they repeat the same reported value.
+    # Materially different values under the same display identity are filing
+    # revisions or different scopes and retain the historical latest-winner
+    # behavior; they are not broadened into the subtraction candidate pool.
+    _cumulative_base_identity = [key for key in (
+        'Label', 'End', 'Duration', 'Concept')
+        if key in _non_operating_cumulative.columns]
+    if (_cumulative_base_identity
+            and not _non_operating_cumulative.empty):
+        _cumulative_winner_value = _non_operating_cumulative.groupby(
+            _cumulative_base_identity, sort=False, dropna=False
+        )['Value'].transform('first')
+        _cumulative_numeric = pd.to_numeric(
+            _non_operating_cumulative['Value'], errors='coerce')
+        _cumulative_winner_numeric = pd.to_numeric(
+            _cumulative_winner_value, errors='coerce')
+        _cumulative_scale = pd.concat([
+            _cumulative_numeric.abs(), _cumulative_winner_numeric.abs(),
+        ], axis=1).max(axis=1).clip(lower=1.0)
+        _same_cumulative_value = (
+            (_cumulative_numeric - _cumulative_winner_numeric).abs()
+            <= (_cumulative_scale * 0.001 + 1.0))
+        _non_operating_cumulative = _non_operating_cumulative.loc[
+            _same_cumulative_value]
+    _non_operating_facts = pd.concat(
+        [_non_operating_direct, _non_operating_cumulative], axis=0)
     _operating_facts = df.loc[_operating_mask].drop_duplicates(
         subset=_dedup_aspects, keep='first')
     df = pd.concat([_non_operating_facts, _operating_facts], axis=0)
@@ -21163,8 +21211,13 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 nonzero_matches += 1
         return nonzero_matches >= 2
 
-    def _best_cumulative_pair():
-        """Choose a YTD9/annual pair with exact or value-proven scope."""
+    def _best_cumulative_pair(exhaustive_aspects=False):
+        """Choose a YTD9/annual pair with exact or value-proven scope.
+
+        Alternate dimensional candidates are evaluated only when the discrete
+        Q4 cell is missing.  A directly filed Q4 already proves the quarter and
+        must retain v97's established display-family selection for Q1-Q3.
+        """
         ytd_candidates = _duration_candidates('Q3', 273, 40)
         annual_candidates = _duration_candidates('Q4', 365, 50)
         if ytd_candidates.empty or annual_candidates.empty:
@@ -21236,43 +21289,160 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 reconciliation_tier = 1
             return reconciliation_tier, coverage
 
-        for concept in sorted(ytd_concepts & annual_concepts):
-            ytd_value = get_best_val(
-                'Q3', 273, 40, concept_filter=concept, exact_concept=True)
-            annual_value = get_best_val(
-                'Q4', 365, 50, concept_filter=concept, exact_concept=True)
-            if ytd_value is not None and annual_value is not None:
-                diagnostics = _pair_diagnostics(
-                    ytd_value, annual_value, concept, concept,
-                    allow_exact_direct_mismatch=True)
-                if diagnostics is not None:
-                    pairs.append((
-                        ytd_value, annual_value, concept, concept, False,
-                        diagnostics[0], diagnostics[1]))
+        def _exact_concept_values(candidates, concept):
+            """Return every ranked candidate for one concrete concept.
 
-        # If no exact concept spans both periods, accept an alias only after a
-        # same-period, same-duration, non-zero overlap proves 100% equivalence.
-        if not pairs:
+            ``get_best_val`` intentionally returns one display winner.  That is
+            insufficient for cumulative arithmetic because a lower-ranked
+            dimensional duplicate may be the only annual row whose aspects
+            match the YTD source.  Candidate order is already deterministic.
+            """
+            values = []
+            if candidates.empty:
+                return values
+            exact = candidates[candidates['Concept'].eq(concept)]
+            for _, candidate_row in exact.iterrows():
+                values.append((float(candidate_row['Value']),
+                               candidate_row.copy()))
+            return values
+
+        def _same_reported_value(left, right):
+            if left is None or right is None:
+                return False
+            left_value = float(left[0])
+            right_value = float(right[0])
+            scale = max(abs(left_value), abs(right_value), 1.0)
+            return abs(left_value - right_value) <= scale * 0.001 + 1.0
+
+        def _same_source_filing(left, right):
+            """Limit aspect substitution to duplicate facts in one filing.
+
+            A later comparative filing may restate the same numeric annual
+            value under a different dimensional presentation.  Treating that
+            as an interchangeable serialization can silently create historical
+            quarters for unrelated issuers.  The Alphabet failure is narrower:
+            the *same accession* emitted the same annual value both with and
+            without the consolidation axis.  Only that same-filing duplicate
+            is safe to substitute for cumulative aspect pairing.
+            """
+            if left is None or right is None:
+                return False
+            left_row, right_row = left[1], right[1]
+            for field in ('Accession', 'SourceAccession', 'AccessionNumber'):
+                left_accession = str(left_row.get(field) or '').strip()
+                right_accession = str(right_row.get(field) or '').strip()
+                if left_accession or right_accession:
+                    return bool(left_accession and right_accession
+                                and left_accession == right_accession)
+            # Without a stable accession, do not infer that two same-date
+            # records came from one filing.  Failing closed is safer than
+            # broadening a cumulative arithmetic family.
+            return False
+
+        def _append_exact_pairs(use_all_aspects):
+            for concept in sorted(ytd_concepts & annual_concepts):
+                legacy_ytd = get_best_val(
+                    'Q3', 273, 40,
+                    concept_filter=concept, exact_concept=True)
+                legacy_annual = get_best_val(
+                    'Q4', 365, 50,
+                    concept_filter=concept, exact_concept=True)
+                if use_all_aspects:
+                    # The alternate-aspect fallback is deliberately narrower
+                    # than a general candidate rescan.  It may only substitute
+                    # another dimensional rendering of the *same reported YTD
+                    # and annual values* selected by v97.  This repairs cases
+                    # such as Alphabet FY22 Cloud, where an identical annual
+                    # fact is filed under one- and two-axis signatures and only
+                    # the latter matches the YTD fact.  It must not discover a
+                    # different annual/YTD scope and synthesize previously
+                    # absent quarters for unrelated issuers.
+                    if legacy_ytd is None or legacy_annual is None:
+                        continue
+                    ytd_values = [
+                        value for value in _exact_concept_values(
+                            ytd_candidates, concept)
+                        if (_same_reported_value(value, legacy_ytd)
+                            and _same_source_filing(value, legacy_ytd))
+                    ]
+                    annual_values = [
+                        value for value in _exact_concept_values(
+                            annual_candidates, concept)
+                        if (_same_reported_value(value, legacy_annual)
+                            and _same_source_filing(value, legacy_annual))
+                    ]
+                else:
+                    ytd_values = (
+                        [legacy_ytd] if legacy_ytd is not None else [])
+                    annual_values = (
+                        [legacy_annual] if legacy_annual is not None else [])
+                for ytd_value in ytd_values:
+                    for annual_value in annual_values:
+                        diagnostics = _pair_diagnostics(
+                            ytd_value, annual_value, concept, concept,
+                            allow_exact_direct_mismatch=True)
+                        if diagnostics is not None:
+                            pairs.append((
+                                ytd_value, annual_value,
+                                concept, concept, False,
+                                diagnostics[0], diagnostics[1]))
+
+        def _append_alias_pairs(use_all_aspects):
             for ytd_concept in sorted(ytd_concepts):
                 for annual_concept in sorted(annual_concepts):
                     if not _concepts_have_value_proven_equivalence(
                             ytd_concept, annual_concept):
                         continue
-                    ytd_value = get_best_val(
-                        'Q3', 273, 40, concept_filter=ytd_concept,
+                    legacy_ytd = get_best_val(
+                        'Q3', 273, 40,
+                        concept_filter=ytd_concept,
                         exact_concept=True)
-                    annual_value = get_best_val(
-                        'Q4', 365, 50, concept_filter=annual_concept,
+                    legacy_annual = get_best_val(
+                        'Q4', 365, 50,
+                        concept_filter=annual_concept,
                         exact_concept=True)
-                    if ytd_value is not None and annual_value is not None:
-                        diagnostics = _pair_diagnostics(
-                            ytd_value, annual_value,
-                            ytd_concept, annual_concept)
-                        if diagnostics is not None:
-                            pairs.append((
+                    if use_all_aspects:
+                        if legacy_ytd is None or legacy_annual is None:
+                            continue
+                        ytd_values = [
+                            value for value in _exact_concept_values(
+                                ytd_candidates, ytd_concept)
+                            if (_same_reported_value(value, legacy_ytd)
+                                and _same_source_filing(value, legacy_ytd))
+                        ]
+                        annual_values = [
+                            value for value in _exact_concept_values(
+                                annual_candidates, annual_concept)
+                            if (_same_reported_value(value, legacy_annual)
+                                and _same_source_filing(value, legacy_annual))
+                        ]
+                    else:
+                        ytd_values = (
+                            [legacy_ytd] if legacy_ytd is not None else [])
+                        annual_values = (
+                            [legacy_annual] if legacy_annual is not None else [])
+                    for ytd_value in ytd_values:
+                        for annual_value in annual_values:
+                            diagnostics = _pair_diagnostics(
                                 ytd_value, annual_value,
-                                ytd_concept, annual_concept, True,
-                                diagnostics[0], diagnostics[1]))
+                                ytd_concept, annual_concept)
+                            if diagnostics is not None:
+                                pairs.append((
+                                    ytd_value, annual_value,
+                                    ytd_concept, annual_concept, True,
+                                    diagnostics[0], diagnostics[1]))
+
+        # Preserve the exact v97 candidate path whenever it already yields a
+        # defensible pair.  Alternate aspect signatures are a fallback only;
+        # they must repair a missing derivation, never replace an established
+        # quarterly family merely because another filed presentation exists.
+        _append_exact_pairs(use_all_aspects=False)
+        if not pairs:
+            _append_alias_pairs(use_all_aspects=False)
+        if not pairs and exhaustive_aspects:
+            _append_exact_pairs(use_all_aspects=True)
+        if not pairs and exhaustive_aspects:
+            _append_alias_pairs(use_all_aspects=True)
 
         if not pairs:
             return None, None, None, None, False
@@ -21556,7 +21726,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 and not is_operating_nonadditive):
             (matching_ytd9, matching_ytd12, _subtraction_concept,
              _subtraction_annual_concept,
-             _subtraction_alias_verified) = _best_cumulative_pair()
+             _subtraction_alias_verified) = _best_cumulative_pair(
+                 exhaustive_aspects=(q_src.get('Q4') is None))
             # Arithmetic across two different XBRL concepts is not evidence.
             # Preserve any directly filed Q4, but fail closed on derivation.
             ytd9 = matching_ytd9
@@ -35993,7 +36164,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-22.final-pivot.v74-cross-tab-basis-lock"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-22.final-pivot.v75-cumulative-aspect-pairing"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
