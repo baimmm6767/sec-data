@@ -2284,9 +2284,10 @@ def _get_filing_html_rescue_rows_cached(filing):
 def _get_textblock_html_tables_cached(value):
     """Parse TextBlock HTML tables once per exact TextBlock string.
 
-    The cache key is the SHA-256 of the exact TextBlock text.  Returned
-    DataFrames are copies so callers can keep using the same drop/filter code
-    without ever mutating the cached table objects.
+    The cache key is the SHA-256 of the exact TextBlock text.  Cached frames
+    are treated as read-only: the sole caller performs non-inplace cleanup and
+    then only reads the resulting frame, so copying every cached table here is
+    unnecessary.
     """
     val_text = str(value)
     key = hashlib.sha256(val_text.encode('utf-8', 'surrogatepass')).hexdigest()
@@ -2294,7 +2295,7 @@ def _get_textblock_html_tables_cached(value):
         cached = _TEXTBLOCK_HTML_TABLES_CACHE.get(key)
     if cached is not None:
         _profile_count("textblock_html_table_cache_hits")
-        return tuple(t.copy(deep=True) for t in cached)
+        return cached
 
     persistent_key = _textblock_persistent_cache_key(value)
     persistent = _persistent_html_cache_get("textblock_tables", persistent_key)
@@ -2302,7 +2303,7 @@ def _get_textblock_html_tables_cached(value):
         tables = tuple(persistent)
         with _FETCH_CACHE_LOCK:
             stored = _TEXTBLOCK_HTML_TABLES_CACHE.setdefault(key, tables)
-        return tuple(t.copy(deep=True) for t in stored)
+        return stored
 
     _profile_count("textblock_html_table_cache_misses")
     with _ProfileTimer("textblock_html_parse"):
@@ -2314,7 +2315,7 @@ def _get_textblock_html_tables_cached(value):
     _persistent_html_cache_set("textblock_tables", persistent_key, tables)
     with _FETCH_CACHE_LOCK:
         stored = _TEXTBLOCK_HTML_TABLES_CACHE.setdefault(key, tables)
-    return tuple(t.copy(deep=True) for t in stored)
+    return stored
 
 
 
@@ -3155,11 +3156,12 @@ def _extract_l2_segments_from_html_impl(facts_df, expected_segments):
 
     for raw_val in blocks_to_search['value'].to_numpy(copy=False):
         val = str(raw_val)
-        if '<table' not in val.lower():
+        val_lower = val.lower()
+        if '<table' not in val_lower:
             continue
 
         # Quick pre-screen: need â‰¥ 2 expected segment names in this block
-        matches_pre = sum(1 for s in expected_lower if s in val.lower())
+        matches_pre = sum(1 for s in expected_lower if s in val_lower)
         if matches_pre < min(2, len(expected_segments)):
             continue
 
@@ -4626,11 +4628,21 @@ def _build_statement_order(cat: str) -> dict[str, float]:
 def _statement_order_for_label(cat: str, label: str, order_maps: dict[str, dict[str, float]]) -> float:
     base = str(label).split(' - ')[0]
     if cat in ('2_Balance_Sheet', '3_Cash_Flow'):
-        order = order_maps.setdefault(cat, _build_statement_order(cat))
+        # ``dict.setdefault`` evaluates its default even when the key already
+        # exists.  Avoid rebuilding the full statement map for every label.
+        order = order_maps.get(cat)
+        if order is None:
+            order = _build_statement_order(cat)
+            order_maps[cat] = order
         if base not in order:
             order[base] = _layered_statement_order_pos(cat, base, len(order))
         return order[base]
-    order = order_maps.setdefault(cat, {name: float(i) for i, name in enumerate(CONCEPT_MAP.keys())})
+    order = order_maps.get(cat)
+    if order is None:
+        order = {
+            name: float(i) for i, name in enumerate(CONCEPT_MAP.keys())
+        }
+        order_maps[cat] = order
     return order.get(base, 999.0)
 
 
@@ -12298,6 +12310,21 @@ def _gb_promote_proven_geographic_revenue_history_facts(
             'member_key': _normalize_label_key(
                 _gb_clean_member_footnote(member_base)),
         })
+
+    # A target record is fully determined by (category, label), but there is
+    # one record above for every matching fact.  The target-series dictionary
+    # below already collapses those keys after evaluating its value expression;
+    # retain the first record here so each identical series is built only once.
+    unique_targets = []
+    seen_target_keys = set()
+    for target in targets:
+        target_key = (target['category'], target['label'])
+        if target_key in seen_target_keys:
+            continue
+        seen_target_keys.add(target_key)
+        unique_targets.append(target)
+    targets = unique_targets
+
     if not targets:
         return out
 
@@ -16922,19 +16949,32 @@ def _gb_reportable_segment_revenue_labels(df: pd.DataFrame, labels=None):
     """Backward-compatible label view of the cross-category reportable basis."""
     return [idx[1] for idx in _gb_reportable_segment_revenue_indices(df, labels)]
 
+
+def _gb_numeric_row_presence(df: pd.DataFrame) -> np.ndarray:
+    """Return a positional mask for rows containing any numeric value.
+
+    Numeric coercion is unchanged, but flattening once avoids constructing an
+    attr-propagating Series for every individual output row.
+    """
+    values = df.to_numpy(dtype=object, copy=False)
+    if values.size == 0:
+        return np.zeros(len(df), dtype=bool)
+    numeric = pd.to_numeric(
+        pd.Series(values.ravel()), errors='coerce'
+    ).notna().to_numpy().reshape(values.shape)
+    return numeric.any(axis=1)
+
+
 def _gb_drop_fully_empty_segment_rows(df: pd.DataFrame) -> pd.DataFrame:
     """Remove abandoned segment/disclosure labels with no published value."""
     if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
         return df
     segment_like = set(SEG_CATS) | {OPERATING_METRICS_CATEGORY, '6_Disclosures'}
-    drop = []
-    for idx in df.index:
-        if idx[0] not in segment_like:
-            continue
-        values = pd.to_numeric(df.loc[idx], errors='coerce')
-        if values.notna().any():
-            continue
-        drop.append(idx)
+    has_numeric = _gb_numeric_row_presence(df)
+    drop = [
+        idx for idx, present in zip(df.index, has_numeric)
+        if idx[0] in segment_like and not present
+    ]
     if not drop:
         return df
     out = df.drop(index=drop).copy()
@@ -17648,12 +17688,11 @@ def _gb_drop_fully_empty_output_rows(df: pd.DataFrame) -> pd.DataFrame:
     """Remove final rows with no numeric period value, except the period header."""
     if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
         return df
-    drop = []
-    for idx in df.index:
-        if idx[0] == '0_Period_Header':
-            continue
-        if not pd.to_numeric(df.loc[idx], errors='coerce').notna().any():
-            drop.append(idx)
+    has_numeric = _gb_numeric_row_presence(df)
+    drop = [
+        idx for idx, present in zip(df.index, has_numeric)
+        if idx[0] != '0_Period_Header' and not present
+    ]
     if not drop:
         return df
     out = df.drop(index=drop).copy()
@@ -20870,7 +20909,24 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     _duration_filter_cache = {}
     _concept_resolve_cache = {}
     _best_val_cache = {}
+    _date_parse_cache = {}
+    _DATE_PARSE_CACHE_MISS = object()
     group = None
+
+    def _parse_plain_date_cached(value):
+        """Parse each repeated plain-string date once per pivot build.
+
+        Filing Start/End values recur across many candidate probes.  Restrict
+        caching to exact built-in strings so custom scalars and every non-string
+        value retain the original ``pd.to_datetime`` call and semantics.
+        """
+        if type(value) is not str:
+            return pd.to_datetime(value, errors='coerce')
+        cached = _date_parse_cache.get(value, _DATE_PARSE_CACHE_MISS)
+        if cached is _DATE_PARSE_CACHE_MISS:
+            cached = pd.to_datetime(value, errors='coerce')
+            _date_parse_cache[value] = cached
+        return cached
 
     def _resolve_concept_cached(_concept):
         if _concept in _concept_resolve_cache:
@@ -20982,7 +21038,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         _selection_sort.extend(['_Filed_dt', 'IsCalculated', 'TagRank'])
         _selection_ascending.extend([False, True, True])
         m = m.sort_values(_selection_sort, ascending=_selection_ascending)
-        result = (float(m.iloc[0]['Value']), m.iloc[0].copy())
+        selected = m.iloc[0].copy()
+        result = (float(selected['Value']), selected)
         _best_val_cache[_cache_key] = result
         return result[0], result[1].copy()
 
@@ -21015,8 +21072,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     def _cumulative_pair_compatible(ytd_row, annual_row):
         if not _cumulative_aspects_compatible(ytd_row, annual_row):
             return False
-        ytd_start = pd.to_datetime(ytd_row.get('Start'), errors='coerce')
-        annual_start = pd.to_datetime(annual_row.get('Start'), errors='coerce')
+        ytd_start = _parse_plain_date_cached(ytd_row.get('Start'))
+        annual_start = _parse_plain_date_cached(annual_row.get('Start'))
         return not (
             pd.notna(ytd_start) and pd.notna(annual_start)
             and ytd_start.normalize() != annual_start.normalize()
@@ -21219,11 +21276,11 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     def _source_date(row, field):
         if row is None:
             return pd.NaT
-        return pd.to_datetime(row.get(field), errors='coerce')
+        return _parse_plain_date_cached(row.get(field))
 
     def _valid_discrete_bounds(start, end):
-        start = pd.to_datetime(start, errors='coerce')
-        end = pd.to_datetime(end, errors='coerce')
+        start = _parse_plain_date_cached(start)
+        end = _parse_plain_date_cached(end)
         if pd.isna(start) or pd.isna(end) or end < start:
             return None
         duration = int((end - start).days)
@@ -21305,8 +21362,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         row['SourcePeriodRole'] = 'derived_discrete'
         valid_bounds = False
         if start is not None and end is not None:
-            start_dt = pd.to_datetime(start, errors='coerce')
-            end_dt = pd.to_datetime(end, errors='coerce')
+            start_dt = _parse_plain_date_cached(start)
+            end_dt = _parse_plain_date_cached(end)
             if pd.notna(start_dt) and pd.notna(end_dt) and end_dt >= start_dt:
                 row['Start'] = start_dt.strftime('%Y-%m-%d')
                 row['End'] = end_dt.strftime('%Y-%m-%d')
@@ -33498,9 +33555,14 @@ def _sort_value_signature(final_pivot):
     if final_pivot is None:
         return None
     records = []
-    for idx, row in final_pivot.iterrows():
+    # ``iterrows`` constructs a Series per row and propagates DataFrame attrs;
+    # the latter can deep-copy the multi-megabyte fact-audit frame.  A direct
+    # object-array view supplies the same scalar payload without Series/attrs
+    # construction.  This function is read-only.
+    values = final_pivot.to_numpy(dtype=object, copy=False)
+    for idx, row_values in zip(final_pivot.index, values):
         norm = []
-        for value in row.tolist():
+        for value in row_values:
             try:
                 if pd.isna(value):
                     norm.append(('NA', None))
