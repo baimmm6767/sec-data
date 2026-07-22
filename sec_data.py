@@ -26540,6 +26540,584 @@ def _refresh_balance_sheet_closure(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
+# ---------------------------------------------------------------------------
+# v96 bounded accounting / segment publication guards
+# ---------------------------------------------------------------------------
+_V96_DEBT_STOCK_LABELS = (
+    'Short-term Debt', 'Short-term Borrowings',
+    'Current Portion of Long-term Debt', 'Long-term Debt', 'Senior Notes',
+    'Convertible Debt', 'Other Long-term Borrowings',
+)
+
+_V96_NONSEGMENT_MEMBER_RE = re.compile(
+    r'(?i)(?:^|\b)(?:expenses?|margin|balance at beginning of period|'
+    r'balance at end of period|quarter[- ]over[- ]quarter change|'
+    r'year[- ]over[- ]year change|customer program accruals?|'
+    r'excess inventory purchase obligations?|operating leases?|'
+    r'taxes payable|unsettled share repurchases?|accrued payroll|'
+    r'utilization|additions|product warranty|warranty|'
+    r'segment reporting information|deferred)(?:$|\b)')
+
+
+def _gb_normalize_balance_sheet_debt_stock_signs(df: pd.DataFrame) -> pd.DataFrame:
+    """Display debt carrying amounts as positive balance-sheet liabilities.
+
+    Calculation-linkbase weights can invert a directly reported debt balance.
+    Only the small curated family of debt-stock rows is affected; repayment,
+    discount, issuance-cost and fair-value-adjustment rows are not candidates.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    changed = []
+    for label in _V96_DEBT_STOCK_LABELS:
+        idx = ('2_Balance_Sheet', label)
+        if idx not in out.index:
+            continue
+        values = pd.to_numeric(out.loc[idx], errors='coerce')
+        mask = values < -1_000_000.0
+        if not mask.any():
+            continue
+        out.loc[idx, mask.index[mask]] = values[mask].abs().values
+        changed.append(f"{label} ({int(mask.sum())} period(s))")
+    if changed:
+        print('  [Debt Sign] Normalized debt carrying amount(s): ' + ', '.join(changed))
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+
+def _gb_balance_sheet_best_residual(assets, liabilities, equity, temporary):
+    ordinary = abs(float(assets) - float(liabilities) - float(equity))
+    mezzanine = abs(float(assets) - float(liabilities) - float(equity) - float(temporary))
+    return min(ordinary, mezzanine)
+
+
+def _gb_restore_or_reconstruct_liabilities_v96(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None) -> pd.DataFrame:
+    """Restore a direct liabilities total or repair a repeated debt-driven gap.
+
+    Priority is always a direct, undimensioned ``Liabilities`` fact that closes
+    the balance sheet.  The identity fallback is reserved for a repeated, very
+    large under-capture where independently displayed debt stocks explain a
+    material portion of the missing balance.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    BS, INT = '2_Balance_Sheet', '8_Integrity_Checks'
+    required_idx = [(BS, 'Total Assets'), (BS, 'Total Liabilities'), (BS, 'Total Equity')]
+    if any(idx not in df.index for idx in required_idx):
+        return df
+    out = _gb_normalize_balance_sheet_debt_stock_signs(df)
+    assets = pd.to_numeric(out.loc[(BS, 'Total Assets')], errors='coerce')
+    liabilities = pd.to_numeric(out.loc[(BS, 'Total Liabilities')], errors='coerce')
+    equity = pd.to_numeric(out.loc[(BS, 'Total Equity')], errors='coerce')
+    temporary = _balance_sheet_temporary_equity_series(out).fillna(0)
+    restored = set()
+
+    if isinstance(fact_audit, pd.DataFrame) and not fact_audit.empty:
+        needed = {'Category', 'Label', 'Period', 'Value', 'Concept'}
+        if needed.issubset(fact_audit.columns):
+            audit = fact_audit[
+                fact_audit['Category'].eq(BS)
+                & fact_audit['Label'].eq('Total Liabilities')
+                & fact_audit['Concept'].astype(str).eq('Liabilities')
+                & fact_audit['Period'].isin(out.columns)
+            ].copy()
+            if 'DimCount' in audit.columns:
+                audit = audit[pd.to_numeric(audit['DimCount'], errors='coerce').fillna(0).eq(0)]
+            if 'SourceDerivation' in audit.columns:
+                audit = audit[audit['SourceDerivation'].fillna('').astype(str).str.strip().eq('')]
+            if 'SourceKind' in audit.columns:
+                source_kind = audit['SourceKind'].fillna('').astype(str).str.casefold()
+                audit = audit[~source_kind.str.startswith('derived')]
+            if 'Filed' in audit.columns:
+                audit['_FiledSort'] = pd.to_datetime(audit['Filed'], errors='coerce')
+                audit = audit.sort_values('_FiledSort', ascending=False)
+            audit = audit.drop_duplicates('Period', keep='first')
+            for row in audit.itertuples():
+                period = str(row.Period)
+                direct = pd.to_numeric(pd.Series([row.Value]), errors='coerce').iloc[0]
+                if period not in out.columns or pd.isna(direct):
+                    continue
+                a, l, e, t = assets.get(period), liabilities.get(period), equity.get(period), temporary.get(period, 0.0)
+                if any(pd.isna(x) for x in (a, l, e)) or float(direct) < 0:
+                    continue
+                tol = max(abs(float(a)) * 0.005, 50_000_000.0)
+                direct_resid = _gb_balance_sheet_best_residual(a, direct, e, t)
+                current_resid = _gb_balance_sheet_best_residual(a, l, e, t)
+                if direct_resid <= tol and current_resid > direct_resid + tol:
+                    out.at[(BS, 'Total Liabilities'), period] = float(direct)
+                    liabilities[period] = float(direct)
+                    restored.add(period)
+                    marker = (INT, 'Metric: Total Liabilities Reconstructed')
+                    if marker in out.index:
+                        out.at[marker, period] = np.nan
+                    print(f"  [BS Source Lock v96] {period}: restored direct Total Liabilities "
+                          f"{float(l)/1e9:.3f}B -> {float(direct)/1e9:.3f}B")
+
+    # Repeated large-gap fallback.  This is deliberately unavailable for an
+    # isolated period and requires debt carrying amounts to explain at least
+    # one third of the missing liability balance.
+    candidates = []
+    for period in out.columns:
+        if period in restored:
+            continue
+        a, l, e, t = assets.get(period), liabilities.get(period), equity.get(period), temporary.get(period, 0.0)
+        if any(pd.isna(x) for x in (a, l, e)) or float(a) <= 0 or float(l) < 0:
+            continue
+        recovered = float(a) - float(e) - float(t)
+        gap = recovered - float(l)
+        if gap <= max(abs(float(a)) * 0.15, 100_000_000.0):
+            continue
+        debt_values = []
+        for label in _V96_DEBT_STOCK_LABELS:
+            idx = (BS, label)
+            if idx in out.index:
+                value = pd.to_numeric(pd.Series([out.at[idx, period]]), errors='coerce').iloc[0]
+                if pd.notna(value) and float(value) > 0:
+                    debt_values.append(float(value))
+        debt_evidence = max(debt_values, default=0.0)
+        # Strong corroboration means the omitted debt stock approximately
+        # explains the liability gap, not merely that some debt row exists.
+        if debt_evidence <= 0 or not (0.75 * gap <= debt_evidence <= 1.25 * gap):
+            continue
+        candidates.append((period, recovered, gap, debt_evidence))
+    complete_periods = int((assets.notna() & liabilities.notna() & equity.notna()).sum())
+    large_gap_periods = []
+    for period in out.columns:
+        a, l, e, t = assets.get(period), liabilities.get(period), equity.get(period), temporary.get(period, 0.0)
+        if any(pd.isna(x) for x in (a, l, e)) or float(a) <= 0 or float(l) < 0:
+            continue
+        recovered = float(a) - float(e) - float(t)
+        gap = recovered - float(l)
+        if gap > max(abs(float(a)) * 0.15, 100_000_000.0):
+            large_gap_periods.append((period, recovered, gap))
+    repeated_structural_gap = (
+        len(large_gap_periods) >= 8
+        and len(large_gap_periods) >= int(0.70 * max(complete_periods, 1))
+    )
+    # Propagate the identity repair only when the repeated pattern is anchored
+    # by at least three strongly corroborated periods.  This prevents a generic
+    # A-E plug from activating solely because a company has many bad periods.
+    evidence_candidates = list(candidates)
+    if repeated_structural_gap and len(evidence_candidates) >= 3:
+        candidate_map = {period: (recovered, gap, debt)
+                         for period, recovered, gap, debt in evidence_candidates}
+        candidates = [
+            (period, recovered, gap, candidate_map.get(period, (None, None, 0.0))[2])
+            for period, recovered, gap in large_gap_periods
+        ]
+    else:
+        candidates = []
+    if candidates:
+        reconstructed = []
+        for period, recovered, gap, debt_evidence in candidates:
+            old = float(liabilities[period])
+            out.at[(BS, 'Total Liabilities'), period] = recovered
+            liabilities[period] = recovered
+            out.loc[(INT, 'Metric: Total Liabilities Reconstructed'), period] = 1.0
+            reconstructed.append((period, old, recovered, debt_evidence))
+        examples = '; '.join(
+            f"{period} {old/1e9:.3f}B->{recovered/1e9:.3f}B"
+            for period, old, recovered, _debt in reconstructed[:3])
+        suffix = f"; examples: {examples}" if examples else ''
+        print(f"  [BS Identity v96] Reconstructed Total Liabilities in "
+              f"{len(reconstructed)} repeated under-capture period(s){suffix}")
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+
+def _gb_fill_current_liquid_investments(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing current investments from non-overlapping current components."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    BS = '2_Balance_Sheet'
+    target = (BS, 'Short-term Investments')
+    component_labels = ('Marketable debt securities', 'Marketable equity securities')
+    components = []
+    for label in component_labels:
+        idx = (BS, label)
+        if idx in df.index:
+            components.append(pd.to_numeric(df.loc[idx], errors='coerce'))
+    if not components:
+        return df
+    component_frame = pd.concat(components, axis=1)
+    # Require both independently reported components in the same period.
+    # A single residual security row is not enough evidence to reconstruct the
+    # canonical current-investments total (for example, an issuer's immaterial old
+    # debt-security balances).
+    component_sum = component_frame.fillna(0).sum(axis=1).where(
+        component_frame.notna().sum(axis=1).ge(2))
+    out = df.copy()
+    current = (pd.to_numeric(out.loc[target], errors='coerce')
+               if target in out.index else pd.Series(np.nan, index=out.columns))
+    fill = current.isna() & component_sum.notna() & (component_sum >= 0)
+    if fill.any():
+        if target not in out.index:
+            out.loc[target, :] = np.nan
+        out.loc[target, fill.index[fill]] = component_sum[fill].values
+        print(f"  [Liquid Investments] Filled {int(fill.sum())} period(s) from "
+              "marketable debt + marketable equity securities.")
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+
+def _gb_refresh_debt_and_net_cash_kpis_v96(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Recompute debt and net cash after final balance-sheet repairs."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = _gb_fill_current_liquid_investments(
+        _gb_normalize_balance_sheet_debt_stock_signs(df))
+    BS, KPI = '2_Balance_Sheet', '5_KPI_Metrics'
+    def row(label):
+        idx = (BS, label)
+        return (pd.to_numeric(out.loc[idx], errors='coerce')
+                if idx in out.index else pd.Series(np.nan, index=out.columns))
+    st_debt, st_borr, cp = row('Short-term Debt'), row('Short-term Borrowings'), row('Current Portion of Long-term Debt')
+    lt_total, senior, convertible, other = row('Long-term Debt'), row('Senior Notes'), row('Convertible Debt'), row('Other Long-term Borrowings')
+    op_c, op_nc = row('Operating Lease Liability (Current)'), row('Operating Lease Liability (Non-current)')
+    fin_c, fin_nc = row('Finance Lease Liability (Current)'), row('Finance Lease Liability (Non-current)')
+    short = st_debt.where(st_debt.fillna(0).ne(0), st_borr.fillna(0) + cp.fillna(0))
+    long_parts = senior.fillna(0) + convertible.fillna(0) + other.fillna(0)
+    long_debt = lt_total.where(lt_total.fillna(0).ne(0), long_parts)
+
+    # ``NotesPayable`` is a total borrowings concept despite the historical
+    # canonical label Other Long-term Borrowings.  Do not add current debt again.
+    notes_payable_periods = set()
+    if isinstance(fact_audit, pd.DataFrame) and not fact_audit.empty and {
+            'Category', 'Label', 'Period', 'Concept'}.issubset(fact_audit.columns):
+        notes = fact_audit[
+            fact_audit['Category'].eq(BS)
+            & fact_audit['Label'].eq('Other Long-term Borrowings')
+            & fact_audit['Concept'].astype(str).eq('NotesPayable')
+        ]
+        notes_payable_periods = set(notes['Period'].astype(str))
+    borrowings = short + long_debt
+    other_parent = (
+        other.notna() & other.gt(0)
+        & other.ge((short.fillna(0) + senior.fillna(0)
+                    + convertible.fillna(0)).mul(1.05))
+    )
+    borrowings = borrowings.where(~other_parent, other)
+    for period in notes_payable_periods:
+        if period in borrowings.index and pd.notna(other.get(period)):
+            borrowings[period] = float(other[period])
+    leases = op_c.fillna(0) + op_nc.fillna(0) + fin_c.fillna(0) + fin_nc.fillna(0)
+    evidence = pd.concat([st_debt, st_borr, cp, lt_total, senior, convertible, other, op_c, op_nc, fin_c, fin_nc], axis=1).notna().any(axis=1)
+    total_debt = (borrowings.fillna(0) + leases).where(evidence)
+    debt_idx = (KPI, 'Metric: Total Debt')
+    existing_debt = (pd.to_numeric(out.loc[debt_idx], errors='coerce')
+                     if debt_idx in out.index else pd.Series(np.nan, index=out.columns))
+    debt_change = total_debt.notna() & (
+        existing_debt.isna()
+        | ((existing_debt - total_debt).abs() > np.maximum(total_debt.abs() * 1e-12, 1.0)))
+    if debt_change.any():
+        if debt_idx not in out.index:
+            out.loc[debt_idx, :] = np.nan
+        out.loc[debt_idx, debt_change.index[debt_change]] = total_debt[debt_change].values
+    cash, investments = row('Cash & Equivalents'), row('Short-term Investments')
+    liquid = (cash.fillna(0) + investments.fillna(0)).where(cash.notna() | investments.notna())
+    net_cash = (liquid - total_debt).where(liquid.notna() & total_debt.notna())
+    net_idx = (KPI, 'Metric: Net Cash (Debt)')
+    existing_net = (pd.to_numeric(out.loc[net_idx], errors='coerce')
+                    if net_idx in out.index else pd.Series(np.nan, index=out.columns))
+    net_change = net_cash.notna() & (
+        existing_net.isna()
+        | ((existing_net - net_cash).abs() > np.maximum(net_cash.abs() * 1e-12, 1.0)))
+    if net_change.any():
+        if net_idx not in out.index:
+            out.loc[net_idx, :] = np.nan
+        out.loc[net_idx, net_change.index[net_change]] = net_cash[net_change].values
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+
+def _gb_is_obvious_nonsegment_member(member: str) -> bool:
+    text = re.sub(r'\s+', ' ', str(member or '')).strip()
+    return bool(text and _V96_NONSEGMENT_MEMBER_RE.search(text))
+
+
+def _gb_reclassify_nonsemantic_segment_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Move obvious accrual/rollforward/expense members out of business segments."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    moved = []
+    for idx in list(out.index):
+        if idx[0] != '4a_Segments_Business':
+            continue
+        _metric, member = _split_segment_display_label(idx[1])
+        if (_normalize_label_key(_metric) != 'revenue'
+                or not _gb_is_obvious_nonsegment_member(member)):
+            continue
+        target = ('6_Disclosures', f'Business Segment Disclosure - {idx[1]}')
+        out = _gb_rename_or_merge_pivot_row(out, idx, target)
+        moved.append(idx[1])
+    if moved:
+        print(f"  [Segment Semantic Gate] Moved {len(moved)} non-segment row(s) to disclosures.")
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+
+def _gb_best_additive_segment_revenue_basis(df: pd.DataFrame):
+    """Return one repeatedly additive revenue family without basis mixing.
+
+    Candidate generation is structural (era labels, reportable ``... Business``
+    members, and small pair/triple searches), avoiding an exponential search
+    across every nested product disclosure.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return []
+    total_idx = ('1_Income_Statement', 'Revenue')
+    if total_idx not in df.index:
+        return []
+    total = pd.to_numeric(df.loc[total_idx], errors='coerce')
+    categories = {
+        '4a_Segments_Business', '4b_Segments_Geographic_Regions',
+        '4c_Segments_Geographic_Countries'}
+    candidate_by_category = defaultdict(list)
+    for idx in df.index:
+        if (idx[0] not in categories
+                or not str(idx[1]).startswith('Revenue - ')
+                or str(idx[1]).count(' - ') != 1):
+            continue
+        member = _split_segment_display_label(idx[1])[1]
+        key = _normalize_label_key(member)
+        if (not member or _gb_is_obvious_nonsegment_member(member)
+                or key in {'total', 'totals', 'corporate', 'unallocated'}):
+            continue
+        values = pd.to_numeric(df.loc[idx], errors='coerce')
+        if int(values.notna().sum()) >= 2:
+            candidate_by_category[idx[0]].append(idx)
+
+    def evaluate(combo):
+        combo = list(dict.fromkeys(combo))
+        if not (2 <= len(combo) <= 8):
+            return None
+        series = {idx: pd.to_numeric(df.loc[idx], errors='coerce') for idx in combo}
+        ratios, evaluated, tied = [], 0, 0
+        for period in df.columns:
+            tv = total.get(period)
+            present = [series[idx].get(period) for idx in combo
+                       if pd.notna(series[idx].get(period))]
+            if pd.isna(tv) or float(tv) == 0 or len(present) < 2:
+                continue
+            evaluated += 1
+            ratio = abs(float(tv) - sum(map(float, present))) / abs(float(tv))
+            ratios.append(ratio)
+            if ratio <= 0.015:
+                tied += 1
+        if tied < 3 or evaluated == 0 or tied / evaluated < 0.60:
+            return None
+        return (tied, tied / evaluated, evaluated, -float(np.mean(ratios)), -len(combo))
+
+    proposals = []
+    for raw_group in candidate_by_category.values():
+        group = list(dict.fromkeys(raw_group))
+        if len(group) < 2:
+            continue
+        if len(group) <= 8:
+            proposals.append(group)
+        era_union = [idx for idx in group
+                     if any(marker in idx[1] for marker in ('(Post Change)', '(Pre Change)'))]
+        if len(era_union) >= 2:
+            proposals.append(era_union)
+        for marker in ('(Post Change)', '(Pre Change)'):
+            era = [idx for idx in group if marker in idx[1]]
+            if len(era) >= 2:
+                proposals.append(era)
+        business = [idx for idx in group
+                    if re.search(r'(?i)\bBusiness(?: \(Post Change\)| \(Pre Change\))?$',
+                                 _split_segment_display_label(idx[1])[1])]
+        if len(business) >= 2:
+            proposals.append(business)
+        # Pairs and triples catch compact reportable families such as NVIDIA's
+        # Graphics + Compute and Networking without exploring all larger subsets.
+        proposals.extend(itertools.combinations(group, 2))
+        proposals.extend(itertools.combinations(group, 3))
+
+    seen, best = set(), None
+    for proposal in proposals:
+        combo = tuple(dict.fromkeys(proposal))
+        if combo in seen:
+            continue
+        seen.add(combo)
+        score = evaluate(combo)
+        if score is not None and (best is None or score > best[0]):
+            best = (score, list(combo))
+    return best[1] if best is not None else []
+
+def _gb_refresh_balance_sheet_footing_v96(df: pd.DataFrame) -> pd.DataFrame:
+    """Refresh only balance-sheet-dependent integrity rows after v96 repairs."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    BS, INT = '2_Balance_Sheet', '8_Integrity_Checks'
+    keys = [(BS, 'Total Assets'), (BS, 'Total Liabilities'), (BS, 'Total Equity')]
+    if any(key not in df.index for key in keys):
+        return df
+    out = df.copy()
+    assets = pd.to_numeric(out.loc[keys[0]], errors='coerce')
+    liabilities = pd.to_numeric(out.loc[keys[1]], errors='coerce')
+    equity = pd.to_numeric(out.loc[keys[2]], errors='coerce')
+    temporary = _balance_sheet_temporary_equity_series(out).fillna(0)
+    have = assets.notna() & liabilities.notna() & equity.notna()
+    residual = pd.concat([
+        (assets - liabilities - equity).abs(),
+        (assets - liabilities - equity - temporary).abs(),
+    ], axis=1).min(axis=1)
+    passed = (assets > 0) & (liabilities >= 0) & (
+        residual <= (assets.abs() * 0.005).clip(lower=50_000_000.0))
+    bs_flag = pd.Series(np.nan, index=out.columns, dtype=float)
+    bs_flag[have] = 0.0
+    bs_flag[have & passed] = 1.0
+    bs_key = (INT, 'Metric: Balance Sheet Footing Verified')
+    existing_bs = (pd.to_numeric(out.loc[bs_key], errors='coerce')
+                   if bs_key in out.index else pd.Series(np.nan, index=out.columns))
+    bs_change = bs_flag.notna() & (existing_bs.isna() | existing_bs.ne(bs_flag))
+    if bs_change.any():
+        if bs_key not in out.index:
+            out.loc[bs_key, :] = np.nan
+        out.loc[bs_key, bs_change.index[bs_change]] = bs_flag[bs_change].values
+
+    # The broad flag depends only on the three core statement flags. Preserve
+    # the existing IS/CF decisions and refresh the roll-up with the new BS flag.
+    is_key = (INT, 'Metric: Income Statement Footing Verified')
+    cf_key = (INT, 'Metric: Cash Flow Footing Verified')
+    if is_key in out.index and cf_key in out.index:
+        is_flag = pd.to_numeric(out.loc[is_key], errors='coerce')
+        cf_flag = pd.to_numeric(out.loc[cf_key], errors='coerce')
+        core = pd.DataFrame({'is': is_flag, 'bs': bs_flag, 'cf': cf_flag})
+        broad = pd.Series(np.nan, index=out.columns, dtype=float)
+        broad[core.eq(0.0).any(axis=1)] = 0.0
+        broad[core.notna().all(axis=1) & core.eq(1.0).all(axis=1)] = 1.0
+        broad_key = (INT, 'Metric: Financials Footing Verified')
+        existing_broad = (pd.to_numeric(out.loc[broad_key], errors='coerce')
+                          if broad_key in out.index else pd.Series(np.nan, index=out.columns))
+        broad_change = broad.notna() & (existing_broad.isna() | existing_broad.ne(broad))
+        if broad_change.any():
+            if broad_key not in out.index:
+                out.loc[broad_key, :] = np.nan
+            out.loc[broad_key, broad_change.index[broad_change]] = broad[broad_change].values
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+def _gb_refresh_segment_footing_v96(df: pd.DataFrame) -> pd.DataFrame:
+    """Correct explicit false-negative segment checks from a proven additive family.
+
+    Preserve every existing success and every intentionally ambiguous/no-basis
+    result.  Only periods currently marked as mismatches are eligible, and only
+    when one repeatedly additive family closes consolidated revenue within 1.5%.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    INT = '8_Integrity_Checks'
+    idx_flag = (INT, 'Metric: Segment Revenue Footing Verified')
+    idx_basis = (INT, 'Metric: Segment Revenue Footing Basis Code')
+    idx_error = (INT, 'Metric: Segment Revenue Footing Error %')
+    if idx_basis not in df.index or idx_error not in df.index:
+        return df
+    existing_basis = pd.to_numeric(df.loc[idx_basis], errors='coerce')
+    existing_error = pd.to_numeric(df.loc[idx_error], errors='coerce')
+    eligible = existing_basis.eq(-1.0) & existing_error.ge(30.0)
+    if int(eligible.sum()) < 3:
+        return df
+    basis = _gb_best_additive_segment_revenue_basis(df)
+    if len(basis) < 2 or ('1_Income_Statement', 'Revenue') not in df.index:
+        return df
+    existing_flag = (pd.to_numeric(df.loc[idx_flag], errors='coerce')
+                     if idx_flag in df.index else pd.Series(np.nan, index=df.columns))
+    total = pd.to_numeric(df.loc[('1_Income_Statement', 'Revenue')], errors='coerce')
+    rows = {idx: pd.to_numeric(df.loc[idx], errors='coerce') for idx in basis}
+    out = df.copy()
+    corrected = []
+    for period in out.columns:
+        # -1 is the established explicit mismatch state. A literal failed flag
+        # is also eligible. Ambiguous/no-basis states (0/2/NA) are preserved.
+        if not bool(eligible.get(period, False)):
+            continue
+        tv = total.get(period)
+        present = [series.get(period) for series in rows.values()
+                   if pd.notna(series.get(period))]
+        if pd.isna(tv) or float(tv) == 0 or len(present) < 2:
+            continue
+        ratio = abs(float(tv) - sum(map(float, present))) / abs(float(tv))
+        if ratio > 0.015:
+            continue
+        out.loc[idx_flag, period] = 1.0
+        out.loc[idx_basis, period] = 1.0
+        out.loc[idx_error, period] = ratio * 100.0
+        corrected.append(period)
+    if corrected:
+        labels = ', '.join(idx[1] for idx in basis)
+        print(f"  [Segment Footing v96] Corrected {len(corrected)} false-negative "
+              f"period(s) from additive family: {labels}")
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+def _gb_quarantine_nonclosing_cross_tab_revenue(df: pd.DataFrame) -> pd.DataFrame:
+    """Blank cross-tab component cells that fail their own top-level region total."""
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    out = df.copy()
+    groups = defaultdict(list)
+    for idx in out.index:
+        if idx[0] != '4d_Segments_Cross_Tabulated':
+            continue
+        parts = str(idx[1]).split(' - ')
+        if len(parts) < 3 or parts[0] != 'Revenue':
+            continue
+        groups[parts[1]].append(idx)
+    cleared = []
+    for parent, rows in groups.items():
+        parent_idx = next((idx for idx in (( '4b_Segments_Geographic_Regions', f'Revenue - {parent}'), ('4c_Segments_Geographic_Countries', f'Revenue - {parent}')) if idx in out.index), None)
+        if parent_idx is None or len(rows) < 2:
+            continue
+        parent_values = pd.to_numeric(out.loc[parent_idx], errors='coerce')
+        component_values = {idx: pd.to_numeric(out.loc[idx], errors='coerce') for idx in rows}
+        for period in out.columns:
+            if not str(period).endswith('-Q4'):
+                continue
+            pv = parent_values.get(period)
+            present = [component_values[idx].get(period) for idx in rows if pd.notna(component_values[idx].get(period))]
+            if pd.isna(pv) or float(pv) <= 0 or len(present) < 2:
+                continue
+            ratio = abs(float(pv) - sum(map(float, present))) / abs(float(pv))
+            if ratio <= 0.03 and all(float(value) >= 0 for value in present):
+                continue
+            for idx in rows:
+                if pd.notna(component_values[idx].get(period)):
+                    out.at[idx, period] = np.nan
+            cleared.append(f'{parent} {period}')
+    if cleared:
+        print('  [Cross-Tab Gate] Suppressed non-closing revenue decompositions: ' + ', '.join(cleared))
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+
+def _gb_drop_rpo_taxonomy_artifacts(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    drop = [idx for idx in df.index if _gb_is_rpo_output_label(idx[1]) and re.search(r'(?i)accounting standards update\s*\d+', str(idx[1]))]
+    if not drop:
+        return df
+    out = df.drop(index=drop).copy()
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    print(f'  [RPO Gate] Removed {len(drop)} taxonomy-domain artifact row(s).')
+    return out
+
+
+def _gb_apply_v96_output_repairs(df: pd.DataFrame, fact_audit=None) -> pd.DataFrame:
+    out = _gb_restore_or_reconstruct_liabilities_v96(df, fact_audit)
+    out = _gb_refresh_debt_and_net_cash_kpis_v96(out, fact_audit)
+    out = _gb_reclassify_nonsemantic_segment_rows(out)
+    out = _gb_quarantine_nonclosing_cross_tab_revenue(out)
+    out = _gb_drop_rpo_taxonomy_artifacts(out)
+    out = _gb_refresh_balance_sheet_footing_v96(out)
+    out = _gb_refresh_segment_footing_v96(out)
+    return out
+
 def _repair_balance_sheet_identity(df: pd.DataFrame) -> pd.DataFrame:
     """Recover an under-captured balance-sheet total from the identity A = L + E.
 
@@ -34955,7 +35533,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-22.final-pivot.v72-rpo-ledger-pinned"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-22.final-pivot.v73-accounting-segment-guards"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -35789,6 +36367,8 @@ def _run_native_annual_mode(ticker, company, ye_month, limit, use_arelle=False,
     final_pivot.attrs.pop('rpo_source_ledger', None)
     final_pivot = _gb_drop_accounting_caption_operating_metrics(final_pivot)
     final_pivot = _gb_drop_fully_empty_output_rows(final_pivot)
+    final_pivot = _gb_apply_v96_output_repairs(
+        final_pivot, final_pivot.attrs.get('fact_audit'))
     final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native annual pre-write sort")
 
     progress.set(98.0, "Writing annual output file")
@@ -36820,6 +37400,7 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             final_pivot, _fact_audit)
         final_pivot = _gb_repair_authoritative_nonoperating_face_line(
             final_pivot, _fact_audit)
+        final_pivot = _gb_apply_v96_output_repairs(final_pivot, _fact_audit)
         final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native quarterly pre-write sort")
 
         progress.set(98.0, "Writing output file")
