@@ -19,14 +19,6 @@ Convert SEC EDGAR filings into detailed, modelling-ready quarterly or annual fin
 >
 > The code is 100% AI generated. From the sec_data.py to the index.html all of it is vibe coded!
 
-<p align="center">
-  <img
-    src="https://github.com/ichsan1448-alt/sec-data/blob/main/examples/cli-ui.jpeg"
-    alt="sec-data Python CLI extracting Netflix quarterly financial statements from SEC 10-K and 10-Q filings"
-    width="100%"
-  >
-</p>
-
 **sec-data** is an open-source Python financial data extraction engine. It retrieves company filings directly from the SEC EDGAR database and transforms XBRL facts, company-specific tags, filing linkbases, historical comparative data, and selected HTML tables into structured financial statements.
 
 The result is a local dataset suitable for financial modelling, valuation, screening, research tools, dashboards, and other open-source financial applications.
