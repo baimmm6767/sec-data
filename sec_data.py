@@ -250,6 +250,244 @@ _EQUITY_ISSUANCE_COMPONENT_LABELS = (
 )
 _EQUITY_ISSUANCE_CASH_LABELS = frozenset(_EQUITY_ISSUANCE_COMPONENT_LABELS)
 
+# Investment purchases/proceeds are separate cash-flow families.  A single
+# broad row cannot safely contain both marketable and non-marketable facts:
+# when both are filed for one period, ordinary candidate dedup keeps only one
+# concept.  These component labels preserve both facts; the legacy parent rows
+# are derived later for backwards compatibility.
+_INVESTMENT_PURCHASE_COMPONENT_LABELS = (
+    'Purchases of Marketable Securities',
+    'Purchases of Non-Marketable / Other Investments',
+    'Purchases of Alternative Investments',
+)
+_INVESTMENT_PROCEEDS_COMPONENT_LABELS = (
+    'Proceeds from Marketable Securities',
+    'Proceeds from Non-Marketable / Other Investments',
+    'Proceeds from Alternative Investments',
+)
+_INVESTMENT_COMPONENT_LABELS = frozenset(
+    _INVESTMENT_PURCHASE_COMPONENT_LABELS
+    + _INVESTMENT_PROCEEDS_COMPONENT_LABELS)
+
+_INVESTMENT_PURCHASE_AGGREGATE_CONCEPTS = frozenset({
+    'PaymentsToAcquireInvestments',
+})
+_INVESTMENT_PROCEEDS_AGGREGATE_CONCEPTS = frozenset({
+    'ProceedsFromSaleAndMaturityOfInvestments',
+})
+_INVESTMENT_COMPONENT_CONCEPT_LABELS = {
+    # Marketable / available-for-sale securities.
+    'PaymentsToAcquireMarketableSecurities':
+        'Purchases of Marketable Securities',
+    'PaymentsToAcquireAvailableForSaleSecurities':
+        'Purchases of Marketable Securities',
+    'PaymentsToAcquireShortTermInvestments':
+        'Purchases of Marketable Securities',
+    'PaymentsToAcquireAvailableForSaleSecuritiesDebt':
+        'Purchases of Marketable Securities',
+    'ProceedsFromSaleAndMaturityOfMarketableSecurities':
+        'Proceeds from Marketable Securities',
+    'ProceedsFromSaleAndMaturityOfAvailableForSaleSecurities':
+        'Proceeds from Marketable Securities',
+    'ProceedsFromMaturitiesPrepaymentsAndCallsOfAvailableForSaleSecurities':
+        'Proceeds from Marketable Securities',
+    'ProceedsFromSaleOfMarketableSecurities':
+        'Proceeds from Marketable Securities',
+    'ProceedsFromMaturitiesOfMarketableSecurities':
+        'Proceeds from Marketable Securities',
+    'ProceedsFromSaleAndMaturityOfAvailableForSaleSecuritiesDebt':
+        'Proceeds from Marketable Securities',
+
+    # The taxonomy's "Other Investments" concepts are used by filers such as
+    # Alphabet for non-marketable securities.  The combined label stays honest
+    # for issuers whose presentation is simply "other investments".
+    'PaymentsToAcquireOtherInvestments':
+        'Purchases of Non-Marketable / Other Investments',
+    'PaymentsToAcquireLongTermInvestments':
+        'Purchases of Non-Marketable / Other Investments',
+    'ProceedsFromSaleAndMaturityOfOtherInvestments':
+        'Proceeds from Non-Marketable / Other Investments',
+    'ProceedsFromSaleOfInvestments':
+        'Proceeds from Non-Marketable / Other Investments',
+
+    # Common extension concepts; the token classifier below covers variants.
+    'PurchasesOfAlternativeInvestments':
+        'Purchases of Alternative Investments',
+    'ProceedsFromSalesOfAlternativeInvestments':
+        'Proceeds from Alternative Investments',
+}
+
+# This is a net/signed investing line, not an asset-sale proceeds concept.
+# Its economic sign is the product of the reported XBRL value and the
+# calculation-linkbase weight into Investing Cash Flow.
+_SIGNED_OTHER_INVESTING_CONCEPTS = frozenset({
+    'PaymentsForProceedsFromOtherInvestingActivities',
+})
+
+
+def _compact_investing_text(*parts):
+    return re.sub(r'[^a-z0-9]+', '', ' '.join(
+        str(part or '') for part in parts).casefold())
+
+
+def _classify_investment_cash_flow_concept(concept):
+    """Return a granular investment cash-flow label for one concept.
+
+    Exact standard concepts win.  Extension concepts are classified only when
+    their names contain both a cash-flow direction and investment/security
+    language; ambiguous net investment concepts remain signed other investing
+    activities rather than being forced into purchases or proceeds.
+    """
+    concept = str(concept or '').split(':')[-1]
+    if concept in _INVESTMENT_COMPONENT_CONCEPT_LABELS:
+        return _INVESTMENT_COMPONENT_CONCEPT_LABELS[concept]
+    if concept in _INVESTMENT_PURCHASE_AGGREGATE_CONCEPTS:
+        return 'Purchases of Investments'
+    if concept in _INVESTMENT_PROCEEDS_AGGREGATE_CONCEPTS:
+        return 'Proceeds from Investments'
+    if concept in _SIGNED_OTHER_INVESTING_CONCEPTS:
+        return 'Other Investing Activities'
+
+    text = _compact_investing_text(concept)
+    if not any(token in text for token in ('investment', 'securit')):
+        return None
+    purchase = any(token in text for token in (
+        'paymentstoacquire', 'paymentforacquisition', 'purchaseof',
+        'purchasesof', 'acquireinvestment'))
+    proceeds = any(token in text for token in (
+        'proceedsfrom', 'saleof', 'salesof', 'maturit', 'redemption',
+        'distributionfrom'))
+    if purchase == proceeds:
+        return None
+    prefix = 'Purchases of ' if purchase else 'Proceeds from '
+    if 'alternativeinvestment' in text:
+        return prefix + 'Alternative Investments'
+    if any(token in text for token in (
+            'marketablesecurit', 'availableforsale', 'shortterminvestment')):
+        return prefix + 'Marketable Securities'
+    if any(token in text for token in (
+            'nonmarketable', 'otherinvestment', 'privateinvestment',
+            'longterminvestment')):
+        return prefix + 'Non-Marketable / Other Investments'
+    # A directional extension with no subtype is a component, not proof that it
+    # is the issuer's all-investments aggregate.  Keep it in the broad
+    # non-marketable/other component so it can be summed safely with marketable
+    # securities without overwriting either fact.
+    return prefix + 'Non-Marketable / Other Investments'
+
+
+def _investing_calc_weight(concept, max_hops=5):
+    """Return the effective calculation weight into Investing Cash Flow."""
+    frontier = {(str(concept or '').split(':')[-1], 1.0)}
+    seen = set()
+    blockers = _CF_OPERATING_PARENTS | _CF_FINANCING_PARENTS
+    for _ in range(max_hops):
+        nxt = set()
+        for child, weight in sorted(frontier, key=lambda item: str(item[0])):
+            if child in seen:
+                continue
+            seen.add(child)
+            for parent, parent_weight in sorted(
+                    GLOBAL_CALC_PARENT.get(child, ()),
+                    key=lambda item: (str(item[0]), str(item[1]))):
+                try:
+                    effective = weight * float(parent_weight)
+                except (TypeError, ValueError):
+                    effective = weight
+                if parent in _CF_INVESTING_PARENTS:
+                    return effective
+                if parent in blockers:
+                    return None
+                nxt.add((parent, effective))
+        frontier = nxt
+        if not frontier:
+            break
+    return None
+
+
+def _prepare_investing_cash_flow_facts(df):
+    """Split broad investment rows and sign true net investing lines.
+
+    This migration also repairs facts loaded from older native-extraction
+    caches whose labels predate the granular map.  It is intentionally limited
+    to cash-flow rows already mapped to investment/asset-sale families.
+    """
+    if df is None or df.empty or not {'Category', 'Label', 'Concept', 'Value'}.issubset(df.columns):
+        return df
+    candidate = (
+        df['Category'].eq('3_Cash_Flow')
+        & df['Label'].isin({
+            'Purchases of Investments', 'Proceeds from Investments',
+            'Proceeds from Asset Sales', 'Other Investing Activities',
+            *_INVESTMENT_COMPONENT_LABELS,
+        })
+    )
+    if not candidate.any():
+        return df
+    out = df.copy()
+    changed = 0
+    signed = 0
+    for concept in out.loc[candidate, 'Concept'].dropna().astype(str).unique():
+        short = concept.split(':')[-1]
+        concept_mask = candidate & out['Concept'].astype(str).eq(concept)
+        target = _classify_investment_cash_flow_concept(short)
+        weight = _investing_calc_weight(short)
+
+        # A concept heuristically placed in a broad investment row but lacking
+        # purchase/proceeds direction (for example a reverse-repurchase net
+        # activity concept) is a signed investing contribution, not an
+        # investment purchase or sale total.
+        current_labels = set(out.loc[concept_mask, 'Label'].astype(str))
+        if (target is None
+                and current_labels.intersection({
+                    'Purchases of Investments', 'Proceeds from Investments'})
+                and weight is not None):
+            target = 'Other Investing Activities'
+
+        if target is not None and any(
+                label != target for label in current_labels):
+            out.loc[concept_mask, 'Label'] = target
+            if 'TagRank' in out.columns:
+                # Preserve curated aggregate-before-component priority.  A
+                # blanket rank=0 would let a later footnote subcomponent
+                # overwrite a statement-face aggregate and disable the
+                # taxonomy-poisoning guard.
+                target_info = CONCEPT_MAP.get(target, {})
+                target_tags = (target_info.get('tags') or []
+                               if isinstance(target_info, dict) else [])
+                try:
+                    target_rank = target_tags.index(short)
+                except ValueError:
+                    target_rank = 999
+                out.loc[concept_mask, 'TagRank'] = target_rank
+            changed += int(concept_mask.sum())
+
+        if target == 'Other Investing Activities' and weight is not None:
+            marker = 'investing_calc_weight_signed'
+            already_signed = pd.Series(False, index=out.index)
+            if 'SourceCanonicalizedFrom' in out.columns:
+                already_signed = (
+                    out['SourceCanonicalizedFrom'].fillna('').astype(str)
+                    .str.split(';').map(lambda parts: marker in parts)
+                )
+            sign_mask = concept_mask & ~already_signed
+            numeric = pd.to_numeric(
+                out.loc[sign_mask, 'Value'], errors='coerce')
+            out.loc[sign_mask, 'Value'] = numeric * float(weight)
+            signed += int(numeric.notna().sum())
+            if 'SourceCanonicalizedFrom' in out.columns and sign_mask.any():
+                prior = (out.loc[sign_mask, 'SourceCanonicalizedFrom']
+                         .fillna('').astype(str))
+                out.loc[sign_mask, 'SourceCanonicalizedFrom'] = np.where(
+                    prior.eq(''), marker, prior + ';' + marker)
+
+    if changed or signed:
+        print(
+            f"  [Investing Granularity] Reclassified {changed} investment "
+            f"fact(s); signed {signed} net investing fact(s) from the "
+            "calculation linkbase.")
+    return out
+
 
 def _compact_equity_issuance_text(*parts):
     return re.sub(r'[^a-z0-9]+', '', ' '.join(
@@ -3547,9 +3785,16 @@ CONCEPT_MAP = {
     'Acquisitions': {'tags': ['PaymentsToAcquireBusinessesNetOfCashAcquired', 'PaymentsToAcquireBusinessesGross', 'PaymentsToAcquireBusinessesAndIntangibles', 'AcquisitionsNetOfCashAcquiredAndPurchasesOfIntangibleAndOtherAssets'], 'cat': '3_Cash_Flow'},
     'Cash Acquired in Business Acquisitions': {'tags': ['CashCashEquivalentsAndSegregatedCashAcquiredInBusinessAcquisitions', 'CashCashEquivalentsAndSegregatedCashAcquiredInBusinessAcquisitionsAndAssetAcquisitions'], 'cat': '6_Disclosures'},
     'Divestitures': {'tags': ['ProceedsFromDivestitureOfBusinesses', 'ProceedsFromSalesOfBusinessesNetOfCashDivested', 'ProceedsFromDivestitureOfBusinessesNetOfCashDivested', 'ProceedsFromSaleOfBusiness', 'ProceedsFromDivestitures', 'ProceedsFromSaleOfSubsidiaries', 'ProceedsFromSaleOfBusinessesAndInterestsInAffiliates', 'ProceedsFromDivestitureOfBusinessesAndInterestsInAffiliates', 'ProceedsFromSaleOfBusinessSegment'], 'cat': '3_Cash_Flow'},
-    'Purchases of Investments': {'tags': ['PaymentsToAcquireMarketableSecurities', 'PaymentsToAcquireAvailableForSaleSecurities', 'PaymentsToAcquireShortTermInvestments', 'PaymentsToAcquireOtherInvestments', 'PaymentsToAcquireInvestments', 'PaymentsToAcquireLongTermInvestments', 'PaymentsToAcquireAvailableForSaleSecuritiesDebt'], 'cat': '3_Cash_Flow'},
-    'Proceeds from Investments': {'tags': ['ProceedsFromSaleAndMaturityOfMarketableSecurities', 'ProceedsFromSaleAndMaturityOfAvailableForSaleSecurities', 'ProceedsFromSaleAndMaturityOfOtherInvestments', 'ProceedsFromMaturitiesPrepaymentsAndCallsOfAvailableForSaleSecurities', 'ProceedsFromSaleOfMarketableSecurities', 'ProceedsFromMaturitiesOfMarketableSecurities', 'ProceedsFromSaleOfInvestments', 'ProceedsFromSaleAndMaturityOfInvestments', 'ProceedsFromSaleAndMaturityOfAvailableForSaleSecuritiesDebt'], 'cat': '3_Cash_Flow'},
-    'Proceeds from Asset Sales': {'tags': ['ProceedsFromSaleOfPropertyPlantAndEquipment', 'ProceedsFromSaleOfIntangibleAssets', 'ProceedsFromSaleOfOtherAssets', 'ProceedsFromSaleOfProductiveAssets', 'ProceedsFromSaleOfOperatingLeaseAssets', 'ProceedsFromSaleOfRealEstate', 'PaymentsForProceedsFromProductiveAssets', 'PaymentsForProceedsFromOtherInvestingActivities', 'ProceedsFromPropertyPlantAndEquipmentSalesAndIncentives', 'ProceedsFromRebatesOnPurchasesOfProductiveAssets'], 'cat': '3_Cash_Flow'},
+    'Purchases of Marketable Securities': {'tags': ['PaymentsToAcquireMarketableSecurities', 'PaymentsToAcquireAvailableForSaleSecurities', 'PaymentsToAcquireShortTermInvestments', 'PaymentsToAcquireAvailableForSaleSecuritiesDebt'], 'cat': '3_Cash_Flow'},
+    'Purchases of Non-Marketable / Other Investments': {'tags': ['PaymentsToAcquireOtherInvestments', 'PaymentsToAcquireLongTermInvestments'], 'cat': '3_Cash_Flow'},
+    'Purchases of Alternative Investments': {'tags': ['PurchasesOfAlternativeInvestments'], 'cat': '3_Cash_Flow'},
+    'Purchases of Investments': {'tags': ['PaymentsToAcquireInvestments'], 'cat': '3_Cash_Flow'},
+    'Proceeds from Marketable Securities': {'tags': ['ProceedsFromSaleAndMaturityOfMarketableSecurities', 'ProceedsFromSaleAndMaturityOfAvailableForSaleSecurities', 'ProceedsFromMaturitiesPrepaymentsAndCallsOfAvailableForSaleSecurities', 'ProceedsFromSaleOfMarketableSecurities', 'ProceedsFromMaturitiesOfMarketableSecurities', 'ProceedsFromSaleAndMaturityOfAvailableForSaleSecuritiesDebt'], 'cat': '3_Cash_Flow'},
+    'Proceeds from Non-Marketable / Other Investments': {'tags': ['ProceedsFromSaleAndMaturityOfOtherInvestments', 'ProceedsFromSaleOfInvestments'], 'cat': '3_Cash_Flow'},
+    'Proceeds from Alternative Investments': {'tags': ['ProceedsFromSalesOfAlternativeInvestments'], 'cat': '3_Cash_Flow'},
+    'Proceeds from Investments': {'tags': ['ProceedsFromSaleAndMaturityOfInvestments'], 'cat': '3_Cash_Flow'},
+    'Proceeds from Asset Sales': {'tags': ['ProceedsFromSaleOfPropertyPlantAndEquipment', 'ProceedsFromSaleOfIntangibleAssets', 'ProceedsFromSaleOfOtherAssets', 'ProceedsFromSaleOfProductiveAssets', 'ProceedsFromSaleOfOperatingLeaseAssets', 'ProceedsFromSaleOfRealEstate', 'PaymentsForProceedsFromProductiveAssets', 'ProceedsFromPropertyPlantAndEquipmentSalesAndIncentives', 'ProceedsFromRebatesOnPurchasesOfProductiveAssets'], 'cat': '3_Cash_Flow'},
+    'Other Investing Activities': {'tags': ['PaymentsForProceedsFromOtherInvestingActivities'], 'cat': '3_Cash_Flow'},
     'Investing Cash Flow': {'tags': ['NetCashProvidedByUsedInInvestingActivities', 'NetCashProvidedByUsedInInvestingActivitiesContinuingOperations', 'NetCashProvidedByUsedInInvestingActivitiesDiscontinuedOperations'], 'cat': '3_Cash_Flow'},
     'Short-term Debt Issued': {'tags': ['ProceedsFromIssuanceOfShortTermDebt', 'ProceedsFromShortTermDebt', 'ProceedsFromShortTermDebtMaturingInThreeMonthsOrLess', 'ProceedsFromIssuanceOfCommercialPaper'], 'cat': '3_Cash_Flow'},
     'Short-term Debt Repaid': {'tags': ['RepaymentsOfShortTermDebt', 'PaymentsForRepaymentsOfShortTermDebt', 'RepaymentsOfCommercialPaper'], 'cat': '3_Cash_Flow'},
@@ -6764,10 +7009,13 @@ def resolve_custom_tags(calc_trees):
                             else:
                                 target_label = 'Divestitures'
                         elif 'investment' in lbl_lower or 'securit' in lbl_lower:
-                            if node.weight > 0: # Proceeds are positive to investing
-                                target_label = 'Proceeds from Investments'
-                            else: # Purchases are negative to investing
-                                target_label = 'Purchases of Investments'
+                            target_label = _classify_investment_cash_flow_concept(
+                                child_clean)
+                            if target_label is None:
+                                if node.weight > 0: # Proceeds are positive to investing
+                                    target_label = 'Proceeds from Investments'
+                                else: # Purchases are negative to investing
+                                    target_label = 'Purchases of Investments'
                     elif parent_clean in financing_parents:
                         _node_label = (getattr(node, 'standard_label', None)
                                        or getattr(node, 'display_label', None)
@@ -13725,8 +13973,9 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
         active_dim_cols = None
 
         if isinstance(val, (int, float)):
-            if concept.startswith(_outflow_prefixes) and val < 0:
-                if 'Net' not in concept or concept.startswith(('Payments', 'Purchases', 'Purchase', 'Acquisitions', 'Repayments')): 
+            if (concept.startswith(_outflow_prefixes) and val < 0
+                    and concept not in _SIGNED_OTHER_INVESTING_CONCEPTS):
+                if 'Net' not in concept or concept.startswith(('Payments', 'Purchases', 'Purchase', 'Acquisitions', 'Repayments')):
                     val = abs(val)
 
         # 1. Check for Standard Concepts (Consolidated)
@@ -20441,6 +20690,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     _rpo_source_ledger = _gb_build_rpo_source_ledger(df)
     df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
     df = df.dropna(subset=['Value'])
+    df = _prepare_investing_cash_flow_facts(df)
     df = _gb_prepare_operating_measure_facts(df)
     df = _gb_quarantine_conflicting_semantic_duplicates(df)
     def normalize_segment_label(label):
@@ -22784,6 +23034,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                                 _DROP_LABELS = {
                                     'Capital Expenditures',
                                     'Purchases of Investments',
+                                    *_INVESTMENT_PURCHASE_COMPONENT_LABELS,
                                 }
                                 if label in _DROP_LABELS:
                                     print(f"  [Scope Fix] {label} FY{fy}: "
@@ -23075,6 +23326,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
 
 _YTD_UNDERCAPTURE_LABELS = {
     'Purchases of Investments', 'Proceeds from Investments',
+    *_INVESTMENT_COMPONENT_LABELS,
     'Capital Expenditures',
 }
 
@@ -29890,6 +30142,39 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
                       f"{', '.join(_unwired) if _unwired else 'none'}")
 
     # -- Investing CF bridge ------------------------------------------
+    # Preserve the legacy parent rows while preventing component facts from
+    # overwriting one another.  A directly filed aggregate wins; otherwise the
+    # parent is the sum of the granular, mutually exclusive components.
+    def _investment_parent(parent_label, component_labels):
+        direct = get_num(parent_label, preferred_cat='3_Cash_Flow')
+        component_sum = pd.Series(0.0, index=pivoted.columns)
+        component_present = pd.Series(False, index=pivoted.columns)
+        for component_label in component_labels:
+            component = get_num(
+                component_label, preferred_cat='3_Cash_Flow')
+            component_sum = component_sum + component.fillna(0)
+            component_present = component_present | component.notna()
+        derived = component_sum.where(component_present)
+        effective = direct.where(direct.notna(), derived)
+        derived_mask = direct.isna() & derived.notna()
+        if derived_mask.any():
+            # Make the compatibility parent visible to bridge-spec capture and
+            # later residual recomputation, not only to the emitted KPI rows.
+            pivoted.loc[('3_Cash_Flow', parent_label), :] = effective.values
+            _row_cache[('3_Cash_Flow', parent_label)] = (
+                _kpi_series_without_attrs(effective))
+            _num_cache[('3_Cash_Flow', parent_label)] = (
+                _kpi_series_without_attrs(effective))
+            add_val('3_Cash_Flow', parent_label, effective[derived_mask])
+        return effective
+
+    purchases_of_investments_n = _investment_parent(
+        'Purchases of Investments',
+        _INVESTMENT_PURCHASE_COMPONENT_LABELS)
+    proceeds_from_investments_n = _investment_parent(
+        'Proceeds from Investments',
+        _INVESTMENT_PROCEEDS_COMPONENT_LABELS)
+
     inv_total = get_row('Investing Cash Flow', preferred_cat='3_Cash_Flow')
     inv_residual = pd.Series(0.0, index=pivoted.columns)
     if inv_total.notna().any():
@@ -29898,13 +30183,27 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
         
         inv_components = [
             'Capital Expenditures', 'Acquisitions', 'Purchases of Investments',
-            'Proceeds from Investments', 'Proceeds from Asset Sales', 'Divestitures'
+            'Proceeds from Investments', 'Proceeds from Asset Sales',
+            'Divestitures', 'Other Investing Activities',
+            *_INVESTMENT_COMPONENT_LABELS,
         ]
-        
-        for _lbl0, _w0 in (('Capital Expenditures', -1.0), ('Acquisitions', -1.0),
-                           ('Purchases of Investments', -1.0), ('Proceeds from Investments', 1.0),
-                           ('Proceeds from Asset Sales', 1.0), ('Divestitures', 1.0)):
-            _v0 = get_num(_lbl0).fillna(0)
+
+        _fixed_investing_components = (
+            ('Capital Expenditures', -1.0, None),
+            ('Acquisitions', -1.0, None),
+            ('Purchases of Investments', -1.0, purchases_of_investments_n),
+            ('Proceeds from Investments', 1.0, proceeds_from_investments_n),
+            ('Proceeds from Asset Sales', 1.0, None),
+            ('Divestitures', 1.0, None),
+            # Already signed to its economic contribution by
+            # _prepare_investing_cash_flow_facts.
+            ('Other Investing Activities', 1.0, None),
+        )
+        for _lbl0, _w0, _prepared in _fixed_investing_components:
+            _v0 = (
+                _prepared.fillna(0) if _prepared is not None
+                else get_num(_lbl0, preferred_cat='3_Cash_Flow').fillna(0)
+            )
             inv_sum += _v0 * _w0
             _inv_contribs[_lbl0] = _v0 * _w0
         
@@ -30432,6 +30731,7 @@ def _repair_always_positive(df):
         'Taxes Paid on Stock Awards', 'Total Debt Repaid', 'Short-term Debt Repaid', 
         'Long-term Debt Repaid', 'Share Repurchases',
         'Purchases of Investments',
+        *_INVESTMENT_PURCHASE_COMPONENT_LABELS,
     }
     df = df.copy()
     num_cols = df.columns.tolist()
@@ -36427,7 +36727,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-23.native-extraction.v33-ordinary-dividends-exact"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-24.native-extraction.v34-investing-granularity"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -36597,7 +36897,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-24.final-pivot.v77-dividend-concept-transition"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-24.final-pivot.v78-investing-granularity"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
