@@ -25419,6 +25419,102 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
                 return True
         return False
 
+    _debt_additivity_proof_cache = {}
+    _debt_additivity_proof_records = []
+
+    def _same_year_component_additivity_proven(
+            labels, target_period, target_active, incomplete_mask,
+            gross_values):
+        """Prove an otherwise ambiguous component set is additive.
+
+        A line-of-credit family can overlap a broad short- or long-term debt
+        aggregate, so missing concept provenance must normally fail closed.
+        Some historical filings, however, provide an independent same-year
+        identity in another quarter: either a reported gross total equals the
+        component sum, or the reported total-net row equals the component sum
+        after the opposite gross side.  That identity proves the normalized
+        families were additive for that fiscal year without relying on label
+        similarity or company-specific hardcoding.
+        """
+        active_labels = frozenset(
+            str(item.get('label')) for item in target_active
+            if abs(float(item.get('value', 0.0))) > 1e-9)
+        if len(active_labels) < 2:
+            return False
+        target_year = str(target_period).split('-', 1)[0]
+        direction = (
+            'issued' if all(str(label).endswith('Issued') for label in labels)
+            else 'repaid')
+        cache_key = (direction, target_year, tuple(sorted(active_labels)))
+        if cache_key in _debt_additivity_proof_cache:
+            return _debt_additivity_proof_cache[cache_key]
+
+        total_label = (
+            'Total Debt Issued' if direction == 'issued'
+            else 'Total Debt Repaid')
+        opposite_label = (
+            'Total Debt Repaid' if direction == 'issued'
+            else 'Total Debt Issued')
+        direct_total = source_ser(total_label)
+        opposite_total = source_ser(opposite_label)
+        reported_net = visible_ser('Total Net Debt Issued (Repaid)')
+
+        proven = False
+        proof_period = None
+        proof_basis = None
+        for candidate_period in idx:
+            if str(candidate_period).split('-', 1)[0] != target_year:
+                continue
+            if bool(incomplete_mask.reindex(idx, fill_value=False).loc[
+                    candidate_period]):
+                continue
+            candidate_items = [
+                (str(label), float(gross_values[label].loc[candidate_period]))
+                for label in labels
+                if (pd.notna(gross_values[label].loc[candidate_period])
+                    and abs(float(gross_values[label].loc[candidate_period]))
+                    > 1e-9)
+            ]
+            candidate_labels = frozenset(label for label, _ in candidate_items)
+            if candidate_labels != active_labels:
+                continue
+            component_value = sum(value for _, value in candidate_items)
+            direct_value = direct_total.loc[candidate_period]
+            if pd.notna(direct_value):
+                tolerance = _debt_value_tolerance(
+                    direct_value, component_value)
+                if abs(float(direct_value) - component_value) <= tolerance:
+                    proven = True
+                    proof_period = candidate_period
+                    proof_basis = 'reported_gross_total'
+                    break
+
+            net_value = reported_net.loc[candidate_period]
+            opposite_value = opposite_total.loc[candidate_period]
+            if pd.isna(net_value) or pd.isna(opposite_value):
+                continue
+            expected_net = (
+                component_value - float(opposite_value)
+                if direction == 'issued'
+                else float(opposite_value) - component_value)
+            tolerance = _debt_value_tolerance(net_value, expected_net)
+            if abs(float(net_value) - expected_net) <= tolerance:
+                proven = True
+                proof_period = candidate_period
+                proof_basis = 'reported_total_net_identity'
+                break
+
+        _debt_additivity_proof_cache[cache_key] = proven
+        if proven:
+            _debt_additivity_proof_records.append({
+                'year': target_year,
+                'direction': direction,
+                'labels': ';'.join(sorted(active_labels)),
+                'proof_period': str(proof_period),
+                'proof_basis': str(proof_basis),
+            })
+        return proven
+
     def component_sum(labels, incomplete_mask, gross_values):
         """Sum only component rows proven not to overlap in each period."""
         evidence = pd.Series(False, index=idx)
@@ -25493,9 +25589,15 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
                             right_concept, left_concept)
                         for left_concept in left['concepts']
                         for right_concept in right['concepts'])
-                    if (linked or possible_unproven_loc_overlap(
-                            left['label'], left['concepts'],
-                            right['label'], right['concepts'])):
+                    unproven_loc_overlap = possible_unproven_loc_overlap(
+                        left['label'], left['concepts'],
+                        right['label'], right['concepts'])
+                    if (unproven_loc_overlap
+                            and _same_year_component_additivity_proven(
+                                labels, period, active, incomplete_mask,
+                                gross_values)):
+                        unproven_loc_overlap = False
+                    if linked or unproven_loc_overlap:
                         unresolved_overlap = True
             if unresolved_overlap:
                 ambiguous.loc[period] = True
@@ -26113,6 +26215,24 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
             existing_inferences.append(inference)
             seen_inferences.add(signature)
         attrs['debt_zero_inferences'] = existing_inferences
+
+    if _debt_additivity_proof_records:
+        existing_proofs = list(
+            attrs.get('debt_component_additivity_proofs', ()) or ())
+        seen_proofs = {
+            tuple(sorted((str(key), repr(value))
+                         for key, value in proof.items()))
+            for proof in existing_proofs
+            if isinstance(proof, dict)
+        }
+        for proof in _debt_additivity_proof_records:
+            signature = tuple(sorted(
+                (str(key), repr(value)) for key, value in proof.items()))
+            if signature in seen_proofs:
+                continue
+            existing_proofs.append(proof)
+            seen_proofs.add(signature)
+        attrs['debt_component_additivity_proofs'] = existing_proofs
 
     if issues:
         existing = list(attrs.get('debt_quality_issues', ()) or ())
@@ -38105,7 +38225,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-24.final-pivot.v78-investing-granularity"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-28.final-pivot.v79-debt-additivity-proof"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
