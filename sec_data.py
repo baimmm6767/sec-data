@@ -323,6 +323,12 @@ _INVESTMENT_COMPONENT_CONCEPT_LABELS = {
 _SIGNED_OTHER_INVESTING_CONCEPTS = frozenset({
     'PaymentsForProceedsFromOtherInvestingActivities',
 })
+_INVESTMENT_CASH_FLOW_CONCEPTS = frozenset(
+    set(_INVESTMENT_COMPONENT_CONCEPT_LABELS)
+    | set(_INVESTMENT_PURCHASE_AGGREGATE_CONCEPTS)
+    | set(_INVESTMENT_PROCEEDS_AGGREGATE_CONCEPTS)
+    | set(_SIGNED_OTHER_INVESTING_CONCEPTS)
+)
 
 
 def _compact_investing_text(*parts):
@@ -545,19 +551,100 @@ def _classify_equity_issuance_line(concept, presentation_label=None):
     return 'Shares Issued - Other Equity'
 
 
-def _classify_debt_cash_flow_line(concept, presentation_label=None):
-    """Conservatively classify custom debt cash-flow extension concepts.
+def _debt_cash_flow_calc_sections(concept, max_hops=7):
+    """Return cash-flow sections reached by one concept's calc ancestry.
 
-    Generic fuzzy matching is useful for broad coverage but cannot reliably
-    distinguish a debt cash flow from debt balances, issuance costs, interest,
-    fair-value disclosures, or maturity schedules.  This classifier requires
-    explicit cash-flow direction and debt-instrument language, then assigns the
-    narrowest supported financing family.  Exact CONCEPT_MAP tags still win
-    before this fallback is reached.
+    A concept can appear in several calculation trees.  Debt classification is
+    safe only when it does not reach operating/investing roots; persistent
+    learned aliases require an unambiguous financing root.
     """
+    start = str(concept or '').split(':')[-1]
+    if not start:
+        return frozenset()
+    roots = {
+        'operating': _CF_OPERATING_PARENTS,
+        'investing': _CF_INVESTING_PARENTS,
+        'financing': _CF_FINANCING_PARENTS,
+    }
+    found = {name for name, values in roots.items() if start in values}
+    frontier = {start}
+    seen = set()
+    for _ in range(max_hops):
+        nxt = set()
+        for child in frontier:
+            if child in seen:
+                continue
+            seen.add(child)
+            for parent, _weight in GLOBAL_CALC_PARENT.get(child, ()):
+                parent = str(parent or '').split(':')[-1]
+                for name, values in roots.items():
+                    if parent in values:
+                        found.add(name)
+                if parent and parent not in seen:
+                    nxt.add(parent)
+        if not nxt:
+            break
+        frontier = nxt
+    return frozenset(found)
+
+
+def _debt_cash_flow_calc_section(concept):
+    sections = _debt_cash_flow_calc_sections(concept)
+    if len(sections) == 1:
+        return next(iter(sections))
+    if len(sections) > 1:
+        return 'conflict'
+    return None
+
+
+def _is_investment_asset_cash_flow_concept(concept, presentation_label=None):
+    """Reject asset-security purchases/sales from liability-debt metrics."""
+    local = str(concept or '').split(':')[-1]
+    text = re.sub(r'[^a-z0-9]+', '', ' '.join(
+        str(part or '') for part in (local, presentation_label)).casefold())
+    if not text:
+        return False
+    if local in _INVESTMENT_CASH_FLOW_CONCEPTS:
+        return True
+    security_asset = any(token in text for token in (
+        'marketablesecurit', 'marketabledebtsecurit', 'availableforsale', 'heldtomaturity',
+        'investmentsecurit', 'nonmarketablesecurit',
+        'shortterminvestment', 'longterminvestment'))
+    asset_transaction = any(token in text for token in (
+        'saleandmaturity', 'salesandmaturit', 'saleofsecurit',
+        'maturitiesofsecurit', 'maturityofsecurit',
+        'paymentstoacquire', 'purchasesof', 'purchaseof',
+        'proceedsfromsale', 'proceedsfrommaturit'))
+    receivable_asset = any(token in text for token in (
+        'notesreceivable', 'loansreceivable', 'creditreceivable'))
+    return bool((security_asset and asset_transaction) or receivable_asset)
+
+
+def _is_normalized_debt_cash_flow_label(label):
+    return str(label) in {
+        'Short-term Debt Issued', 'Short-term Debt Repaid',
+        'Lines of Credit Issued', 'Lines of Credit Repaid',
+        'Net Change in Short-term Debt',
+        'Net Short-Term Debt Issued (Repaid)',
+        'Long-term Debt Issued', 'Long-term Debt Repaid',
+        'Net Long-Term Debt Issued (Repaid)',
+        'Total Debt Issued', 'Total Debt Repaid',
+        'Total Net Debt Issued (Repaid)',
+    }
+
+
+def _classify_debt_cash_flow_line(concept, presentation_label=None,
+                                  source_section=None):
+    """Conservatively classify custom liability-debt cash-flow concepts."""
     text = re.sub(r'[^a-z0-9]+', '', ' '.join(
         str(part or '') for part in (concept, presentation_label)).casefold())
     if not text:
+        return None
+    if source_section is None:
+        source_section = _debt_cash_flow_calc_section(concept)
+    if source_section in {'operating', 'investing', 'conflict'}:
+        return None
+    if _is_investment_asset_cash_flow_concept(concept, presentation_label):
         return None
 
     has_debt = any(token in text for token in (
@@ -567,8 +654,6 @@ def _classify_debt_cash_flow_line(concept, presentation_label=None):
     if not has_debt:
         return None
 
-    # These describe expense, valuation, balances, or noncash accounting rather
-    # than principal cash issued/repaid during the period.
     if any(token in text for token in (
             'noncash', 'interest', 'amortization', 'accretion',
             'extinguishmentgain', 'extinguishmentloss', 'modificationgain',
@@ -578,9 +663,6 @@ def _classify_debt_cash_flow_line(concept, presentation_label=None):
             'covenant', 'commitmentfee', 'unusedcommitment')):
         return None
 
-    # Combined proceeds/repayments concepts are signed net changes, not gross
-    # issuance or repayment.  Restrict this fallback to the short/LOC family,
-    # where the taxonomy commonly provides such concepts.
     combined_direction = (
         ('proceedsfromrepayment' in text
          or ('proceeds' in text and 'repayment' in text))
@@ -615,11 +697,33 @@ def _classify_debt_cash_flow_line(concept, presentation_label=None):
     return f'Total Debt {suffix}'
 
 
-def _register_debt_cash_flow_alias(concept, target_label):
-    """Register one strictly classified financing-face debt extension."""
-    if not concept or target_label not in (
-            _DEBT_GROSS_LABELS | {'Net Change in Short-term Debt'}):
+def _register_debt_cash_flow_alias(concept, target_label,
+                                   require_financing=False):
+    """Register an alias only when it cannot overwrite another metric family."""
+    if not concept or not _is_normalized_debt_cash_flow_label(target_label):
         return False
+    section = _debt_cash_flow_calc_section(concept)
+    if section in {'operating', 'investing', 'conflict'}:
+        return False
+    if require_financing and section != 'financing':
+        return False
+    if _is_investment_asset_cash_flow_concept(concept):
+        return False
+
+    mapped_labels = {
+        label for label, mapped in CONCEPT_MAP.items()
+        if isinstance(mapped, dict) and concept in (mapped.get('tags') or ())
+    }
+    existing = _CONCEPT_TAG_TO_LABEL.get(concept)
+    if existing:
+        mapped_labels.add(existing)
+    # A learned alias may fill an unmapped extension, but it must never change
+    # an existing exact concept's normalized meaning—even to another debt row.
+    if existing and existing != target_label:
+        return False
+    if any(label != target_label for label in mapped_labels):
+        return False
+
     info = CONCEPT_MAP.get(target_label)
     if not isinstance(info, dict):
         return False
@@ -5032,6 +5136,11 @@ def _presentation_statement_pos(cat: str, label: str):
 def _evidence_statement_pos(cat: str, label: str, _seen=None) -> float:
     """Calc/canonical/semantic bucket, with auto anchor rescue for vague labels."""
     base = str(label).split(' - ')[0]
+    if cat == '3_Cash_Flow' and _is_normalized_debt_cash_flow_label(base):
+        # Normalized debt metrics are financing rows by definition.  Source-tag
+        # calc/presentation evidence may diagnose contamination, but must never
+        # move the normalized display row into investing or operating sections.
+        return float(_semantic_statement_pos(cat, base))
     calc_pos = _calc_lineage_statement_pos(cat, base)
     if calc_pos is not None:
         return float(calc_pos)
@@ -6892,7 +7001,7 @@ def learn_statement_concepts(xbrl) -> int:
                         concept, _face_label)
                     if (_debt_target
                             and _register_debt_cash_flow_alias(
-                                concept, _debt_target)):
+                                concept, _debt_target, require_financing=True)):
                         last_anchor = _debt_target
                         continue
 
@@ -14477,10 +14586,14 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 target_labels = (_equity_target,)
 
         # Debt extensions need direction-aware classification before the broad
-        # fuzzy resolver.  This prevents debt balances, interest, issuance
-        # costs, and maturity schedules from entering principal cash flows.
+        # fuzzy resolver.  Resolve calculation ancestry lazily: most facts have
+        # exact mappings and should not pay for an unnecessary tree walk.
+        _debt_source_section = None
+        _investment_asset_cash_flow = None
         if not target_labels and isinstance(val, (int, float)):
-            _debt_target = _classify_debt_cash_flow_line(concept)
+            _debt_source_section = _debt_cash_flow_calc_section(concept)
+            _debt_target = _classify_debt_cash_flow_line(
+                concept, source_section=_debt_source_section)
             if _debt_target:
                 target_labels = (_debt_target,)
 
@@ -14493,7 +14606,22 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                     and (not is_segment_prefix or _is_flow_recon)):
                 fuzzy_lbl = resolve_concept_to_label(concept)
                 if fuzzy_lbl and fuzzy_lbl in CONCEPT_MAP:
-                    target_labels = (fuzzy_lbl,)
+                    # Never let generic token similarity re-route an investing
+                    # asset fact into liability-debt financing.
+                    if _is_normalized_debt_cash_flow_label(fuzzy_lbl):
+                        if _debt_source_section is None:
+                            _debt_source_section = (
+                                _debt_cash_flow_calc_section(concept))
+                        if _investment_asset_cash_flow is None:
+                            _investment_asset_cash_flow = (
+                                _is_investment_asset_cash_flow_concept(
+                                    concept))
+                        if (_investment_asset_cash_flow
+                                or _debt_source_section in {
+                                    'operating', 'investing', 'conflict'}):
+                            fuzzy_lbl = None
+                    if fuzzy_lbl:
+                        target_labels = (fuzzy_lbl,)
         if not target_labels:
             target_labels = ()
 
@@ -21924,6 +22052,55 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         if _direct_cf_period_sets else set()
     )
 
+    # Direct-quarter debt activity blocks a missing-baseline-as-zero inference
+    # for the same direction. Inspect every dimensionless cash-flow concept,
+    # not only rows that were already normalized as debt: an extension can be
+    # presented under a generic financing label and must still prevent a false
+    # zero baseline. Proven investing/operating concepts are excluded.
+    _direct_debt_nonzero_periods = {'issued': set(), 'repaid': set()}
+    _direct_debt_net_activity_periods = set()
+    _direct_cf_candidate_mask = (
+        df['Category'].astype(str).eq('3_Cash_Flow')
+        & _duration_numeric.between(60, 120)
+        & _dim_numeric.eq(0)
+    )
+    for _, _debt_row in df.loc[_direct_cf_candidate_mask].iterrows():
+        _debt_value = pd.to_numeric(_debt_row.get('Value'), errors='coerce')
+        if pd.isna(_debt_value) or abs(float(_debt_value)) <= 1e-9:
+            continue
+        _raw_label = str(_debt_row.get('Label') or '')
+        _concept = str(_debt_row.get('Concept') or '').split(':')[-1]
+        _source_section = _debt_cash_flow_calc_section(_concept)
+        _contaminated = (
+            _source_section in {'operating', 'investing', 'conflict'}
+            or _is_investment_asset_cash_flow_concept(
+                _concept, _raw_label)
+        )
+        if _contaminated:
+            continue
+        if _raw_label in (_DEBT_GROSS_LABELS
+                          | {'Net Change in Short-term Debt'}):
+            _normalized_label = _raw_label
+        else:
+            _normalized_label = _classify_debt_cash_flow_line(
+                _concept, presentation_label=_raw_label,
+                source_section=_source_section)
+        if not _normalized_label:
+            continue
+        try:
+            _period = (int(_debt_row['FY']), str(_debt_row['Q']))
+        except (TypeError, ValueError):
+            continue
+        if _normalized_label == 'Net Change in Short-term Debt':
+            _direct_debt_net_activity_periods.add(_period)
+            continue
+        _direction = (
+            'issued' if str(_normalized_label).endswith('Issued')
+            else 'repaid' if str(_normalized_label).endswith('Repaid')
+            else None)
+        if _direction is not None:
+            _direct_debt_nonzero_periods[_direction].add(_period)
+
     # Historically non-operating facts sharing a label were reconciled in one
     # Label/FY group.  Keep that behavior, while separating operating metrics
     # by category so their stronger aspect-aware arbitration remains isolated.
@@ -21949,6 +22126,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
 
     final_rows = []
     _incomplete_debt_concept_periods = set()
+    _source_proven_zero_debt_concept_periods = set()
 
     # These three helpers and their per-group caches were previously
     # redefined on every loop iteration.  Defined once here, they capture
@@ -21977,6 +22155,76 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             cached = pd.to_datetime(value, errors='coerce')
             _date_parse_cache[value] = cached
         return cached
+
+    def _source_proven_zero_debt_baseline(
+            label, fiscal_year, prior_quarters, cumulative_row):
+        """Prove zero prior debt activity from complete filed CF quarters.
+
+        This is deliberately stronger than an omitted-line heuristic: every
+        prior quarter must contain direct operating, investing, and financing
+        subtotals; no normalized debt gross row in the same direction may be
+        nonzero; no direct short-term net-debt activity may exist; and the
+        filed dates must form the opening portion of the cumulative interval.
+        """
+        if label not in _DEBT_GROSS_LABELS or cumulative_row is None:
+            return None
+        direction = (
+            'issued' if str(label).endswith('Issued')
+            else 'repaid' if str(label).endswith('Repaid')
+            else None)
+        if direction is None:
+            return None
+        periods = [(int(fiscal_year), str(q)) for q in prior_quarters]
+        if not periods or any(
+                period not in _complete_direct_cf_periods
+                for period in periods):
+            return None
+        if any(period in _direct_debt_nonzero_periods[direction]
+               for period in periods):
+            return None
+        if any(period in _direct_debt_net_activity_periods
+               for period in periods):
+            return None
+
+        ytd_start = _parse_plain_date_cached(cumulative_row.get('Start'))
+        ytd_end = _parse_plain_date_cached(cumulative_row.get('End'))
+        financing_rows = [
+            _direct_cf_period_rows.get(
+                ('Financing Cash Flow', int(fiscal_year), str(q)))
+            for q in prior_quarters
+        ]
+        if (pd.isna(ytd_start) or pd.isna(ytd_end)
+                or any(row is None for row in financing_rows)):
+            return None
+        intervals = []
+        for row in financing_rows:
+            start = _parse_plain_date_cached(row.get('Start'))
+            end = _parse_plain_date_cached(row.get('End'))
+            if pd.isna(start) or pd.isna(end):
+                return None
+            intervals.append((start.normalize(), end.normalize(), row))
+        intervals.sort(key=lambda item: item[1])
+        if intervals[0][0] != ytd_start.normalize():
+            return None
+        previous_end = None
+        for start, end, _row in intervals:
+            if previous_end is not None:
+                gap = (start - previous_end).days
+                if gap < 0 or gap > 7:
+                    return None
+            previous_end = end
+        if previous_end is None or previous_end >= ytd_end.normalize():
+            return None
+        return {
+            'derived_start': previous_end + pd.Timedelta(days=1),
+            'derived_end': ytd_end.normalize(),
+            'baseline_periods': '|'.join(
+                f'{int(fiscal_year)}-{q}' for q in prior_quarters),
+            'financing_concepts': ';'.join(
+                str(row.get('Concept') or '') for _, _, row in intervals),
+            'financing_accessions': ';'.join(
+                str(row.get('Accession') or '') for _, _, row in intervals),
+        }
 
     def _resolve_concept_cached(_concept):
         if _concept in _concept_resolve_cache:
@@ -22923,8 +23171,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 # financing transaction, and a fully filed Q1 cash-flow
                 # statement with no issuance row is source evidence of zero Q1
                 # activity.  In that bounded case H1 equals Q2.  The rule never
-                # applies to revenue, expenses, dividends, debt, or generic
-                # financing rows.
+                # applies to revenue, expenses, dividends, or generic
+                # financing rows. Debt uses the stricter multi-family rule below.
                 elif (label in _EQUITY_ISSUANCE_CASH_LABELS
                       and (int(fy), 'Q1') in _complete_direct_cf_periods):
                     _q1_financing_row = _direct_cf_period_rows.get(
@@ -22972,6 +23220,43 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                             "direct Q1 cash-flow statement proved zero Q1 issuance."
                         )
 
+                elif label in _DEBT_GROSS_LABELS:
+                    _zero_proof = _source_proven_zero_debt_baseline(
+                        label, fy, ('Q1',), ytd6[1])
+                    if _zero_proof is not None:
+                        q_vals['Q2'] = ytd6[0]
+                        best_rows['Q2'] = _derived_source_row(
+                            ytd6[1], fy, 'Q2', q_vals['Q2'],
+                            'debt_ytd6_with_source_proven_zero_q1',
+                            start=_zero_proof['derived_start'],
+                            end=_zero_proof['derived_end'],
+                            operands={
+                                'Expression': f"{ytd6[0]} - 0 = {q_vals['Q2']}",
+                                'YTDValue': ytd6[0],
+                                'YTDConcept': ytd6[1].get('Concept'),
+                                'YTDAccession': ytd6[1].get('Accession'),
+                                'ZeroBaselinePeriods': _zero_proof[
+                                    'baseline_periods'],
+                                'ZeroBaselineEvidence': (
+                                    'complete direct cash-flow statements and '
+                                    'no same-direction debt activity'),
+                                'ZeroBaselineFinancingConcepts': _zero_proof[
+                                    'financing_concepts'],
+                                'ZeroBaselineFinancingAccessions': _zero_proof[
+                                    'financing_accessions'],
+                            },
+                        )
+                        _zero_concept = _exact_subtraction_concept(ytd6[1])
+                        if _zero_concept:
+                            _source_proven_zero_debt_concept_periods.add((
+                                str(label), str(_zero_concept),
+                                f'{int(fy)}-Q1'))
+                        print(
+                            f"  [Quarter Derivation] {label} FY{int(fy)}: "
+                            f"H1 {ytd6[0]:,.0f} assigned to Q2 after a complete "
+                            "direct Q1 cash-flow statement proved zero prior "
+                            "same-direction debt activity.")
+
             # Derive Q3 from YTD9 if missing
             q3_ytd = ytd9 if ytd9 is not None else standalone_ytd9
             if q_vals['Q3'] is None and q3_ytd is not None:
@@ -22997,8 +23282,45 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                             'BaselineAccession': ytd6_same_tag[1].get('Accession'),
                         },
                     )
-                # Likewise, a nine-month YTD fact cannot become Q3 unless a
-                # real H1 or complete Q1+Q2 baseline exists.
+                elif label in _DEBT_GROSS_LABELS:
+                    _zero_proof = _source_proven_zero_debt_baseline(
+                        label, fy, ('Q1', 'Q2'), q3_ytd[1])
+                    if _zero_proof is not None:
+                        q_vals['Q3'] = q3_ytd[0]
+                        best_rows['Q3'] = _derived_source_row(
+                            q3_ytd[1], fy, 'Q3', q_vals['Q3'],
+                            'debt_ytd9_with_source_proven_zero_h1',
+                            start=_zero_proof['derived_start'],
+                            end=_zero_proof['derived_end'],
+                            operands={
+                                'Expression': f"{q3_ytd[0]} - 0 = {q_vals['Q3']}",
+                                'YTDValue': q3_ytd[0],
+                                'YTDConcept': q3_ytd[1].get('Concept'),
+                                'YTDAccession': q3_ytd[1].get('Accession'),
+                                'ZeroBaselinePeriods': _zero_proof[
+                                    'baseline_periods'],
+                                'ZeroBaselineEvidence': (
+                                    'complete direct cash-flow statements and '
+                                    'no same-direction debt activity'),
+                                'ZeroBaselineFinancingConcepts': _zero_proof[
+                                    'financing_concepts'],
+                                'ZeroBaselineFinancingAccessions': _zero_proof[
+                                    'financing_accessions'],
+                            },
+                        )
+                        _zero_concept = _exact_subtraction_concept(q3_ytd[1])
+                        if _zero_concept:
+                            for _zero_q in ('Q1', 'Q2'):
+                                _source_proven_zero_debt_concept_periods.add((
+                                    str(label), str(_zero_concept),
+                                    f'{int(fy)}-{_zero_q}'))
+                        print(
+                            f"  [Quarter Derivation] {label} FY{int(fy)}: "
+                            f"YTD9 {q3_ytd[0]:,.0f} assigned to Q3 after "
+                            "complete direct Q1-Q2 cash-flow statements proved "
+                            "zero prior same-direction debt activity.")
+                # Otherwise a nine-month YTD fact remains unresolved; absence
+                # alone is not a safe H1 baseline.
 
             _v9_synthetic = None
             if (
@@ -23666,7 +23988,11 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                                 zero_candidate[1], nonzero_row)
                             for zero_candidate, zero_quarters in zero
                         )
-                        if not proven_zero:
+                        source_proven_zero = (
+                            str(label), str(debt_concept),
+                            f'{int(fy)}-{qn}') in (
+                                _source_proven_zero_debt_concept_periods)
+                        if not proven_zero and not source_proven_zero:
                             _incomplete_debt_concept_periods.add((
                                 str(label),
                                 str(debt_concept),
@@ -25336,6 +25662,7 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
         return audited.combine_first(visible_ser(label))
 
     gross_rejected = {}
+    gross_non_debt_rejected = {}
 
     def clean_gross(label):
         series = source_ser(label).copy()
@@ -25350,12 +25677,122 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
                     'value': float(series.loc[period]),
                 })
             series[negative] = np.nan
+
+        # Source provenance is stronger than a plausible numeric identity.  A
+        # marketable-security sale can be positive, reconcile algebraically,
+        # and still be economically unrelated to debt financing.
+        contaminated = pd.Series(False, index=idx, dtype=bool)
+        if authoritative_audit:
+            for period in idx[series.notna()]:
+                rejection = _debt_provenance_rejection(
+                    label, period, series.loc[period])
+                if rejection is None:
+                    continue
+                contaminated.loc[period] = True
+                issues.append({
+                    'period': str(period),
+                    'label': label,
+                    'reason': rejection['reason'],
+                    'value': float(series.loc[period]),
+                    'concepts': rejection.get('concepts', ''),
+                    'source_section': rejection.get('source_section', ''),
+                })
+        if contaminated.any():
+            gross_non_debt_rejected[str(label)] = contaminated.copy()
+            gross_rejected[str(label)] = (
+                gross_rejected[str(label)] | contaminated)
+            series[contaminated] = np.nan
+
         # Suppress microscopic floating-point negatives/positives around zero.
         near_zero = series.notna() & (series.abs() <= 1e-9)
         series[near_zero] = 0.0
         return series
 
     audit = df.attrs.get('fact_audit')
+    _investment_audit_labels = {
+        'Purchases of Investments',
+        'Purchases of Marketable Securities',
+        'Purchases of Non-Marketable / Other Investments',
+        'Purchases of Alternative Investments',
+        'Proceeds from Investments',
+        'Proceeds from Marketable Securities',
+        'Proceeds from Non-Marketable / Other Investments',
+        'Proceeds from Alternative Investments',
+        'Proceeds from Asset Sales',
+        'Other Investing Activities',
+    }
+
+    def _audit_cell_concepts(label, period):
+        concepts = set()
+        required = {'Category', 'Label', 'Period', 'Concept'}
+        if (not authoritative_audit or not isinstance(audit, pd.DataFrame)
+                or not required.issubset(audit.columns)):
+            return frozenset()
+        selected = audit[
+            audit['Category'].astype(str).eq('3_Cash_Flow')
+            & audit['Label'].astype(str).eq(str(label))
+            & audit['Period'].astype(str).eq(str(period))
+        ]
+        for _, row in selected.iterrows():
+            derivation = row.get('SourceDerivationConcepts')
+            if (derivation is not None and not pd.isna(derivation)
+                    and str(derivation).strip()):
+                concepts.update(
+                    _debt_local_concept(value)
+                    for value in str(derivation).split(';')
+                    if _debt_local_concept(value))
+            concept = _debt_local_concept(row.get('Concept'))
+            if concept and concept not in {
+                    'CalculatedDebtAggregate', 'CalculatedDebtRepair'}:
+                concepts.add(concept)
+        return frozenset(concepts)
+
+    def _debt_provenance_rejection(label, period, value):
+        concepts = _audit_cell_concepts(label, period)
+        for concept in concepts:
+            if _is_investment_asset_cash_flow_concept(concept):
+                return {
+                    'reason': 'investment_asset_fact_rejected_from_debt',
+                    'concepts': ';'.join(sorted(concepts)),
+                    'source_section': 'investing',
+                }
+            section = _debt_cash_flow_calc_section(concept)
+            if section in {'operating', 'investing', 'conflict'}:
+                return {
+                    'reason': 'nonfinancing_calc_ancestry_rejected_from_debt',
+                    'concepts': ';'.join(sorted(concepts)),
+                    'source_section': section,
+                }
+
+        # Exact source-concept duplication across an investing and debt row is
+        # definitive contamination.  Value equality alone is not sufficient,
+        # because unrelated cash flows can legitimately have the same amount.
+        if concepts and isinstance(audit, pd.DataFrame):
+            same_period = audit[
+                audit['Category'].astype(str).eq('3_Cash_Flow')
+                & audit['Period'].astype(str).eq(str(period))
+                & audit['Label'].astype(str).isin(_investment_audit_labels)
+            ]
+            investing_concepts = set()
+            for _, row in same_period.iterrows():
+                concept = _debt_local_concept(row.get('Concept'))
+                if concept:
+                    investing_concepts.add(concept)
+                derivation = row.get('SourceDerivationConcepts')
+                if (derivation is not None and not pd.isna(derivation)
+                        and str(derivation).strip()):
+                    investing_concepts.update(
+                        _debt_local_concept(item)
+                        for item in str(derivation).split(';')
+                        if _debt_local_concept(item))
+            overlap = concepts & investing_concepts
+            if overlap:
+                return {
+                    'reason': 'same_source_concept_used_for_investing_and_debt',
+                    'concepts': ';'.join(sorted(overlap)),
+                    'source_section': 'investing',
+                }
+        return None
     _debt_concept_cache = {}
 
     def provenance_concepts(label, period):
@@ -25873,6 +26310,20 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
                 mask = mask | rejected.reindex(idx, fill_value=False)
         return mask
 
+    def hard_rejected_mask(labels):
+        """Rejections that mean unknown/invalid debt, not proven non-debt."""
+        mask = pd.Series(False, index=idx, dtype=bool)
+        for label in labels:
+            rejected = gross_rejected.get(str(label))
+            non_debt = gross_non_debt_rejected.get(str(label))
+            if isinstance(rejected, pd.Series):
+                current = rejected.reindex(idx, fill_value=False)
+                if isinstance(non_debt, pd.Series):
+                    current = current & ~non_debt.reindex(
+                        idx, fill_value=False)
+                mask = mask | current
+        return mask
+
     def derive_net_with_guarded_zero(
             family_label, issued_series, repaid_series,
             issued_zero_blocked, repaid_zero_blocked,
@@ -25940,12 +26391,12 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
         'Net Long-Term Debt Issued (Repaid)',
         lt_issued, lt_repaid,
         lt_issued_incomplete
-        | rejected_mask(('Long-term Debt Issued',)),
+        | hard_rejected_mask(('Long-term Debt Issued',)),
         lt_repaid_incomplete
-        | rejected_mask(('Long-term Debt Repaid',)),
+        | hard_rejected_mask(('Long-term Debt Repaid',)),
         pair_invalid=(
             lt_incomplete
-            | rejected_mask((
+            | hard_rejected_mask((
                 'Long-term Debt Issued', 'Long-term Debt Repaid'))))
     lt_net = lt_existing.copy()
     lt_net[lt_pair] = lt_derived[lt_pair]
@@ -25972,12 +26423,12 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
         'Net Short-Term Debt Issued (Repaid)',
         st_issued, st_repaid,
         st_issued_incomplete
-        | rejected_mask(('Short-term Debt Issued',)),
+        | hard_rejected_mask(('Short-term Debt Issued',)),
         st_repaid_incomplete
-        | rejected_mask(('Short-term Debt Repaid',)),
+        | hard_rejected_mask(('Short-term Debt Repaid',)),
         pair_invalid=(
             st_incomplete
-            | rejected_mask((
+            | hard_rejected_mask((
                 'Short-term Debt Issued', 'Short-term Debt Repaid'))))
     st_net = st_existing.copy()
     st_net[st_pair] = st_derived[st_pair]
@@ -25988,12 +26439,12 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
         'Net Lines of Credit Issued (Repaid)',
         loc_issued, loc_repaid,
         loc_issued_incomplete
-        | rejected_mask(('Lines of Credit Issued',)),
+        | hard_rejected_mask(('Lines of Credit Issued',)),
         loc_repaid_incomplete
-        | rejected_mask(('Lines of Credit Repaid',)),
+        | hard_rejected_mask(('Lines of Credit Repaid',)),
         pair_invalid=(
             loc_incomplete
-            | rejected_mask((
+            | hard_rejected_mask((
                 'Lines of Credit Issued', 'Lines of Credit Repaid'))))
     loc_net = pd.Series(np.nan, index=idx, dtype=float)
     loc_net[loc_pair] = loc_derived[loc_pair]
@@ -26004,8 +26455,8 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
         & (
             incomplete_issued
             | issued_component_overlap
-            | rejected_mask(_DEBT_ISSUED_COMPONENT_LABELS)
-            | rejected_mask(('Total Debt Issued',))
+            | hard_rejected_mask(_DEBT_ISSUED_COMPONENT_LABELS)
+            | hard_rejected_mask(('Total Debt Issued',))
             | total_rejected.get(
                 'Total Debt Issued',
                 pd.Series(False, index=idx, dtype=bool))))
@@ -26014,8 +26465,8 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
         & (
             incomplete_repaid
             | repaid_component_overlap
-            | rejected_mask(_DEBT_REPAID_COMPONENT_LABELS)
-            | rejected_mask(('Total Debt Repaid',))
+            | hard_rejected_mask(_DEBT_REPAID_COMPONENT_LABELS)
+            | hard_rejected_mask(('Total Debt Repaid',))
             | total_rejected.get(
                 'Total Debt Repaid',
                 pd.Series(False, index=idx, dtype=bool))))
@@ -38055,7 +38506,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-24.native-extraction.v34-investing-granularity"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-28.native-extraction.v35-debt-provenance-guard"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -38225,7 +38676,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-28.final-pivot.v79-debt-additivity-proof"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-28.final-pivot.v80-debt-section-integrity"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
