@@ -545,6 +545,92 @@ def _classify_equity_issuance_line(concept, presentation_label=None):
     return 'Shares Issued - Other Equity'
 
 
+def _classify_debt_cash_flow_line(concept, presentation_label=None):
+    """Conservatively classify custom debt cash-flow extension concepts.
+
+    Generic fuzzy matching is useful for broad coverage but cannot reliably
+    distinguish a debt cash flow from debt balances, issuance costs, interest,
+    fair-value disclosures, or maturity schedules.  This classifier requires
+    explicit cash-flow direction and debt-instrument language, then assigns the
+    narrowest supported financing family.  Exact CONCEPT_MAP tags still win
+    before this fallback is reached.
+    """
+    text = re.sub(r'[^a-z0-9]+', '', ' '.join(
+        str(part or '') for part in (concept, presentation_label)).casefold())
+    if not text:
+        return None
+
+    has_debt = any(token in text for token in (
+        'debt', 'borrowing', 'loan', 'note', 'bond', 'commercialpaper',
+        'lineofcredit', 'creditfacility', 'revolvingcredit', 'termfacility',
+        'financelease', 'capitallease'))
+    if not has_debt:
+        return None
+
+    # These describe expense, valuation, balances, or noncash accounting rather
+    # than principal cash issued/repaid during the period.
+    if any(token in text for token in (
+            'noncash', 'interest', 'amortization', 'accretion',
+            'extinguishmentgain', 'extinguishmentloss', 'modificationgain',
+            'modificationloss', 'carryingamount', 'fairvalue',
+            'principalamountoutstanding', 'debtoutstanding', 'balance',
+            'maturityschedule', 'maturitiesschedule', 'weightedaverage',
+            'covenant', 'commitmentfee', 'unusedcommitment')):
+        return None
+
+    # Combined proceeds/repayments concepts are signed net changes, not gross
+    # issuance or repayment.  Restrict this fallback to the short/LOC family,
+    # where the taxonomy commonly provides such concepts.
+    combined_direction = (
+        ('proceedsfromrepayment' in text
+         or ('proceeds' in text and 'repayment' in text))
+        and any(token in text for token in (
+            'shortterm', 'commercialpaper', 'lineofcredit',
+            'creditfacility', 'revolvingcredit')))
+    if combined_direction:
+        return 'Net Change in Short-term Debt'
+
+    issued = any(token in text for token in (
+        'proceedsfrom', 'netproceedsfrom', 'cashproceedsfrom',
+        'borrowingsunder', 'issuanceof', 'issueddebt', 'debtissued'))
+    repaid = any(token in text for token in (
+        'repayment', 'repayments', 'principalpayment', 'principalrepayment',
+        'paymentsofprincipal', 'redemptionof', 'retirementofdebt',
+        'debtprepayment', 'prepaymentofdebt'))
+    if issued == repaid:
+        return None
+
+    suffix = 'Issued' if issued else 'Repaid'
+    if any(token in text for token in (
+            'lineofcredit', 'creditfacility', 'revolvingcredit')):
+        return f'Lines of Credit {suffix}'
+    if any(token in text for token in (
+            'shortterm', 'commercialpaper')):
+        return f'Short-term Debt {suffix}'
+    if any(token in text for token in (
+            'longterm', 'senior', 'subordinated', 'secured', 'unsecured',
+            'convertible', 'termloan', 'termfacility', 'mediumtermnote',
+            'financelease', 'capitallease', 'note', 'bond')):
+        return f'Long-term Debt {suffix}'
+    return f'Total Debt {suffix}'
+
+
+def _register_debt_cash_flow_alias(concept, target_label):
+    """Register one strictly classified financing-face debt extension."""
+    if not concept or target_label not in (
+            _DEBT_GROSS_LABELS | {'Net Change in Short-term Debt'}):
+        return False
+    info = CONCEPT_MAP.get(target_label)
+    if not isinstance(info, dict):
+        return False
+    tags = info.setdefault('tags', [])
+    if concept not in tags:
+        tags.append(concept)
+    _CONCEPT_TAG_TO_LABEL[concept] = target_label
+    _FUZZY_CACHE[concept] = target_label
+    return True
+
+
 def _fact_has_share_count_unit(row):
     """Return True only when available unit metadata explicitly says shares.
 
@@ -6802,6 +6888,13 @@ def learn_statement_concepts(xbrl) -> int:
                         _register_equity_issuance_alias(concept, _equity_target)
                         last_anchor = _equity_target
                         continue
+                    _debt_target = _classify_debt_cash_flow_line(
+                        concept, _face_label)
+                    if (_debt_target
+                            and _register_debt_cash_flow_alias(
+                                concept, _debt_target)):
+                        last_anchor = _debt_target
+                        continue
 
                 # Exact-mapped concept: normally nothing to learn (it
                 # anchors later learned lines) -- UNLESS the company never
@@ -11296,6 +11389,399 @@ _DEBT_REPAID_COMPONENT_LABELS = (
 )
 _DEBT_COMPONENT_LABELS = frozenset(
     _DEBT_ISSUED_COMPONENT_LABELS + _DEBT_REPAID_COMPONENT_LABELS)
+_DEBT_TOTAL_GROSS_LABELS = (
+    'Total Debt Issued',
+    'Total Debt Repaid',
+)
+_DEBT_GROSS_LABELS = frozenset(
+    _DEBT_ISSUED_COMPONENT_LABELS
+    + _DEBT_REPAID_COMPONENT_LABELS
+    + _DEBT_TOTAL_GROSS_LABELS)
+
+# Debt cash-flow facts need a stricter aggregation model than ordinary mapped
+# labels. A filer can report both a broad statement-face aggregate and several
+# footnote/detail concepts under the same normalized label. Conversely, some
+# filers report only disjoint detail concepts that must be added together. The
+# generic pivot winner-takes-one rule cannot distinguish those cases.
+#
+# Only concepts whose taxonomy meaning is itself a family aggregate are listed
+# here. Subtype concepts (commercial paper, senior notes, secured debt,
+# finance-lease principal, etc.) remain additive details unless a broader
+# selected concept is proven to contain them through the calculation linkbase.
+_DEBT_KNOWN_AGGREGATE_CONCEPTS_BY_LABEL = {
+    'Short-term Debt Issued': frozenset({
+        'ProceedsFromIssuanceOfShortTermDebt',
+        'ProceedsFromShortTermDebt',
+    }),
+    'Short-term Debt Repaid': frozenset({
+        'RepaymentsOfShortTermDebt',
+        'PaymentsForRepaymentsOfShortTermDebt',
+    }),
+    'Lines of Credit Issued': frozenset({
+        'ProceedsFromLinesOfCredit',
+    }),
+    'Lines of Credit Repaid': frozenset({
+        'RepaymentsOfLinesOfCredit',
+    }),
+    'Long-term Debt Issued': frozenset({
+        'ProceedsFromIssuanceOfLongTermDebt',
+        'ProceedsFromIssuanceOfLongTermDebtAndCapitalSecuritiesNet',
+    }),
+    'Long-term Debt Repaid': frozenset({
+        'RepaymentsOfLongTermDebt',
+        'RepaymentsOfLongTermDebtAndCapitalSecurities',
+    }),
+    'Total Debt Issued': frozenset({
+        'ProceedsFromIssuanceOfDebt',
+        'ProceedsFromDebtNetOfIssuanceCosts',
+    }),
+    'Total Debt Repaid': frozenset({
+        'RepaymentsOfDebt',
+        'RepaymentsOfDebtAndCapitalLeaseObligations',
+    }),
+}
+_DEBT_COMBINED_SUBFAMILY_AGGREGATE_CONCEPTS = frozenset({
+    'RepaymentsOfDebtAndCapitalLeaseObligations',
+})
+
+
+def _debt_local_concept(concept):
+    """Return a namespace-free concrete debt concept name."""
+    if concept is None:
+        return ''
+    try:
+        if pd.isna(concept):
+            return ''
+    except Exception:
+        pass
+    text = str(concept).strip()
+    return text.split(':')[-1] if text else ''
+
+
+def _debt_concept_subfamily(concept):
+    """Partition independently additive debt and finance-lease cash flows."""
+    local = _debt_local_concept(concept)
+    compact = re.sub(r'[^a-z0-9]+', '', local.casefold())
+    if 'financelease' in compact or 'capitallease' in compact:
+        return 'finance_lease'
+    return 'debt'
+
+
+def _debt_value_tolerance(*values):
+    """Materiality tolerance for exact debt cash-flow identities."""
+    finite = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number):
+            finite.append(abs(number))
+    scale = max(finite, default=0.0)
+    # XBRL facts are already scaled to currency units.  A fixed $1M floor can
+    # hide a complete contradiction for smaller issuers, so use a strict 0.1%
+    # identity tolerance with only a one-dollar numerical floor.
+    return max(1.0, scale * 0.001)
+
+
+def _debt_concept_is_ancestor(ancestor, descendant, max_hops=7):
+    """Whether ``ancestor`` contains ``descendant`` in the calc linkbase."""
+    ancestor = _debt_local_concept(ancestor)
+    descendant = _debt_local_concept(descendant)
+    if not ancestor or not descendant or ancestor == descendant:
+        return bool(ancestor and ancestor == descendant)
+    frontier = {descendant}
+    seen = set()
+    for _ in range(max_hops):
+        nxt = set()
+        for child in frontier:
+            if child in seen:
+                continue
+            seen.add(child)
+            for parent, _weight in GLOBAL_CALC_PARENT.get(child, ()):
+                parent = _debt_local_concept(parent)
+                if parent == ancestor:
+                    return True
+                if parent and parent not in seen:
+                    nxt.add(parent)
+        if not nxt:
+            break
+        frontier = nxt
+    return False
+
+
+def _debt_row_is_cash_flow_face(row):
+    """Whether provenance places a debt fact on the financing statement."""
+    concept = _debt_local_concept(row.get('Concept'))
+    presented = _FACE_PRESENTED.get(concept, set())
+    if '3_Cash_Flow' in presented:
+        return True
+    role = str(row.get('SourceTableRole') or '').casefold()
+    return bool('cash' in role and 'flow' in role and 'footnote' not in role)
+
+
+def _debt_row_selection_score(row):
+    """Rank one already-quarterized debt fact by source authority."""
+    concept = _debt_local_concept(row.get('Concept'))
+    face = int(_debt_row_is_cash_flow_face(row))
+    dim_count = pd.to_numeric(
+        pd.Series([row.get('DimCount')]), errors='coerce').iloc[0]
+    dimensionless = int(pd.isna(dim_count) or float(dim_count) == 0.0)
+    calculated_value = row.get('IsCalculated', False)
+    try:
+        calculated = False if pd.isna(calculated_value) else bool(calculated_value)
+    except Exception:
+        calculated = bool(calculated_value)
+    role = str(row.get('SourceTableRole') or '').casefold()
+    statement_role = int(
+        'cash' in role and 'flow' in role and 'footnote' not in role)
+    tag_rank = pd.to_numeric(
+        pd.Series([row.get('TagRank')]), errors='coerce').iloc[0]
+    tag_rank = float(tag_rank) if pd.notna(tag_rank) else 1e9
+    filed = pd.to_datetime(row.get('Filed'), errors='coerce')
+    filed_ns = int(filed.value) if pd.notna(filed) else -1
+    value = pd.to_numeric(
+        pd.Series([row.get('Value')]), errors='coerce').iloc[0]
+    magnitude = abs(float(value)) if pd.notna(value) else -1.0
+    return (
+        face,
+        statement_role,
+        dimensionless,
+        int(not calculated),
+        -tag_rank,
+        filed_ns,
+        magnitude,
+        concept,
+    )
+
+
+def _aggregate_debt_gross_rows(final_df, incomplete_concept_periods):
+    """Aggregate independently quarterized debt concepts without overlap.
+
+    The ordinary pivot path intentionally selects one fact per normalized
+    label/period. Debt is different: subtype concepts can be additive, while a
+    statement-face aggregate must replace its footnote/details. This helper is
+    called before the final label/period dedup and returns exactly one source-
+    traceable gross value per debt label and period.
+
+    ``incomplete_concept_periods`` contains ``(label, concept, period)`` triples
+    for non-zero cumulative facts whose exact discrete quarter could not be
+    proven. An unresolved detail blocks a summed detail result, but it does not
+    block a broader selected aggregate that contains the detail.
+    """
+    if final_df is None or final_df.empty:
+        return final_df, set()
+
+    debt_mask = (
+        final_df['Category'].astype(str).eq('3_Cash_Flow')
+        & final_df['Label'].astype(str).isin(_DEBT_GROSS_LABELS)
+    )
+    if not debt_mask.any() and not incomplete_concept_periods:
+        return final_df, set()
+
+    unresolved = defaultdict(set)
+    for item in incomplete_concept_periods or ():
+        if not isinstance(item, (tuple, list)) or len(item) != 3:
+            continue
+        label, concept, period = item
+        unresolved[(str(label), str(period))].add(
+            _debt_local_concept(concept))
+
+    non_debt = final_df.loc[~debt_mask].copy()
+    debt = final_df.loc[debt_mask].copy()
+    grouped_rows = []
+    incomplete_label_periods = set()
+    candidate_keys = {
+        (str(label), str(period))
+        for label, period in zip(
+            debt.get('Label', pd.Series(dtype=object)),
+            debt.get('Period', pd.Series(dtype=object)))
+    }
+    all_keys = sorted(candidate_keys | set(unresolved), key=str)
+
+    for label, period in all_keys:
+        rows = debt[
+            debt['Label'].astype(str).eq(label)
+            & debt['Period'].astype(str).eq(period)
+        ].copy()
+
+        invalid_concepts = set()
+        if not rows.empty:
+            rows['_DebtNumericValue'] = pd.to_numeric(
+                rows['Value'], errors='coerce')
+            bad = rows['_DebtNumericValue'].isna() | (
+                rows['_DebtNumericValue'] < -1e-9)
+            invalid_concepts.update(
+                _debt_local_concept(value)
+                for value in rows.loc[bad, 'Concept'])
+            rows = rows.loc[~bad].copy()
+
+        # Keep the strongest quarterized row for each exact concept. This
+        # removes filing-vintage duplicates without merging distinct concepts.
+        concept_rows = []
+        if not rows.empty:
+            rows['_DebtLocalConcept'] = rows['Concept'].map(
+                _debt_local_concept)
+            for _concept, concept_group in rows.groupby(
+                    '_DebtLocalConcept', sort=False, dropna=False):
+                best_index = max(
+                    concept_group.index,
+                    key=lambda index: _debt_row_selection_score(
+                        concept_group.loc[index]))
+                concept_rows.append(concept_group.loc[best_index].copy())
+
+        aggregate_concepts = _DEBT_KNOWN_AGGREGATE_CONCEPTS_BY_LABEL.get(
+            label, frozenset())
+        face_concept_rows = [
+            row for row in concept_rows
+            if _debt_row_is_cash_flow_face(row)
+        ]
+        combined_aggregate_rows = [
+            row for row in concept_rows
+            if _debt_local_concept(row.get('Concept'))
+            in _DEBT_COMBINED_SUBFAMILY_AGGREGATE_CONCEPTS
+            and (not face_concept_rows
+                 or _debt_row_is_cash_flow_face(row))
+        ]
+
+        selected_rows = []
+        aggregate_selected_families = set()
+        face_selected_families = set()
+        combined_aggregate_selected = False
+        if combined_aggregate_rows:
+            selected_rows = [max(
+                combined_aggregate_rows, key=_debt_row_selection_score)]
+            combined_aggregate_selected = True
+        else:
+            rows_by_subfamily = defaultdict(list)
+            for row in concept_rows:
+                rows_by_subfamily[_debt_concept_subfamily(
+                    row.get('Concept'))].append(row)
+
+            for subfamily, family_rows in sorted(
+                    rows_by_subfamily.items(), key=lambda item: item[0]):
+                # The cash-flow statement is the authoritative scope.  When it
+                # supplies rows for this subfamily, footnote facts are evidence
+                # and diagnostics only; summing them into the face amount would
+                # double count the same financing activity.  Multiple face rows
+                # remain additive unless an aggregate/lineage relationship says
+                # otherwise.
+                family_face_rows = [
+                    row for row in family_rows
+                    if _debt_row_is_cash_flow_face(row)
+                ]
+                if family_face_rows:
+                    family_rows = family_face_rows
+                    face_selected_families.add(subfamily)
+                family_aggregates = [
+                    row for row in family_rows
+                    if _debt_local_concept(row.get('Concept'))
+                    in aggregate_concepts
+                ]
+                if family_aggregates:
+                    selected_rows.append(max(
+                        family_aggregates, key=_debt_row_selection_score))
+                    aggregate_selected_families.add(subfamily)
+                    continue
+
+                # Without a known aggregate, retain only the broadest
+                # non-overlapping concepts inside this independently additive
+                # subfamily. A debt aggregate does not suppress finance-lease
+                # principal unless the taxonomy concept explicitly combines the
+                # two families.
+                family_selected = []
+                ordered = sorted(
+                    family_rows, key=_debt_row_selection_score, reverse=True)
+                for candidate in ordered:
+                    candidate_concept = _debt_local_concept(
+                        candidate.get('Concept'))
+                    if any(_debt_concept_is_ancestor(
+                            _debt_local_concept(current.get('Concept')),
+                            candidate_concept)
+                           for current in family_selected):
+                        continue
+                    descendant_concepts = {
+                        _debt_local_concept(current.get('Concept'))
+                        for current in family_selected
+                        if _debt_concept_is_ancestor(
+                            candidate_concept,
+                            _debt_local_concept(current.get('Concept')))
+                    }
+                    if descendant_concepts:
+                        family_selected = [
+                            current for current in family_selected
+                            if _debt_local_concept(current.get('Concept'))
+                            not in descendant_concepts]
+                    family_selected.append(candidate)
+                selected_rows.extend(family_selected)
+
+        unresolved_concepts = set(unresolved.get((label, period), set()))
+        unresolved_concepts.update(invalid_concepts)
+        selected_concepts = {
+            _debt_local_concept(row.get('Concept')) for row in selected_rows
+        }
+        uncovered = set()
+        if unresolved_concepts and not combined_aggregate_selected:
+            for concept in unresolved_concepts:
+                if not concept:
+                    uncovered.add(concept)
+                    continue
+                subfamily = _debt_concept_subfamily(concept)
+                if subfamily in aggregate_selected_families:
+                    continue
+                if (subfamily in face_selected_families
+                        and '3_Cash_Flow' not in _FACE_PRESENTED.get(
+                            concept, set())):
+                    # A complete cash-flow-face row defines the statement scope;
+                    # an unresolved footnote detail must not make that canonical
+                    # amount incomplete.  An unresolved face concept still
+                    # blocks the result because it may be an additive line.
+                    continue
+                if any(
+                        _debt_concept_subfamily(selected) == subfamily
+                        and _debt_concept_is_ancestor(selected, concept)
+                        for selected in selected_concepts):
+                    continue
+                uncovered.add(concept)
+        if uncovered or (unresolved_concepts and not selected_rows):
+            incomplete_label_periods.add((label, period))
+
+        if not selected_rows:
+            continue
+
+        total_value = sum(float(row['_DebtNumericValue'])
+                          for row in selected_rows)
+        representative = max(
+            selected_rows, key=_debt_row_selection_score).copy()
+        representative['Value'] = total_value
+        if len(selected_rows) > 1:
+            concepts = sorted(
+                _debt_local_concept(row.get('Concept'))
+                for row in selected_rows)
+            representative['Concept'] = 'CalculatedDebtAggregate'
+            representative['IsCalculated'] = True
+            representative['SourcePeriodRole'] = 'derived_discrete'
+            representative['SourceDerivation'] = (
+                'sum_nonoverlapping_exact_concept_debt_cash_flows')
+            representative['SourceDerivationFormula'] = ' + '.join(concepts)
+            representative['SourceDerivationConcepts'] = ';'.join(concepts)
+        grouped_rows.append(representative)
+
+    debt_out = pd.DataFrame(grouped_rows).drop(
+        columns=['_DebtNumericValue', '_DebtLocalConcept'], errors='ignore')
+    if debt_out.empty:
+        result = non_debt
+    else:
+        ordered_columns = list(dict.fromkeys(
+            list(final_df.columns) + list(debt_out.columns)))
+        result = pd.concat(
+            [non_debt.reindex(columns=ordered_columns),
+             debt_out.reindex(columns=ordered_columns)],
+            ignore_index=True, sort=False)
+    result.attrs.update(dict(getattr(final_df, 'attrs', {}) or {}))
+    return result, incomplete_label_periods
+
+
 _INCOMPLETE_DEBT_COMPONENT_PERIODS_ATTR = (
     'incomplete_debt_component_periods')
 _ADDITIVE_CAPEX_DETAIL_PERIODS_ATTR = 'additive_capex_detail_periods'
@@ -13989,6 +14475,14 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
             _equity_target = _classify_equity_issuance_line(concept)
             if _equity_target:
                 target_labels = (_equity_target,)
+
+        # Debt extensions need direction-aware classification before the broad
+        # fuzzy resolver.  This prevents debt balances, interest, issuance
+        # costs, and maturity schedules from entering principal cash flows.
+        if not target_labels and isinstance(val, (int, float)):
+            _debt_target = _classify_debt_cash_flow_line(concept)
+            if _debt_target:
+                target_labels = (_debt_target,)
 
         # If not matched directly, use fuzzy matcher for numeric facts (ignore text blocks)
         if not target_labels and 'TextBlock' not in concept and isinstance(val, (int, float)):
@@ -21081,6 +21575,12 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     _cf_annual_df = df[_cf_ann_mask]
     if not _cf_annual_df.empty:
         for (lbl, end, dur), grp in _cf_annual_df.groupby(['Label', 'End', 'Duration']):
+            # Debt concepts are intentionally retained and quarterized
+            # independently later. A label-level quarterly sum can mix
+            # aggregates and instrument details, so it is not valid evidence
+            # for dropping any annual debt concept here.
+            if lbl in _DEBT_GROSS_LABELS:
+                continue
             if len(grp) < 2:
                 continue
             fy_val = grp['FY'].iloc[0]
@@ -21429,13 +21929,26 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     # by category so their stronger aspect-aware arbitration remains isolated.
     df['_OperatingGroupCategory'] = np.where(
         _operating_fact_mask(df), df['Category'].fillna('').astype(str), '')
+    # Debt gross flows are quarterized by exact concept before they are
+    # aggregated back to one normalized row.  This prevents arithmetic such as
+    # current-YTD concept A minus prior-YTD concept B, the source of UBER's
+    # negative gross repayment artifacts and many missing net rows.
+    _debt_gross_mask = (
+        df['Category'].astype(str).eq('3_Cash_Flow')
+        & df['Label'].astype(str).isin(_DEBT_GROSS_LABELS)
+    )
+    df['_DebtGroupConcept'] = np.where(
+        _debt_gross_mask,
+        df['Concept'].fillna('').astype(str),
+        '',
+    )
     _best_val_ordinal = '_BestValOriginalOrdinal'
     while _best_val_ordinal in df.columns:
         _best_val_ordinal += '_'
     df[_best_val_ordinal] = np.arange(len(df), dtype=np.int64)
 
     final_rows = []
-    _incomplete_debt_component_periods = set()
+    _incomplete_debt_concept_periods = set()
 
     # These three helpers and their per-group caches were previously
     # redefined on every loop iteration.  Defined once here, they capture
@@ -22192,8 +22705,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             row[f'SourceDerivation{key}'] = operand
         return row
 
-    for (_group_category, label, fy), group in df.groupby(
-            ['_OperatingGroupCategory', 'Label', 'FY']):
+    for (_group_category, label, fy, _debt_group_concept), group in df.groupby(
+            ['_OperatingGroupCategory', 'Label', 'FY', '_DebtGroupConcept']):
         cat = (_group_category if _group_category
                else group['Category'].iloc[0])
         _q_group_cache.clear()
@@ -23154,8 +23667,11 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                             for zero_candidate, zero_quarters in zero
                         )
                         if not proven_zero:
-                            _incomplete_debt_component_periods.add(
-                                (str(label), f'{int(fy)}-{qn}'))
+                            _incomplete_debt_concept_periods.add((
+                                str(label),
+                                str(debt_concept),
+                                f'{int(fy)}-{qn}',
+                            ))
 
         for qn in ['Q1', 'Q2', 'Q3', 'Q4']:
             val = q_vals[qn]
@@ -23204,7 +23720,10 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     final_df = pd.DataFrame(final_rows)
     if final_df.empty: return pd.DataFrame()
     final_df = final_df.drop(
-        columns=[_best_val_ordinal], errors='ignore')
+        columns=[_best_val_ordinal, '_DebtGroupConcept'], errors='ignore')
+    (final_df,
+     _incomplete_debt_component_periods) = _aggregate_debt_gross_rows(
+         final_df, _incomplete_debt_concept_periods)
     _final_operating_mask = final_df['Category'].eq(
         OPERATING_METRICS_CATEGORY)
     _final_non_operating = final_df.loc[~_final_operating_mask].sort_values(
@@ -23284,8 +23803,24 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                       + (" ..." if len(_nofacts) > 10 else ""))
     except Exception:
         pass
+    # Normalize source debt rows before KPI generation and use the normalized
+    # pivot as the base output.  KPI-only emission cannot delete a corrupt source
+    # cell and previously lost newly derived gross totals when no source row
+    # existed, so rebuilding the base long form from this pivot is required.
+    pivoted_temp = _repair_total_net_debt_from_components(pivoted_temp)
+    fact_audit = pivoted_temp.attrs.get('fact_audit', fact_audit)
     kpi_long = calculate_kpis(pivoted_temp, is_reit=is_reit)
-    final_long = pd.concat([final_df[['Category', 'Label', 'Period', 'Value']], kpi_long], ignore_index=True)
+    _normalized_for_melt = pivoted_temp.copy(deep=False)
+    _normalized_for_melt.attrs = {}
+    _normalized_base_long = (
+        _normalized_for_melt.rename_axis(
+            index=['Category', 'Label'], columns='Period')
+        .reset_index()
+        .melt(id_vars=['Category', 'Label'],
+              var_name='Period', value_name='Value')
+        .dropna(subset=['Value'])
+    )
+    final_long = pd.concat([_normalized_base_long, kpi_long], ignore_index=True)
     final_long = final_long.drop_duplicates(subset=['Category', 'Label', 'Period'], keep='last')
     final_pivot = final_long.pivot(index=['Category', 'Label'], columns='Period', values='Value')
     import json
@@ -24753,162 +25288,688 @@ def _has_authoritative_fact_audit(df: pd.DataFrame) -> bool:
 
 
 def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
-    """Refresh Total Net Debt Issued (Repaid) with layered debt evidence.
+    """Rebuild gross and net debt rows from validated, non-overlapping evidence.
 
-    Priority by period:
-      1) if both gross total issued and repaid are visible, net = issued - repaid;
-      2) otherwise combine available short-term, long-term, and line-of-credit
-         component evidence exactly once;
-      3) otherwise preserve a directly reported net-debt fact.  A one-sided
-         aggregate gross row alone is not proof that the missing side was zero.
+    Debt totals are exact cash-flow identities, but source filings vary between
+    broad aggregates, instrument details, and directly reported net changes.
+    The repair therefore applies these rules independently for every period:
 
-    This fixes AVGO-style periods where total repayments exist but the old net
-    row stayed at zero, while preserving UNH-style periods where the correct net
-    line is short-term net change plus long-term debt activity.
+      1) reject negative gross issued/repaid values;
+      2) reject a direct total that is materially below known components;
+      3) otherwise preserve a valid direct total, including broader activity not
+         represented by the available component rows;
+      4) derive family and total net rows from a complete gross pair;
+      5) when exactly one gross side has validated activity, treat the truly
+         absent opposite side as zero only if no incomplete, rejected, or
+         overlapping source evidence exists for that side;
+      6) use non-overlapping family nets when no gross total pair exists;
+      7) preserve a directly reported net fact only as the final fallback.
+
+    This one-sided zero rule reflects cash-flow-statement presentation: filers
+    commonly omit an issuance or repayment line when there was no activity. It
+    never converts a known-incomplete, invalid, or scope-ambiguous cell to zero,
+    and it never fills periods where both gross sides are absent.
     """
     if df is None or df.empty:
         return df
+
     idx = df.columns
     authoritative_audit = _has_authoritative_fact_audit(df)
+    issues = []
+    zero_inferences = []
 
-    def ser(label):
+    def visible_ser(label):
         key = ('3_Cash_Flow', label)
-        return pd.to_numeric(df.loc[key], errors='coerce') if key in df.index else pd.Series(np.nan, index=idx)
+        if key not in df.index:
+            return pd.Series(np.nan, index=idx, dtype=float)
+        return pd.to_numeric(df.loc[key], errors='coerce').reindex(idx)
 
-    def evidenced_ser(label):
-        if authoritative_audit:
-            return _fact_audit_output_series(
-                df, '3_Cash_Flow', label).reindex(idx)
-        return ser(label)
+    def source_ser(label):
+        if not authoritative_audit:
+            return visible_ser(label)
+        audited = _fact_audit_output_series(
+            df, '3_Cash_Flow', label).reindex(idx)
+        # Derived rows created after the fact audit (especially normalized net
+        # rows) remain available as fallback, but source-backed gross facts win.
+        return audited.combine_first(visible_ser(label))
 
-    def first_nonmissing(*series):
-        out = pd.Series(np.nan, index=idx)
-        for s in series:
-            out = out.where(out.notna(), s)
-        return out
+    gross_rejected = {}
 
-    issued_direct = evidenced_ser('Total Debt Issued')
-    repaid_direct = evidenced_ser('Total Debt Repaid')
-    net_existing = evidenced_ser('Total Net Debt Issued (Repaid)')
+    def clean_gross(label):
+        series = source_ser(label).copy()
+        negative = series.notna() & (series < -1e-9)
+        gross_rejected[str(label)] = negative.copy()
+        if negative.any():
+            for period in series.index[negative]:
+                issues.append({
+                    'period': str(period),
+                    'label': label,
+                    'reason': 'negative_gross_rejected',
+                    'value': float(series.loc[period]),
+                })
+            series[negative] = np.nan
+        # Suppress microscopic floating-point negatives/positives around zero.
+        near_zero = series.notna() & (series.abs() <= 1e-9)
+        series[near_zero] = 0.0
+        return series
 
-    st_issued = evidenced_ser('Short-term Debt Issued')
-    st_repaid = evidenced_ser('Short-term Debt Repaid')
-    st_normalized_direct = evidenced_ser(
-        'Net Short-Term Debt Issued (Repaid)')
-    short_change_direct = evidenced_ser('Net Change in Short-term Debt')
+    audit = df.attrs.get('fact_audit')
+    _debt_concept_cache = {}
+
+    def provenance_concepts(label, period):
+        """Return exact concepts represented by one selected debt cell."""
+        key = (str(label), str(period))
+        if key in _debt_concept_cache:
+            return _debt_concept_cache[key]
+        concepts = set()
+        required = {'Category', 'Label', 'Period', 'Concept'}
+        if (authoritative_audit and isinstance(audit, pd.DataFrame)
+                and required.issubset(audit.columns)):
+            selected = audit[
+                audit['Category'].astype(str).eq('3_Cash_Flow')
+                & audit['Label'].astype(str).eq(str(label))
+                & audit['Period'].astype(str).eq(str(period))
+            ]
+            if not selected.empty:
+                row = selected.iloc[0]
+                derivation_concepts = row.get(
+                    'SourceDerivationConcepts', None)
+                if (derivation_concepts is not None
+                        and not pd.isna(derivation_concepts)
+                        and str(derivation_concepts).strip()):
+                    concepts.update(
+                        _debt_local_concept(value)
+                        for value in str(derivation_concepts).split(';')
+                        if _debt_local_concept(value))
+                concept = _debt_local_concept(row.get('Concept'))
+                if concept and concept != 'CalculatedDebtAggregate':
+                    concepts.add(concept)
+        _debt_concept_cache[key] = frozenset(concepts)
+        return _debt_concept_cache[key]
+
+    def concept_set_contains(broader, narrower):
+        if not broader or not narrower:
+            return False
+        return all(any(_debt_concept_is_ancestor(parent, child)
+                       for parent in broader)
+                   for child in narrower)
+
+    def possible_unproven_loc_overlap(left_label, left_concepts,
+                                      right_label, right_concepts):
+        labels = {str(left_label), str(right_label)}
+        loc_labels = {'Lines of Credit Issued', 'Lines of Credit Repaid'}
+        if not labels.intersection(loc_labels):
+            return False
+        other_label = (right_label if left_label in loc_labels else left_label)
+        other_concepts = (
+            right_concepts if left_label in loc_labels else left_concepts)
+        if not other_concepts:
+            return True
+        aggregate_concepts = _DEBT_KNOWN_AGGREGATE_CONCEPTS_BY_LABEL.get(
+            str(other_label), frozenset())
+        for concept in other_concepts:
+            compact = re.sub(
+                r'[^a-z0-9]+', '', str(concept).casefold())
+            if (concept in aggregate_concepts
+                    or any(token in compact for token in (
+                        'lineofcredit', 'creditfacility',
+                        'revolvingcredit'))):
+                return True
+        return False
+
+    def component_sum(labels, incomplete_mask, gross_values):
+        """Sum only component rows proven not to overlap in each period."""
+        evidence = pd.Series(False, index=idx)
+        total = pd.Series(np.nan, index=idx, dtype=float)
+        ambiguous = pd.Series(False, index=idx, dtype=bool)
+        for period in idx:
+            all_active = [
+                {
+                    'label': label,
+                    'value': float(gross_values[label].loc[period]),
+                    'concepts': provenance_concepts(label, period),
+                }
+                for label in labels
+                if pd.notna(gross_values[label].loc[period])
+            ]
+            evidence.loc[period] = bool(all_active)
+            if not all_active or bool(incomplete_mask.loc[period]):
+                continue
+
+            # An explicit zero proves that the family contributed no cash in
+            # this period. It cannot overlap or double-count a nonzero family,
+            # so exclude it from lineage arbitration. If every filed component
+            # is zero, the validated component total is exactly zero.
+            active = [
+                item for item in all_active
+                if abs(item['value']) > 1e-9
+            ]
+            if not active:
+                total.loc[period] = 0.0
+                continue
+            selected = list(range(len(active)))
+            unresolved_overlap = False
+            for left_pos in range(len(active)):
+                if left_pos not in selected:
+                    continue
+                for right_pos in range(left_pos + 1, len(active)):
+                    if right_pos not in selected:
+                        continue
+                    left = active[left_pos]
+                    right = active[right_pos]
+                    left_contains = concept_set_contains(
+                        left['concepts'], right['concepts'])
+                    right_contains = concept_set_contains(
+                        right['concepts'], left['concepts'])
+                    if left_contains and right_contains:
+                        tolerance = _debt_value_tolerance(
+                            left['value'], right['value'])
+                        if abs(left['value'] - right['value']) <= tolerance:
+                            selected.remove(right_pos)
+                        else:
+                            unresolved_overlap = True
+                        continue
+                    if left_contains:
+                        tolerance = _debt_value_tolerance(
+                            left['value'], right['value'])
+                        if left['value'] + tolerance >= right['value']:
+                            selected.remove(right_pos)
+                        else:
+                            unresolved_overlap = True
+                        continue
+                    if right_contains:
+                        tolerance = _debt_value_tolerance(
+                            left['value'], right['value'])
+                        if right['value'] + tolerance >= left['value']:
+                            selected.remove(left_pos)
+                            break
+                        unresolved_overlap = True
+                        continue
+                    linked = any(
+                        _debt_concept_is_ancestor(left_concept, right_concept)
+                        or _debt_concept_is_ancestor(
+                            right_concept, left_concept)
+                        for left_concept in left['concepts']
+                        for right_concept in right['concepts'])
+                    if (linked or possible_unproven_loc_overlap(
+                            left['label'], left['concepts'],
+                            right['label'], right['concepts'])):
+                        unresolved_overlap = True
+            if unresolved_overlap:
+                ambiguous.loc[period] = True
+                issues.append({
+                    'period': str(period),
+                    'label': ' + '.join(labels),
+                    'reason': 'component_scope_overlap_unresolved',
+                })
+                continue
+            if selected:
+                total.loc[period] = sum(
+                    active[position]['value'] for position in selected)
+        return total, evidence, ambiguous
+
+    total_rejected = {}
+
+    def select_total(label, direct, components, component_evidence,
+                     component_floor):
+        selected = direct.copy()
+        contradiction = pd.Series(False, index=idx, dtype=bool)
+
+        # Even when additive scope among components is unresolved, a genuine
+        # total cannot be below any one included gross component. Use the
+        # largest visible component as a containment floor, while reserving the
+        # summed component series for periods whose non-overlap is proven.
+        comparison = components.combine_first(component_floor)
+        comparable = direct.notna() & comparison.notna()
+        for period in idx[comparable]:
+            direct_value = float(direct.loc[period])
+            component_value = float(comparison.loc[period])
+            tolerance = _debt_value_tolerance(
+                direct_value, component_value)
+            if direct_value + tolerance >= component_value:
+                continue
+
+            # Issuance totals can be explicitly reported net of debt issuance
+            # costs while instrument proceeds are reported gross.  That is a
+            # valid cash-flow scope difference, not evidence that the direct
+            # total is a narrower footnote detail.  Prefer explicit provenance;
+            # for legacy CSVs without audit metadata, allow only a small
+            # cost-like shortfall and otherwise fail the containment test.
+            preserve_net_proceeds = False
+            if label == 'Total Debt Issued':
+                direct_concepts = provenance_concepts(label, period)
+                compact_concepts = {
+                    re.sub(r'[^a-z0-9]+', '', concept.casefold())
+                    for concept in direct_concepts
+                }
+                preserve_net_proceeds = any(
+                    any(token in concept for token in (
+                        'netofissuancecost', 'netproceeds',
+                        'afterissuancecost', 'lessissuancecost'))
+                    for concept in compact_concepts)
+                if not authoritative_audit:
+                    shortfall = component_value - direct_value
+                    preserve_net_proceeds = (
+                        shortfall <= max(10_000.0,
+                                         component_value * 0.02))
+            if preserve_net_proceeds:
+                continue
+
+            contradiction.loc[period] = True
+            issues.append({
+                'period': str(period),
+                'label': label,
+                'reason': 'direct_total_below_components',
+                'value': direct_value,
+                'component_value': component_value,
+            })
+        total_rejected[str(label)] = contradiction.copy()
+        selected[contradiction] = np.nan
+        selected = selected.combine_first(components)
+        return selected
+
+    incomplete_issued = _incomplete_debt_component_mask(
+        df, _DEBT_ISSUED_COMPONENT_LABELS)
+    incomplete_repaid = _incomplete_debt_component_mask(
+        df, _DEBT_REPAID_COMPONENT_LABELS)
+    st_issued_incomplete = _incomplete_debt_component_mask(
+        df, 'Short-term Debt Issued')
+    st_repaid_incomplete = _incomplete_debt_component_mask(
+        df, 'Short-term Debt Repaid')
+    lt_issued_incomplete = _incomplete_debt_component_mask(
+        df, 'Long-term Debt Issued')
+    lt_repaid_incomplete = _incomplete_debt_component_mask(
+        df, 'Long-term Debt Repaid')
+    loc_issued_incomplete = _incomplete_debt_component_mask(
+        df, 'Lines of Credit Issued')
+    loc_repaid_incomplete = _incomplete_debt_component_mask(
+        df, 'Lines of Credit Repaid')
+    st_incomplete = st_issued_incomplete | st_repaid_incomplete
+    lt_incomplete = lt_issued_incomplete | lt_repaid_incomplete
+    loc_incomplete = loc_issued_incomplete | loc_repaid_incomplete
+
+    st_issued = clean_gross('Short-term Debt Issued')
+    st_repaid = clean_gross('Short-term Debt Repaid')
+    lt_issued = clean_gross('Long-term Debt Issued')
+    lt_repaid = clean_gross('Long-term Debt Repaid')
+    loc_issued = clean_gross('Lines of Credit Issued')
+    loc_repaid = clean_gross('Lines of Credit Repaid')
+    gross_values = {
+        'Short-term Debt Issued': st_issued,
+        'Short-term Debt Repaid': st_repaid,
+        'Long-term Debt Issued': lt_issued,
+        'Long-term Debt Repaid': lt_repaid,
+        'Lines of Credit Issued': loc_issued,
+        'Lines of Credit Repaid': loc_repaid,
+    }
+
+    (issued_components, issued_component_evidence,
+     issued_component_overlap) = component_sum(
+        _DEBT_ISSUED_COMPONENT_LABELS, incomplete_issued, gross_values)
+    (repaid_components, repaid_component_evidence,
+     repaid_component_overlap) = component_sum(
+        _DEBT_REPAID_COMPONENT_LABELS, incomplete_repaid, gross_values)
+
+    def component_floor(labels):
+        available = [gross_values[label] for label in labels]
+        if not available:
+            return pd.Series(np.nan, index=idx, dtype=float)
+        return pd.concat(available, axis=1).max(axis=1, skipna=True)
+
+    issued_direct = clean_gross('Total Debt Issued')
+    repaid_direct = clean_gross('Total Debt Repaid')
+    issued = select_total(
+        'Total Debt Issued', issued_direct,
+        issued_components, issued_component_evidence,
+        component_floor(_DEBT_ISSUED_COMPONENT_LABELS))
+    repaid = select_total(
+        'Total Debt Repaid', repaid_direct,
+        repaid_components, repaid_component_evidence,
+        component_floor(_DEBT_REPAID_COMPONENT_LABELS))
+
+    def rejected_mask(labels):
+        mask = pd.Series(False, index=idx, dtype=bool)
+        for label in labels:
+            rejected = gross_rejected.get(str(label))
+            if isinstance(rejected, pd.Series):
+                mask = mask | rejected.reindex(idx, fill_value=False)
+        return mask
+
+    def derive_net_with_guarded_zero(
+            family_label, issued_series, repaid_series,
+            issued_zero_blocked, repaid_zero_blocked,
+            pair_invalid=None):
+        """Derive net debt while distinguishing absence from unknown data.
+
+        A missing side is interpreted as zero only when the opposite side has
+        validated gross activity and the missing side has no known-incomplete,
+        rejected, or overlap-ambiguous evidence. Both-missing periods remain
+        unknown. The gross display rows themselves are not filled with inferred
+        zeros; only the normalized net identity uses them.
+        """
+        issued_effective = issued_series.copy()
+        repaid_effective = repaid_series.copy()
+        issued_zero_blocked = issued_zero_blocked.reindex(
+            idx, fill_value=False).astype(bool)
+        repaid_zero_blocked = repaid_zero_blocked.reindex(
+            idx, fill_value=False).astype(bool)
+        if pair_invalid is None:
+            pair_invalid = pd.Series(False, index=idx, dtype=bool)
+        else:
+            pair_invalid = pair_invalid.reindex(
+                idx, fill_value=False).astype(bool)
+
+        infer_issued_zero = (
+            issued_effective.isna()
+            & repaid_effective.notna()
+            & (repaid_effective.abs() > 1e-9)
+            & ~issued_zero_blocked)
+        infer_repaid_zero = (
+            repaid_effective.isna()
+            & issued_effective.notna()
+            & (issued_effective.abs() > 1e-9)
+            & ~repaid_zero_blocked)
+
+        issued_effective[infer_issued_zero] = 0.0
+        repaid_effective[infer_repaid_zero] = 0.0
+
+        for period in idx[infer_issued_zero]:
+            zero_inferences.append({
+                'period': str(period),
+                'label': family_label,
+                'reason': 'absent_issuance_inferred_zero',
+            })
+        for period in idx[infer_repaid_zero]:
+            zero_inferences.append({
+                'period': str(period),
+                'label': family_label,
+                'reason': 'absent_repayment_inferred_zero',
+            })
+
+        complete = (
+            issued_effective.notna()
+            & repaid_effective.notna()
+            & ~pair_invalid)
+        derived = (
+            issued_effective - repaid_effective
+        ).where(complete)
+        return derived, complete
+
+    # Long-term family: validated gross activity on one side is enough to
+    # derive the net when the unreported opposite side is safely absent.
+    lt_existing = visible_ser('Net Long-Term Debt Issued (Repaid)')
+    lt_derived, lt_pair = derive_net_with_guarded_zero(
+        'Net Long-Term Debt Issued (Repaid)',
+        lt_issued, lt_repaid,
+        lt_issued_incomplete
+        | rejected_mask(('Long-term Debt Issued',)),
+        lt_repaid_incomplete
+        | rejected_mask(('Long-term Debt Repaid',)),
+        pair_invalid=(
+            lt_incomplete
+            | rejected_mask((
+                'Long-term Debt Issued', 'Long-term Debt Repaid'))))
+    lt_net = lt_existing.copy()
+    lt_net[lt_pair] = lt_derived[lt_pair]
+
+    # Short-term direct net concepts require scope classification so a generic
+    # ST+LOC change is not added to a separate LOC family a second time.
+    short_change = source_ser('Net Change in Short-term Debt')
     short_change_concepts = _fact_audit_output_series(
         df, '3_Cash_Flow', 'Net Change in Short-term Debt',
         field='Concept').reindex(idx)
     normalized_concepts = short_change_concepts.fillna('').astype(str).str.replace(
         r'[^a-z0-9]+', '', regex=True).str.casefold()
     loc_direct_mask = normalized_concepts.str.contains(
-        r'lines?ofcredit', regex=True) & short_change_direct.notna()
+        r'lines?ofcredit', regex=True) & short_change.notna()
     st_specific_mask = normalized_concepts.str.contains(
-        'commercialpaper', regex=False) & short_change_direct.notna()
-    # Generic short-term net concepts can include lines of credit.  Treat them
-    # as one combined ST+LOC family instead of adding gross LOC activity again.
+        'commercialpaper', regex=False) & short_change.notna()
     combined_short_mask = (
-        short_change_direct.notna() & ~loc_direct_mask & ~st_specific_mask)
+        short_change.notna() & ~loc_direct_mask & ~st_specific_mask)
     if not authoritative_audit:
-        combined_short_mask = short_change_direct.notna()
+        combined_short_mask = short_change.notna()
 
-    st_incomplete = _incomplete_debt_component_mask(
-        df, ('Short-term Debt Issued', 'Short-term Debt Repaid'))
-    st_from_components = (
-        st_issued.fillna(0) - st_repaid.fillna(0)).where(
-            (st_issued.notna() | st_repaid.notna()) & ~st_incomplete)
-    st_family_direct = short_change_direct.where(st_specific_mask)
-    st_family_net = first_nonmissing(st_family_direct, st_from_components)
-    st_display = first_nonmissing(
-        st_normalized_direct, short_change_direct, st_from_components)
+    st_existing = visible_ser('Net Short-Term Debt Issued (Repaid)')
+    st_derived, st_pair = derive_net_with_guarded_zero(
+        'Net Short-Term Debt Issued (Repaid)',
+        st_issued, st_repaid,
+        st_issued_incomplete
+        | rejected_mask(('Short-term Debt Issued',)),
+        st_repaid_incomplete
+        | rejected_mask(('Short-term Debt Repaid',)),
+        pair_invalid=(
+            st_incomplete
+            | rejected_mask((
+                'Short-term Debt Issued', 'Short-term Debt Repaid'))))
+    st_net = st_existing.copy()
+    st_net[st_pair] = st_derived[st_pair]
+    st_direct_mask = st_specific_mask | combined_short_mask
+    st_net[st_direct_mask] = short_change[st_direct_mask]
 
-    lt_issued = evidenced_ser('Long-term Debt Issued')
-    lt_repaid = evidenced_ser('Long-term Debt Repaid')
-    lt_direct = evidenced_ser('Net Long-Term Debt Issued (Repaid)')
-    lt_incomplete = _incomplete_debt_component_mask(
-        df, ('Long-term Debt Issued', 'Long-term Debt Repaid'))
-    lt_from_components = (
-        lt_issued.fillna(0) - lt_repaid.fillna(0)).where(
-            (lt_issued.notna() | lt_repaid.notna()) & ~lt_incomplete)
-    lt_net = first_nonmissing(lt_direct, lt_from_components)
+    loc_derived, loc_pair = derive_net_with_guarded_zero(
+        'Net Lines of Credit Issued (Repaid)',
+        loc_issued, loc_repaid,
+        loc_issued_incomplete
+        | rejected_mask(('Lines of Credit Issued',)),
+        loc_repaid_incomplete
+        | rejected_mask(('Lines of Credit Repaid',)),
+        pair_invalid=(
+            loc_incomplete
+            | rejected_mask((
+                'Lines of Credit Issued', 'Lines of Credit Repaid'))))
+    loc_net = pd.Series(np.nan, index=idx, dtype=float)
+    loc_net[loc_pair] = loc_derived[loc_pair]
+    loc_net[loc_direct_mask] = short_change[loc_direct_mask]
 
-    loc_issued = evidenced_ser('Lines of Credit Issued')
-    loc_repaid = evidenced_ser('Lines of Credit Repaid')
-    loc_incomplete = _incomplete_debt_component_mask(
-        df, ('Lines of Credit Issued', 'Lines of Credit Repaid'))
-    loc_from_components = (loc_issued.fillna(0) - loc_repaid.fillna(0)).where(
-        (loc_issued.notna() | loc_repaid.notna()) & ~loc_incomplete)
-    loc_net = first_nonmissing(
-        short_change_direct.where(loc_direct_mask), loc_from_components)
+    total_issued_blocked = (
+        issued.isna()
+        & (
+            incomplete_issued
+            | issued_component_overlap
+            | rejected_mask(_DEBT_ISSUED_COMPONENT_LABELS)
+            | rejected_mask(('Total Debt Issued',))
+            | total_rejected.get(
+                'Total Debt Issued',
+                pd.Series(False, index=idx, dtype=bool))))
+    total_repaid_blocked = (
+        repaid.isna()
+        & (
+            incomplete_repaid
+            | repaid_component_overlap
+            | rejected_mask(_DEBT_REPAID_COMPONENT_LABELS)
+            | rejected_mask(('Total Debt Repaid',))
+            | total_rejected.get(
+                'Total Debt Repaid',
+                pd.Series(False, index=idx, dtype=bool))))
 
-    short_loc_mask = (
-        combined_short_mask | st_family_net.notna() | loc_net.notna())
-    short_loc_net = st_family_net.fillna(0) + loc_net.fillna(0)
-    short_loc_net[combined_short_mask] = short_change_direct[
-        combined_short_mask]
-    component_mask = short_loc_mask | lt_net.notna()
-    component_net = short_loc_net.fillna(0) + lt_net.fillna(0)
+    total_existing = visible_ser('Total Net Debt Issued (Repaid)')
+    total_derived, total_pair = derive_net_with_guarded_zero(
+        'Total Net Debt Issued (Repaid)',
+        issued, repaid,
+        total_issued_blocked, total_repaid_blocked)
+    total_net = total_existing.copy()
+    total_net[total_pair] = total_derived[total_pair]
 
-    incomplete_issued = _incomplete_debt_component_mask(
-        df, _DEBT_ISSUED_COMPONENT_LABELS)
-    incomplete_repaid = _incomplete_debt_component_mask(
-        df, _DEBT_REPAID_COMPONENT_LABELS)
-    issued_component_mask = (
-        st_issued.notna() | lt_issued.notna() | loc_issued.notna())
-    repaid_component_mask = (
-        st_repaid.notna() | lt_repaid.notna() | loc_repaid.notna())
-    issued_from_components = (
-        st_issued.fillna(0) + lt_issued.fillna(0)
-        + loc_issued.fillna(0)).where(
-            issued_component_mask & ~incomplete_issued)
-    repaid_from_components = (
-        st_repaid.fillna(0) + lt_repaid.fillna(0)
-        + loc_repaid.fillna(0)).where(
-            repaid_component_mask & ~incomplete_repaid)
-    issued = first_nonmissing(issued_direct, issued_from_components)
-    repaid = first_nonmissing(repaid_direct, repaid_from_components)
-    gross_pair = issued.notna() & repaid.notna()
-    gross_net = issued.fillna(0) - repaid.fillna(0)
-
-    # Start from direct reported net facts, then replace only where stronger
-    # evidence is available.
-    net = net_existing.copy()
-
-    # Complete gross totals are the strongest display identity.
-    net[gross_pair] = gross_net[gross_pair]
-
-    # Components are stronger than an incomplete one-sided aggregate because
-    # they never require assuming the missing aggregate side was zero.
+    short_loc_evidence = (
+        combined_short_mask | st_net.notna() | loc_net.notna())
+    short_loc_net = st_net.fillna(0) + loc_net.fillna(0)
+    short_loc_net[combined_short_mask] = short_change[combined_short_mask]
+    family_evidence = short_loc_evidence | lt_net.notna()
+    family_net = short_loc_net.fillna(0) + lt_net.fillna(0)
     any_incomplete = st_incomplete | lt_incomplete | loc_incomplete
-    use_component = component_mask & ~gross_pair & ~any_incomplete
-    net[use_component] = component_net[use_component]
+    component_overlap = issued_component_overlap | repaid_component_overlap
+    use_family = (
+        ~total_pair & total_net.isna() & family_evidence
+        & ~any_incomplete & ~component_overlap)
+    total_net[use_family] = family_net[use_family]
 
     out = df.copy()
-    if authoritative_audit:
-        for gross_label, supported in (
-                ('Total Debt Issued', issued),
-                ('Total Debt Repaid', repaid)):
-            key = ('3_Cash_Flow', gross_label)
-            if supported.notna().any() or key in out.index:
-                out.loc[key, :] = supported.values
 
-    for subtotal_label, incomplete, supported in (
-            ('Net Short-Term Debt Issued (Repaid)', st_incomplete, st_display),
-            ('Net Long-Term Debt Issued (Repaid)', lt_incomplete, lt_net)):
-        subtotal_key = ('3_Cash_Flow', subtotal_label)
-        if authoritative_audit:
-            # Rebuild normalized subtotal rows solely from direct facts or
-            # independently supported gross components.  This clears a stale
-            # KPI rollup without discarding a provable long-term subtotal merely
-            # because a different debt family is incomplete.
-            if supported.notna().any() or subtotal_key in out.index:
-                out.loc[subtotal_key, :] = supported.values
-        elif subtotal_key in out.index and incomplete.any():
-            out.loc[subtotal_key, incomplete.index[incomplete]] = np.nan
+    # Publish cleaned source components as well: a gross debt flow may never be
+    # negative. This also removes legacy cross-concept subtraction artifacts.
+    for label, series in (
+            ('Short-term Debt Issued', st_issued),
+            ('Short-term Debt Repaid', st_repaid),
+            ('Long-term Debt Issued', lt_issued),
+            ('Long-term Debt Repaid', lt_repaid),
+            ('Lines of Credit Issued', loc_issued),
+            ('Lines of Credit Repaid', loc_repaid),
+            ('Total Debt Issued', issued),
+            ('Total Debt Repaid', repaid),
+            ('Net Short-Term Debt Issued (Repaid)', st_net),
+            ('Net Long-Term Debt Issued (Repaid)', lt_net),
+            ('Total Net Debt Issued (Repaid)', total_net)):
+        key = ('3_Cash_Flow', label)
+        if series.notna().any() or key in out.index:
+            out.loc[key, :] = series.values
 
-    total_key = ('3_Cash_Flow', 'Total Net Debt Issued (Repaid)')
-    if net.notna().any() or total_key in out.index:
-        out.loc[total_key, :] = net.values
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+
+    # Keep selected-fact provenance aligned with the published debt cells.  A
+    # repaired total/net row must not continue to advertise the rejected source
+    # value in ``fact_audit`` because later passes intentionally rebuild source
+    # series from that immutable ledger.
+    audit_source = attrs.get('fact_audit')
+    if (authoritative_audit and isinstance(audit_source, pd.DataFrame)):
+        audit_attrs = dict(getattr(audit_source, 'attrs', {}) or {})
+        audit_work = audit_source.copy()
+        for column, default in (
+                ('SourceReportedValue', np.nan),
+                ('SourceDerivation', None),
+                ('SourceDerivationFormula', None),
+                ('SourcePeriodRole', None),
+                ('IsCalculated', False),
+                ('Concept', None)):
+            if column not in audit_work.columns:
+                audit_work[column] = default
+        if 'Ticker' not in audit_work.columns:
+            audit_work['Ticker'] = ''
+        ticker_value = (
+            str(audit_work['Ticker'].dropna().iloc[0])
+            if not audit_work.empty and audit_work['Ticker'].notna().any()
+            else '')
+        debt_audit_labels = (
+            _DEBT_GROSS_LABELS
+            | {
+                'Net Short-Term Debt Issued (Repaid)',
+                'Net Long-Term Debt Issued (Repaid)',
+                'Total Net Debt Issued (Repaid)',
+            })
+        replacement_rows = []
+        remove_indices = set()
+        for label in sorted(debt_audit_labels):
+            key = ('3_Cash_Flow', label)
+            published = (
+                pd.to_numeric(out.loc[key], errors='coerce').reindex(idx)
+                if key in out.index
+                else pd.Series(np.nan, index=idx, dtype=float))
+            for period in idx:
+                mask = (
+                    audit_work['Category'].astype(str).eq('3_Cash_Flow')
+                    & audit_work['Label'].astype(str).eq(str(label))
+                    & audit_work['Period'].astype(str).eq(str(period)))
+                matching = list(audit_work.index[mask])
+                value = published.loc[period]
+                if pd.isna(value):
+                    remove_indices.update(matching)
+                    continue
+                existing_row = (
+                    audit_work.loc[matching[0]].copy()
+                    if matching else pd.Series(dtype=object))
+                existing_value = pd.to_numeric(
+                    existing_row.get('Value', np.nan), errors='coerce')
+                _audit_scale = max(
+                    abs(float(existing_value)) if pd.notna(existing_value) else 0.0,
+                    abs(float(value)), 1.0)
+                value_changed = (
+                    pd.isna(existing_value)
+                    or abs(float(existing_value) - float(value))
+                    > max(1e-6, _audit_scale * 1e-9))
+                if not matching:
+                    value_changed = True
+                if not value_changed:
+                    # One selected output cell must have one audit row.
+                    remove_indices.update(matching[1:])
+                    continue
+                remove_indices.update(matching)
+                row = existing_row.to_dict() if not existing_row.empty else {}
+                row.update({
+                    'Ticker': row.get('Ticker', ticker_value),
+                    'Category': '3_Cash_Flow',
+                    'Label': label,
+                    'Period': str(period),
+                    'Value': float(value),
+                    'SourceReportedValue': (
+                        float(existing_value)
+                        if pd.notna(existing_value) else np.nan),
+                    'Concept': 'CalculatedDebtRepair',
+                    'IsCalculated': True,
+                    'SourcePeriodRole': 'derived_discrete',
+                    'SourceDerivation': 'validated_debt_normalization',
+                    'SourceDerivationFormula': (
+                        'issued - repaid'
+                        if 'Issued (Repaid)' in label
+                        else 'validated non-overlapping debt components'),
+                })
+                replacement_rows.append(row)
+        if remove_indices:
+            audit_work = audit_work.drop(index=list(remove_indices))
+        if replacement_rows:
+            audit_work = pd.concat(
+                [audit_work, pd.DataFrame(replacement_rows)],
+                ignore_index=True, sort=False)
+        sort_columns = [
+            column for column in ('Category', 'Label', 'Period', 'Filed')
+            if column in audit_work.columns]
+        if sort_columns:
+            ascending = [True, True, False, False][:len(sort_columns)]
+            audit_work = audit_work.sort_values(
+                sort_columns, ascending=ascending, kind='stable')
+        audit_work = audit_work.reset_index(drop=True)
+        audit_work.attrs.update(audit_attrs)
+        attrs['fact_audit'] = audit_work
+
+    if zero_inferences:
+        existing_inferences = list(
+            attrs.get('debt_zero_inferences', ()) or ())
+        seen_inferences = {
+            tuple(sorted((str(key), repr(value))
+                         for key, value in inference.items()))
+            for inference in existing_inferences
+            if isinstance(inference, dict)
+        }
+        for inference in zero_inferences:
+            signature = tuple(sorted(
+                (str(key), repr(value))
+                for key, value in inference.items()))
+            if signature in seen_inferences:
+                continue
+            existing_inferences.append(inference)
+            seen_inferences.add(signature)
+        attrs['debt_zero_inferences'] = existing_inferences
+
+    if issues:
+        existing = list(attrs.get('debt_quality_issues', ()) or ())
+        seen = {
+            tuple(sorted((str(key), repr(value))
+                         for key, value in issue.items()))
+            for issue in existing if isinstance(issue, dict)
+        }
+        added = 0
+        for issue in issues:
+            signature = tuple(sorted(
+                (str(key), repr(value)) for key, value in issue.items()))
+            if signature in seen:
+                continue
+            existing.append(issue)
+            seen.add(signature)
+            added += 1
+        attrs['debt_quality_issues'] = existing
+        if added:
+            print(
+                f"  [Debt Validation] Recorded {added} new debt quality "
+                "issue(s); invalid or overlapping cells were rejected.")
+    out.attrs.update(attrs)
     return out
 
 
@@ -29159,6 +30220,11 @@ def calculate_kpis(pivoted, is_reit=False):
 
 def _calculate_kpis_impl(pivoted, is_reit=False):
     _IBM_STYLE_STATE['active'] = False
+    # Normalize debt before any KPI or financing-bridge math consumes it.  The
+    # prior order let the legacy component sum rebuild an already-validated
+    # direct total (including overlapping LOC/ST scopes) and then encode the
+    # wrong amount into the financing residual specification.
+    pivoted = _repair_total_net_debt_from_components(pivoted)
     kpi_rows = []
     _row_cache: dict[tuple[str | None, str], pd.Series] = {}
     _num_cache: dict[tuple[str | None, str], pd.Series] = {}
@@ -29322,41 +30388,17 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     lt_repaid_n     = pd.to_numeric(lt_debt_repaid, errors='coerce').fillna(0)
     loc_repaid_n    = pd.to_numeric(loc_debt_repaid, errors='coerce').fillna(0)
 
-    # Derive missing Total Debt Issued
-    derived_issued = st_issued_n + lt_issued_n + loc_issued_n
+    # Gross totals were already reconciled by the provenance-aware debt
+    # normalizer at function entry.  Do not re-sum ST/LT/LOC here: those rows
+    # can overlap, and debt issuance totals may validly be net of issuance
+    # costs while instrument proceeds are gross.
     issued_raw_n = pd.to_numeric(debt_issued, errors='coerce')
-    issued_n = issued_raw_n.copy()
-    components_issued = (
-        st_debt_issued.notna() | lt_debt_issued.notna()
-        | loc_debt_issued.notna())
-    mask_issued = needs_anomaly_rescue(issued_n, derived_issued, components_issued, is_exact_identity=False)
-    mask_issued = (
-        mask_issued & components_issued & ~incomplete_issued
-        & (derived_issued >= 0))
-    if mask_issued.any():
-        issued_n[mask_issued] = derived_issued[mask_issued]
-        add_val('3_Cash_Flow', 'Total Debt Issued', issued_n[mask_issued])
-        debt_issued = issued_n # update series for missing_gross downstream
-    issued_available = issued_n.notna()
-    issued_n = issued_n.fillna(0)
+    issued_available = issued_raw_n.notna()
+    issued_n = issued_raw_n.fillna(0)
 
-    # Derive missing Total Debt Repaid
-    derived_repaid = st_repaid_n + lt_repaid_n + loc_repaid_n
     repaid_raw_n = pd.to_numeric(debt_repaid, errors='coerce')
-    repaid_n = repaid_raw_n.copy()
-    components_repaid = (
-        st_debt_repaid.notna() | lt_debt_repaid.notna()
-        | loc_debt_repaid.notna())
-    mask_repaid = needs_anomaly_rescue(repaid_n, derived_repaid, components_repaid, is_exact_identity=False)
-    mask_repaid = (
-        mask_repaid & components_repaid & ~incomplete_repaid
-        & (derived_repaid >= 0))
-    if mask_repaid.any():
-        repaid_n[mask_repaid] = derived_repaid[mask_repaid]
-        add_val('3_Cash_Flow', 'Total Debt Repaid', repaid_n[mask_repaid])
-        debt_repaid = repaid_n # update series for missing_gross downstream
-    repaid_available = repaid_n.notna()
-    repaid_n = repaid_n.fillna(0)
+    repaid_available = repaid_raw_n.notna()
+    repaid_n = repaid_raw_n.fillna(0)
 
     short_net_raw   = pd.to_numeric(short_debt_net, errors='coerce')
     _short_net_concepts = _fact_audit_output_series(
