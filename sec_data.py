@@ -25317,6 +25317,8 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
     authoritative_audit = _has_authoritative_fact_audit(df)
     issues = []
     zero_inferences = []
+    family_allocations = []
+    allocated_cells = {}
 
     def visible_ser(label):
         key = ('3_Cash_Flow', label)
@@ -25627,6 +25629,140 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
         repaid_components, repaid_component_evidence,
         component_floor(_DEBT_REPAID_COMPONENT_LABELS))
 
+    def balance_ser(label):
+        key = ('2_Balance_Sheet', label)
+        if key not in df.index:
+            return pd.Series(np.nan, index=idx, dtype=float)
+        return pd.to_numeric(df.loc[key], errors='coerce').reindex(idx)
+
+    def has_material_activity(series):
+        values = pd.to_numeric(series, errors='coerce').fillna(0.0)
+        return bool((values.abs() > 1e-9).any())
+
+    def has_positive_balance(labels):
+        for label in labels:
+            values = balance_ser(label)
+            if bool((values.fillna(0.0) > 1e-9).any()):
+                return True
+        return False
+
+    def has_long_term_instrument_disclosure():
+        if not isinstance(df.index, pd.MultiIndex):
+            return False
+        pattern = re.compile(
+            r'(?i)(?:senior|subordinated|secured|unsecured|convertible|'
+            r'medium[- ]term|term loan|notes? issued|notes? due|bond)')
+        for category, label in df.index:
+            if str(category) != '6_Disclosures':
+                continue
+            text = str(label or '')
+            if ('debt' in text.casefold() or 'note' in text.casefold()) and pattern.search(text):
+                return True
+        return False
+
+    # Some issuers use a generic statement-face aggregate such as
+    # ``ProceedsFromDebtNetOfIssuanceCosts`` for cash flows that are entirely
+    # senior notes or term loans.  Keeping that fact only in Total Debt Issued
+    # leaves the long-term family blank even though its economic scope is known.
+    # Allocate a validated direct total to long-term only when the issuer-level
+    # evidence is consistently long-term: positive long-term debt stock, no
+    # short-term debt stock, no short-term/LOC cash activity, and either an
+    # explicit historical long-term cash-flow fact or a long-term instrument
+    # disclosure.  The rule is deliberately company-generic and refuses mixed
+    # or unresolved debt profiles.
+    explicit_short_activity = any(has_material_activity(series) for series in (
+        st_issued, st_repaid, loc_issued, loc_repaid,
+        source_ser('Net Change in Short-term Debt')))
+    long_term_stock_evidence = has_positive_balance((
+        'Long-term Debt', 'Senior Notes', 'Convertible Debt',
+        'Other Long-term Borrowings', 'Current Portion of Long-term Debt'))
+    short_term_stock_evidence = has_positive_balance((
+        'Short-term Debt', 'Short-term Borrowings'))
+    historical_long_term_flow = (
+        has_material_activity(lt_issued) or has_material_activity(lt_repaid))
+    long_term_instrument_evidence = has_long_term_instrument_disclosure()
+    long_term_only_profile = (
+        long_term_stock_evidence
+        and not short_term_stock_evidence
+        and not explicit_short_activity
+        and (historical_long_term_flow or long_term_instrument_evidence))
+
+    def total_concept_supports_family_allocation(total_label, period):
+        if not authoritative_audit:
+            return True
+        concepts = provenance_concepts(total_label, period)
+        allowed = _DEBT_KNOWN_AGGREGATE_CONCEPTS_BY_LABEL.get(
+            total_label, frozenset())
+        return bool(concepts) and concepts.issubset(allowed)
+
+    def gross_rejected_at(label, period):
+        rejected = gross_rejected.get(str(label))
+        return bool(isinstance(rejected, pd.Series)
+                    and rejected.reindex(idx, fill_value=False).loc[period])
+
+    def allocate_direct_total_to_long_term(
+            total_label, direct, selected_total, long_label, long_series,
+            short_series, loc_series, long_incomplete, short_incomplete,
+            loc_incomplete):
+        allocated = long_series.copy()
+        if not long_term_only_profile:
+            return allocated
+        total_contradiction = total_rejected.get(
+            total_label, pd.Series(False, index=idx, dtype=bool)).reindex(
+                idx, fill_value=False)
+        for period in idx:
+            if pd.notna(allocated.loc[period]):
+                continue
+            if pd.isna(direct.loc[period]) or pd.isna(selected_total.loc[period]):
+                continue
+            tolerance = _debt_value_tolerance(
+                direct.loc[period], selected_total.loc[period])
+            if abs(float(direct.loc[period]) - float(selected_total.loc[period])) > tolerance:
+                continue
+            if bool(total_contradiction.loc[period]):
+                continue
+            if not total_concept_supports_family_allocation(
+                    total_label, period):
+                continue
+            if (bool(long_incomplete.loc[period])
+                    or bool(short_incomplete.loc[period])
+                    or bool(loc_incomplete.loc[period])):
+                continue
+            if (gross_rejected_at(long_label, period)
+                    or gross_rejected_at(total_label, period)):
+                continue
+            short_value = short_series.loc[period]
+            loc_value = loc_series.loc[period]
+            if (pd.notna(short_value) and abs(float(short_value)) > 1e-9):
+                continue
+            if (pd.notna(loc_value) and abs(float(loc_value)) > 1e-9):
+                continue
+            allocated.loc[period] = float(selected_total.loc[period])
+            source_concepts = sorted(provenance_concepts(
+                total_label, period))
+            allocation = {
+                'period': str(period),
+                'label': long_label,
+                'source_label': total_label,
+                'value': float(selected_total.loc[period]),
+                'reason': 'validated_total_allocated_to_long_term_only_profile',
+                'source_concepts': ';'.join(source_concepts),
+            }
+            family_allocations.append(allocation)
+            allocated_cells[(str(long_label), str(period))] = allocation
+        return allocated
+
+    lt_issued = allocate_direct_total_to_long_term(
+        'Total Debt Issued', issued_direct, issued,
+        'Long-term Debt Issued', lt_issued, st_issued, loc_issued,
+        lt_issued_incomplete, st_issued_incomplete, loc_issued_incomplete)
+    lt_repaid = allocate_direct_total_to_long_term(
+        'Total Debt Repaid', repaid_direct, repaid,
+        'Long-term Debt Repaid', lt_repaid, st_repaid, loc_repaid,
+        lt_repaid_incomplete, st_repaid_incomplete, loc_repaid_incomplete)
+    gross_values['Long-term Debt Issued'] = lt_issued
+    gross_values['Long-term Debt Repaid'] = lt_repaid
+
     def rejected_mask(labels):
         mask = pd.Series(False, index=idx, dtype=bool)
         for label in labels:
@@ -25893,6 +26029,8 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
                     continue
                 remove_indices.update(matching)
                 row = existing_row.to_dict() if not existing_row.empty else {}
+                allocation = allocated_cells.get(
+                    (str(label), str(period)))
                 row.update({
                     'Ticker': row.get('Ticker', ticker_value),
                     'Category': '3_Cash_Flow',
@@ -25905,12 +26043,21 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
                     'Concept': 'CalculatedDebtRepair',
                     'IsCalculated': True,
                     'SourcePeriodRole': 'derived_discrete',
-                    'SourceDerivation': 'validated_debt_normalization',
+                    'SourceDerivation': (
+                        'validated_total_allocated_to_long_term_family'
+                        if allocation is not None
+                        else 'validated_debt_normalization'),
                     'SourceDerivationFormula': (
-                        'issued - repaid'
-                        if 'Issued (Repaid)' in label
-                        else 'validated non-overlapping debt components'),
+                        f"{allocation['source_label']} allocated to {label} "
+                        '(long-term-only debt profile)'
+                        if allocation is not None
+                        else ('issued - repaid'
+                              if 'Issued (Repaid)' in label
+                              else 'validated non-overlapping debt components')),
                 })
+                if allocation is not None:
+                    row['SourceDerivationConcepts'] = allocation.get(
+                        'source_concepts', '')
                 replacement_rows.append(row)
         if remove_indices:
             audit_work = audit_work.drop(index=list(remove_indices))
@@ -25928,6 +26075,25 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
         audit_work = audit_work.reset_index(drop=True)
         audit_work.attrs.update(audit_attrs)
         attrs['fact_audit'] = audit_work
+
+    if family_allocations:
+        existing_allocations = list(
+            attrs.get('debt_family_allocations', ()) or ())
+        seen_allocations = {
+            tuple(sorted((str(key), repr(value))
+                         for key, value in allocation.items()))
+            for allocation in existing_allocations
+            if isinstance(allocation, dict)
+        }
+        for allocation in family_allocations:
+            signature = tuple(sorted(
+                (str(key), repr(value))
+                for key, value in allocation.items()))
+            if signature in seen_allocations:
+                continue
+            existing_allocations.append(allocation)
+            seen_allocations.add(signature)
+        attrs['debt_family_allocations'] = existing_allocations
 
     if zero_inferences:
         existing_inferences = list(
