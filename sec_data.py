@@ -153,6 +153,25 @@ _DIVIDEND_CUMULATIVE_TRANSITION_GROUPS = (
     frozenset({'PaymentsOfDividends', 'PaymentsOfOrdinaryDividends'}),
 )
 
+# These cash-flow rows are normalized as nonnegative gross outflows.  For one
+# exact source family, a materially smaller annual total than its nine-month
+# cumulative total is not a valid discrete Q4; it is evidence of a restatement,
+# measurement-family collision, or other basis mismatch.  Reject that pair at
+# candidate selection instead of deriving a negative value and silently
+# deleting it later.
+_NONNEGATIVE_CUMULATIVE_RESIDUAL_LABELS = frozenset({
+    'Capital Expenditures',
+    'Dividends Paid',
+    'Income Taxes Paid, Net',
+    'Interest Paid',
+    'Purchases of Investments',
+    'Share Repurchases',
+    'Taxes Paid on Stock Awards',
+    'Total Debt Repaid',
+    'Short-term Debt Repaid',
+    'Long-term Debt Repaid',
+})
+
 
 _CF_BRIDGE_SPEC = {}
 _IBM_STYLE_STATE = {'active': False}  # interest folded into the operating-expense block (no separate operating-income line)
@@ -6758,6 +6777,316 @@ def _infer_html_scale(extracted, html_nums):
             return 1_000_000   # likely "in millions"
 
     return 1_000_000  # conservative default
+
+
+_TOTAL_NONOPERATING_INTEREST_CONCEPTS = frozenset({
+    'InterestExpense',
+    'InterestExpenseNonoperating',
+})
+_VERIFIED_INTEREST_TABLE_RULE = (
+    'verified_interest_and_other_income_component_table')
+_VERIFIED_INTEREST_TABLE_ROLE = (
+    'verified_interest_and_other_income_component_table')
+
+
+def _interest_html_context(facts_df, period_end, duration_low,
+                           duration_high, duration_target):
+    """Return one source-reported, dimensionless XBRL duration context.
+
+    The HTML row itself is untagged, so its dates must be borrowed from the
+    filing's real XBRL contexts.  Nominal 90/180/270-day date construction is
+    deliberately forbidden here.  A unique modal start date among monetary,
+    dimensionless contexts is required; ties fail closed.
+    """
+    required = {'period_start'}
+    if facts_df is None or facts_df.empty or not required.issubset(
+            facts_df.columns):
+        return None
+
+    end_source = None
+    if 'period_end' in facts_df.columns:
+        end_source = facts_df['period_end']
+    if 'period_instant' in facts_df.columns:
+        instant = facts_df['period_instant']
+        end_source = instant if end_source is None else end_source.where(
+            end_source.notna(), instant)
+    if end_source is None:
+        return None
+
+    end_dt = pd.to_datetime(period_end, errors='coerce')
+    starts = pd.to_datetime(facts_df['period_start'], errors='coerce')
+    ends = pd.to_datetime(end_source, errors='coerce')
+    duration = (ends - starts).dt.days
+    mask = (
+        starts.notna() & ends.notna()
+        & ends.dt.normalize().eq(end_dt.normalize())
+        & duration.between(duration_low, duration_high)
+    )
+
+    dim_cols = [column for column in facts_df.columns
+                if str(column).startswith('dim_')]
+    if dim_cols:
+        mask &= facts_df[dim_cols].isna().all(axis=1)
+    if 'unit_ref' in facts_df.columns:
+        units = facts_df['unit_ref'].fillna('').astype(str).str.casefold()
+        monetary = units.str.contains(r'(?:^|[^a-z])(?:usd|us\s*dollar)',
+                                      regex=True, na=False)
+        if monetary.any():
+            mask &= monetary
+
+    candidates = pd.DataFrame({
+        'Start': starts.loc[mask],
+        'End': ends.loc[mask],
+        'Duration': duration.loc[mask],
+    }).dropna()
+    if candidates.empty:
+        return None
+
+    counts = candidates.groupby('Start', sort=False).size()
+    max_count = int(counts.max())
+    modal_starts = list(counts[counts.eq(max_count)].index)
+    if len(modal_starts) > 1:
+        distances = {
+            start: abs(int((end_dt - start).days) - int(duration_target))
+            for start in modal_starts
+        }
+        minimum = min(distances.values())
+        modal_starts = [start for start in modal_starts
+                        if distances[start] == minimum]
+    if len(modal_starts) != 1:
+        return None
+    start_dt = pd.Timestamp(modal_starts[0])
+    return (
+        start_dt.strftime('%Y-%m-%d'),
+        end_dt.strftime('%Y-%m-%d'),
+        int((end_dt - start_dt).days),
+    )
+
+
+def _interest_html_row_values(row):
+    """Parse only monetary columns from one rendered SEC table row."""
+    cells = row.find_all(['th', 'td'])
+    values = []
+    for position, cell in enumerate(cells[1:], start=1):
+        raw = _gb_clean_text(cell.get_text(' ', strip=True))
+        next_raw = (
+            _gb_clean_text(cells[position + 1].get_text(' ', strip=True))
+            if position + 1 < len(cells) else '')
+        if '%' in raw or '%' in next_raw:
+            continue
+        value, _ = _gb_parse_number(raw)
+        if value is not None:
+            values.append(float(value))
+    return values
+
+
+def _extract_verified_interest_expense_html_facts(
+        html_content, facts_df, extracted, filing_form, period_end, ye_month,
+        filed, tag_rank=1):
+    """Recover an untagged total-interest component with accounting proof.
+
+    This is intentionally much narrower than the legacy row-text fallback.  A
+    table is admitted only when it identifies the applicable quarterly and YTD
+    periods, declares a monetary scale, and every displayed monetary column
+    reconciles from its component rows to ``Total interest and other income,
+    net``.  The recovered expense remains an HTML fact for audit purposes, but
+    carries a tightly scoped equivalence to ``InterestExpenseNonoperating``.
+    Debt-only, lease, operating-bank, and net-interest facts are never aliases.
+    """
+    if '10-Q' not in str(filing_form or '').upper():
+        return []
+    if not html_content or period_end is None:
+        return []
+
+    end_dt = pd.to_datetime(period_end, errors='coerce')
+    if pd.isna(end_dt):
+        return []
+    _, quarter = get_period_info(end_dt, ye_month, 90)
+    if quarter not in {'Q1', 'Q2', 'Q3'}:
+        return []
+
+    soup = BeautifulSoup(html_content, 'html.parser')
+    for hidden in soup.find_all(style=_DISPLAY_NONE_RE):
+        hidden.decompose()
+
+    def _key(value):
+        return re.sub(r'[^a-z0-9]+', ' ', str(value).casefold()).strip()
+
+    expected_cumulative_heading = {
+        'Q1': None,
+        'Q2': 'six months ended',
+        'Q3': 'nine months ended',
+    }[quarter]
+    current_year = str(int(end_dt.year))
+    total_row_keys = {
+        'total interest and other income net',
+        'total interest and other income expense net',
+        'total interest and other income expenses net',
+        'interest and other income net',
+        'interest and other income expense net',
+        'interest and other income expenses net',
+    }
+
+    for table in soup.find_all('table'):
+        table_text = _gb_clean_text(table.get_text(' ', strip=True))
+        table_key = _key(table_text)
+        if ('three months ended' not in table_key
+                or current_year not in table_text):
+            continue
+        if (expected_cumulative_heading
+                and expected_cumulative_heading not in table_key):
+            continue
+
+        scale_match = re.search(
+            r'\bin\s+(thousands|millions|billions)\b',
+            table_text, flags=re.I)
+        if scale_match is None:
+            continue
+        if '$' not in table_text and not re.search(
+                r'\b(?:usd|u\.?s\.?\s+dollars?)\b', table_text, re.I):
+            continue
+        scale_word = scale_match.group(1).casefold()
+        scale = {
+            'thousands': 1_000,
+            'millions': 1_000_000,
+            'billions': 1_000_000_000,
+        }[scale_word]
+
+        ordered_rows = []
+        interest_row = None
+        total_row = None
+        for row_position, tr in enumerate(table.find_all('tr')):
+            cells = tr.find_all(['th', 'td'])
+            if not cells:
+                continue
+            label = _gb_clean_text(cells[0].get_text(' ', strip=True))
+            label_key = _key(label)
+            if label_key == 'interest expense':
+                interest_row = (row_position, label, tr)
+            if label_key in total_row_keys:
+                total_row = (row_position, label, tr)
+            ordered_rows.append((row_position, label, label_key, tr))
+        if interest_row is None or total_row is None:
+            continue
+
+        income_positions = [position for position, _, label_key, _ in ordered_rows
+                            if label_key == 'interest income']
+        if len(income_positions) != 1:
+            continue
+        first_component = income_positions[0]
+        last_component = total_row[0]
+        if not (first_component < interest_row[0] < last_component):
+            continue
+
+        components = []
+        for position, label, label_key, tr in ordered_rows:
+            if not first_component <= position < last_component:
+                continue
+            values = _interest_html_row_values(tr)
+            if values:
+                components.append((label, label_key, values))
+        total_values = _interest_html_row_values(total_row[2])
+        expense_values = _interest_html_row_values(interest_row[2])
+        if (len(components) < 3 or len(total_values) not in {2, 4}
+                or len(expense_values) != len(total_values)
+                or any(len(values) != len(total_values)
+                       for _, _, values in components)):
+            continue
+        if any(value >= 0 for value in expense_values):
+            # In this net-income component table the expense is presented as a
+            # subtraction.  Refuse a positive value because its polarity and
+            # relationship to the total would be ambiguous.
+            continue
+
+        reconciled = True
+        component_sums = []
+        for column in range(len(total_values)):
+            component_sum = sum(values[column]
+                                for _, _, values in components)
+            component_sums.append(component_sum)
+            if abs(component_sum - total_values[column]) > 1.01:
+                reconciled = False
+                break
+        if not reconciled:
+            continue
+
+        direct_context = _interest_html_context(
+            facts_df, end_dt, 70, 115, 91)
+        if direct_context is None:
+            continue
+        cumulative_context = None
+        if quarter == 'Q2':
+            cumulative_context = _interest_html_context(
+                facts_df, end_dt, 150, 210, 182)
+        elif quarter == 'Q3':
+            cumulative_context = _interest_html_context(
+                facts_df, end_dt, 240, 300, 273)
+        if quarter != 'Q1' and cumulative_context is None:
+            continue
+
+        table_fingerprint = hashlib.sha256(
+            str(table).encode('utf-8', 'replace')).hexdigest()
+        proof = json.dumps({
+            'component_rows': [label for label, _, _ in components],
+            'component_sums': component_sums,
+            'reported_totals': total_values,
+            'display_scale': scale,
+        }, sort_keys=True)
+        common = {
+            'Category': '1_Income_Statement',
+            'Label': 'Interest Expense',
+            'FY': int(get_period_info(end_dt, ye_month, 90)[0]),
+            'Q': quarter,
+            'Filed': filed,
+            'TagRank': int(tag_rank),
+            'DimCount': 0,
+            'IsCalculated': False,
+            'Concept': 'HTMLFallback',
+            'SourceKind': 'html_table',
+            'SourceAdmissionRule': _VERIFIED_INTEREST_TABLE_RULE,
+            'SourceSemanticType': 'Interest Expense',
+            'SourceAnalyticalBasis':
+                'consolidated_nonoperating_income_breakdown',
+            'SourceDirectness': 'reported',
+            'SourceClassificationConfidence': 0.995,
+            'SourceTableRole': _VERIFIED_INTEREST_TABLE_ROLE,
+            'SourceEquivalentConcept': 'InterestExpenseNonoperating',
+            'SourceMetricFamily': 'interest_expense.total_nonoperating',
+            'SourceMetricIdentity': 'total_nonoperating_interest_expense',
+            'SourceCompositionVerified': True,
+            'SourceCompositionProof': proof,
+            'SourceTableFingerprint': table_fingerprint,
+            'SourceRawLabel': interest_row[1],
+            'SourcePeriodHeaderEvidence': table_text[:1000],
+            'SourceUnitKind': 'monetary',
+            'SourceUnitSignature': 'usd',
+            'SourceUnitScale': scale,
+            'SourceUnitEvidence': f'in {scale_word}; currency marker',
+            'SourceUnitConfidence': 0.995,
+            'SourcePeriodBasis': 'duration_flow',
+            'StartEstimated': False,
+        }
+
+        facts = []
+        direct = dict(common)
+        direct.update({
+            'Value': abs(expense_values[0]) * scale,
+            'Start': direct_context[0],
+            'End': direct_context[1],
+            'Duration': direct_context[2],
+        })
+        facts.append(direct)
+        if cumulative_context is not None:
+            cumulative = dict(common)
+            cumulative.update({
+                'Value': abs(expense_values[2]) * scale,
+                'Start': cumulative_context[0],
+                'End': cumulative_context[1],
+                'Duration': cumulative_context[2],
+            })
+            facts.append(cumulative)
+        return facts
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -15231,6 +15560,38 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 f"  [Asset Group] Inline-XBRL recovery skipped "
                 f"({type(_inline_asset_error).__name__}: {_inline_asset_error})")
 
+    # Some issuers publish total interest expense only in an untagged MD&A
+    # component table while their XBRL contains a narrower debt-note fact.  A
+    # display-label check therefore cannot decide whether the total is already
+    # present.  Recover the HTML row only through the strict table composition
+    # proof above, and only when no total-nonoperating XBRL concept exists.
+    _has_total_interest = any(
+        str(x.get('Concept') or '') in _TOTAL_NONOPERATING_INTEREST_CONCEPTS
+        for x in extracted
+        if x.get('Label') == 'Interest Expense'
+    )
+    _verified_interest_facts = []
+    if not _has_total_interest and '10-Q' in str(filing_form).upper():
+        try:
+            _verified_interest_facts = (
+                _extract_verified_interest_expense_html_facts(
+                    fetch_html(filing), facts_df, extracted, filing_form,
+                    filing.period_of_report, ye_month, _filing_date_raw,
+                    tag_rank=_tag_rank_lookup.get(
+                        ('Interest Expense',
+                         'InterestExpenseNonoperating'), 1)))
+            if _verified_interest_facts:
+                extracted.extend(_verified_interest_facts)
+                print(
+                    '  [Interest Table] Recovered total nonoperating interest '
+                    'expense with exact component reconciliation and XBRL '
+                    'period contexts.')
+        except Exception as _verified_interest_error:
+            _debug_print(
+                '  [Interest Table] Verified recovery skipped '
+                f'({type(_verified_interest_error).__name__}: '
+                f'{_verified_interest_error})')
+
     has_interest = any(x['Label'] == 'Interest Expense' for x in extracted)
     if not has_interest:
         try:
@@ -16339,6 +16700,255 @@ def _reconcile_segment_labels(df, ticker=None, company_name=None):
         df['Label'] = df['Label'].replace(rename_map2)
 
     return df
+
+def _merge_value_proven_dimensional_member_renames(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Unify disclosure-member captions only after repeated exact proof.
+
+    A taxonomy extension can rename one dimensional member between a 10-Q and
+    10-K, splitting quarterly and annual facts into different display rows.
+    Name similarity is not sufficient evidence: two members on the same axis
+    may be genuinely distinct.  This helper requires two nonzero, distinct-date
+    overlaps under the same concrete concept/context/unit, exact values within
+    filing precision, no conflicting overlap, and a containment/high-overlap
+    relationship between the captions.  It changes only the public grouping
+    label; original member provenance remains intact.
+    """
+    required = {'Category', 'Label', 'Value', 'Concept', 'FY', 'Q'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+
+    axes = df.get(
+        'SourceAxisSignature',
+        df.get('SourceDimensionAxes', pd.Series('', index=df.index))
+    ).fillna('').astype(str).str.strip()
+    members = df.get(
+        'SourceMemberSignature',
+        df.get('SourceDimensionMembers', pd.Series('', index=df.index))
+    ).fillna('').astype(str).str.strip()
+    values = pd.to_numeric(df['Value'], errors='coerce')
+    candidates = df[
+        df['Category'].eq('6_Disclosures')
+        & axes.ne('') & members.ne('') & values.notna()
+    ].copy()
+    if candidates.empty:
+        return df
+    candidates['_GBAxis'] = axes.loc[candidates.index]
+    candidates['_GBMember'] = members.loc[candidates.index]
+    candidates['_GBValue'] = values.loc[candidates.index]
+
+    def _tokens(member):
+        return set(re.findall(r'[a-z0-9]+', str(member).casefold())) - {
+            'member', 'the', 'and', 'of', 'for', 'by',
+        }
+
+    context_fields = [field for field in (
+        'Concept', 'FY', 'Q', 'Start', 'End', 'Duration',
+        'SourceUnitSignature', 'SourceUnitKind', 'Unit',
+    ) if field in candidates.columns]
+
+    def _context_values(rows):
+        result = {}
+        for context, group in rows.groupby(
+                context_fields, dropna=False, sort=False):
+            if not isinstance(context, tuple):
+                context = (context,)
+            numeric = sorted(set(float(value) for value in group['_GBValue']
+                                 if pd.notna(value)))
+            if not numeric:
+                continue
+            scale = max(max(abs(value) for value in numeric), 1.0)
+            if max(numeric) - min(numeric) > scale * 0.001 + 1.0:
+                # A member that reports conflicting values for one exact
+                # context cannot supply equivalence proof.
+                result[context] = None
+            else:
+                if 'Accession' in group.columns:
+                    sources = {
+                        str(value).strip()
+                        for value in group['Accession'].dropna()
+                        if str(value).strip()
+                    }
+                else:
+                    sources = set()
+                if not sources and 'Filed' in group.columns:
+                    sources = {
+                        str(value).strip()
+                        for value in group['Filed'].dropna()
+                        if str(value).strip()
+                    }
+                result[context] = (numeric[0], sources)
+        return result
+
+    proposals = []
+    for axis, axis_rows in candidates.groupby('_GBAxis', sort=False):
+        member_names = sorted(axis_rows['_GBMember'].unique(), key=str)
+        if len(member_names) < 2 or len(member_names) > 80:
+            continue
+        rows_by_member = {
+            member: axis_rows[axis_rows['_GBMember'].eq(member)]
+            for member in member_names
+        }
+        contexts_by_member = {
+            member: _context_values(rows_by_member[member])
+            for member in member_names
+        }
+        for left_pos, left_member in enumerate(member_names):
+            if '|' in left_member:
+                # Composite dimensional signatures can share one participant
+                # while differing on another (for example Minimum vs Maximum).
+                # They are context aspects, not member-renaming candidates.
+                continue
+            left_tokens = _tokens(left_member)
+            if not left_tokens:
+                continue
+            for right_member in member_names[left_pos + 1:]:
+                if '|' in right_member:
+                    continue
+                right_tokens = _tokens(right_member)
+                if not right_tokens:
+                    continue
+                contained = (left_tokens <= right_tokens
+                             or right_tokens <= left_tokens)
+                if not contained:
+                    continue
+                if len(left_tokens) == len(right_tokens):
+                    continue
+                if len(left_tokens) < len(right_tokens):
+                    shorter_member, longer_member = left_member, right_member
+                    extra_tokens = right_tokens - left_tokens
+                else:
+                    shorter_member, longer_member = right_member, left_member
+                    extra_tokens = left_tokens - right_tokens
+                normalized_shorter = re.sub(
+                    r'[^a-z0-9]+', ' ', shorter_member.casefold()).strip()
+                normalized_longer = re.sub(
+                    r'[^a-z0-9]+', ' ', longer_member.casefold()).strip()
+                if not normalized_longer.startswith(normalized_shorter + ' '):
+                    # Prefix expansion is the bounded pattern proved by an
+                    # issuer extending an existing member caption.  A suffix
+                    # match such as "Additional Paid In Capital" inside
+                    # "Common Stock Including ..." is an aggregate/detail
+                    # relationship, not a rename.
+                    continue
+                if extra_tokens & {
+                        'including', 'excluding', 'combined', 'consolidated',
+                        'total', 'net', 'gross', 'minimum', 'maximum',
+                        'current', 'noncurrent', 'continuing', 'discontinued'}:
+                    continue
+
+                left_values = contexts_by_member[left_member]
+                right_values = contexts_by_member[right_member]
+                overlap = set(left_values).intersection(right_values)
+                matches = []
+                conflict = False
+                for context in overlap:
+                    left_entry = left_values[context]
+                    right_entry = right_values[context]
+                    if left_entry is None or right_entry is None:
+                        conflict = True
+                        break
+                    left_value, left_sources = left_entry
+                    right_value, right_sources = right_entry
+                    scale = max(abs(left_value), abs(right_value), 1.0)
+                    if abs(left_value - right_value) > scale * 0.001 + 1.0:
+                        conflict = True
+                        break
+                    if (not left_sources or not right_sources
+                            or left_sources.intersection(right_sources)):
+                        # The exact overlap must come from different filing
+                        # sources. Coexisting equal parent/detail members in one
+                        # accession are not rename evidence.
+                        continue
+                    if scale > 1.0:
+                        matches.append((context, left_value))
+                if conflict or len(matches) < 2:
+                    continue
+
+                end_position = (context_fields.index('End')
+                                if 'End' in context_fields else None)
+                distinct_ends = {
+                    str(context[end_position]) for context, _ in matches
+                } if end_position is not None else set()
+                distinct_values = {
+                    round(float(value), 6) for _, value in matches
+                }
+                if len(distinct_ends) < 2 or len(distinct_values) < 2:
+                    continue
+
+                def _canonical_score(member):
+                    rows = rows_by_member[member]
+                    duration = pd.to_numeric(
+                        rows.get('Duration', pd.Series(np.nan, index=rows.index)),
+                        errors='coerce')
+                    direct_coverage = int(duration.between(45, 125).sum())
+                    period_coverage = len(set(zip(
+                        rows['FY'].astype(str), rows['Q'].astype(str))))
+                    # Prefer the established, more concise caption only after
+                    # source coverage has decided the era.
+                    return (direct_coverage, period_coverage,
+                            -len(_tokens(member)), -len(member))
+
+                if _canonical_score(left_member) >= _canonical_score(
+                        right_member):
+                    canonical, alias = left_member, right_member
+                else:
+                    canonical, alias = right_member, left_member
+                proposals.append((axis, alias, canonical, len(matches)))
+
+    if not proposals:
+        return df
+
+    # A member may not map to two different contemporaneous targets.  Keep only
+    # a unique strongest proposal; ties with different targets fail closed.
+    by_alias = defaultdict(list)
+    for proposal in proposals:
+        by_alias[(proposal[0], proposal[1])].append(proposal)
+    accepted = []
+    for _, options in by_alias.items():
+        strongest = max(option[3] for option in options)
+        winners = [option for option in options if option[3] == strongest]
+        targets = {option[2] for option in winners}
+        if len(targets) == 1:
+            accepted.append(winners[0])
+    if not accepted:
+        return df
+
+    out = df.copy()
+    source_axes = out.get(
+        'SourceAxisSignature',
+        out.get('SourceDimensionAxes', pd.Series('', index=out.index))
+    ).fillna('').astype(str).str.strip()
+    source_members = out.get(
+        'SourceMemberSignature',
+        out.get('SourceDimensionMembers', pd.Series('', index=out.index))
+    ).fillna('').astype(str).str.strip()
+    changes = []
+    for axis, alias, canonical, proof_count in accepted:
+        mask = (
+            out['Category'].eq('6_Disclosures')
+            & source_axes.eq(axis) & source_members.eq(alias)
+        )
+        if not mask.any():
+            continue
+
+        def _rename(label):
+            metric, separator, member = str(label).partition(' - ')
+            if separator and member == alias:
+                return f'{metric} - {canonical}'
+            return label
+
+        out.loc[mask, 'Label'] = out.loc[mask, 'Label'].map(_rename)
+        out.loc[mask, 'SourceMemberAliasCanonical'] = canonical
+        out.loc[mask, 'SourceMemberAliasProof'] = (
+            f'{proof_count} exact concept/context/unit value overlaps')
+        changes.append(f'{alias} -> {canonical}')
+    if changes:
+        print('  [Dimensional Member Rename] Applied value-proven mapping: '
+              + '; '.join(sorted(set(changes))))
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
 
 def _detect_and_merge_renamed_segments(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -21458,6 +22068,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df['Label'] = df['Label'].map(lambda _lbl: _label_norm_map.get(_lbl, _lbl))
     df = _reconcile_segment_labels(df, ticker=ticker, company_name=company_name)
     df = _detect_and_merge_renamed_segments(df)
+    df = _merge_value_proven_dimensional_member_renames(df)
     df = _gb_promote_proven_segment_disclosure_history(df)
     df = _merge_concurrent_member_variants(df)
     # Re-run after label-era reconciliation: several false rows are only
@@ -22295,6 +22906,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     _duration_filter_cache = {}
     _concept_resolve_cache = {}
     _best_val_cache = {}
+    _concept_equivalence_cache = {}
     _date_parse_cache = {}
     _DATE_PARSE_CACHE_MISS = object()
     group = None
@@ -22437,10 +23049,63 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         _concept_resolve_cache[_concept] = _resolved
         return _resolved
 
+    def _verified_html_equivalent_concept(row):
+        """Return the one tightly scoped XBRL identity proven by HTML."""
+        if row is None:
+            return None
+        if str(row.get('Concept') or '').strip() != 'HTMLFallback':
+            return None
+        if str(row.get('Label') or '').strip() != 'Interest Expense':
+            return None
+        if str(row.get('SourceAdmissionRule') or '').strip() != (
+                _VERIFIED_INTEREST_TABLE_RULE):
+            return None
+        if str(row.get('SourceTableRole') or '').strip() != (
+                _VERIFIED_INTEREST_TABLE_ROLE):
+            return None
+        if str(row.get('SourceEquivalentConcept') or '').strip() != (
+                'InterestExpenseNonoperating'):
+            return None
+        if str(row.get('SourceMetricFamily') or '').strip() != (
+                'interest_expense.total_nonoperating'):
+            return None
+        if str(row.get('SourceMetricIdentity') or '').strip() != (
+                'total_nonoperating_interest_expense'):
+            return None
+        if not bool(row.get('SourceCompositionVerified', False)):
+            return None
+        if not str(row.get('SourceCompositionProof') or '').strip():
+            return None
+        if not str(row.get('SourceTableFingerprint') or '').strip():
+            return None
+        if bool(row.get('StartEstimated', False)):
+            return None
+        if str(row.get('SourcePeriodBasis') or '').strip() != 'duration_flow':
+            return None
+        if str(row.get('SourceUnitKind') or '').strip().casefold() not in {
+                'money', 'monetary'}:
+            return None
+        unit_scale = pd.to_numeric(
+            pd.Series([row.get('SourceUnitScale')]), errors='coerce').iloc[0]
+        dim_count = pd.to_numeric(
+            pd.Series([row.get('DimCount')]), errors='coerce').iloc[0]
+        if pd.isna(unit_scale) or float(unit_scale) <= 0:
+            return None
+        if pd.isna(dim_count) or int(dim_count) != 0:
+            return None
+        start = _parse_plain_date_cached(row.get('Start'))
+        end = _parse_plain_date_cached(row.get('End'))
+        if pd.isna(start) or pd.isna(end) or end <= start:
+            return None
+        return 'InterestExpenseNonoperating'
+
     def _exact_subtraction_concept(row):
         """Return a concrete concept suitable for cumulative subtraction."""
         if row is None:
             return None
+        verified_equivalent = _verified_html_equivalent_concept(row)
+        if verified_equivalent is not None:
+            return verified_equivalent
         concept = row.get('Concept')
         if concept is None or pd.isna(concept):
             return None
@@ -22516,7 +23181,11 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             return None
 
         if concept_filter is not None and exact_concept:
-            m = m[m['Concept'].eq(concept_filter)]
+            identity_mask = [
+                _exact_subtraction_concept(candidate_row) == concept_filter
+                for _, candidate_row in m.iterrows()
+            ]
+            m = m.loc[identity_mask]
             if m.empty:
                 _best_val_cache[_cache_key] = False
                 return None
@@ -22573,7 +23242,23 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     def _cumulative_aspects_compatible(left_row, right_row):
         if left_row is None or right_row is None:
             return False
+        verified_equivalent_pair = bool(
+            (_verified_html_equivalent_concept(left_row) is not None
+             and _exact_subtraction_concept(left_row)
+             == _exact_subtraction_concept(right_row))
+            or (_verified_html_equivalent_concept(right_row) is not None
+                and _exact_subtraction_concept(left_row)
+                == _exact_subtraction_concept(right_row))
+        )
         for field in _CUMULATIVE_ASPECT_FIELDS:
+            if (verified_equivalent_pair
+                    and field in {'SourceTableRole',
+                                  'SourceAnalyticalBasis'}):
+                # The proof is specifically that an untagged MD&A component
+                # row and the audited XBRL statement fact express one total-
+                # interest family.  Preserve their truthful source roles while
+                # allowing only this verified cross-source comparison.
+                continue
             left = _normalized_aspect_value(left_row.get(field))
             right = _normalized_aspect_value(right_row.get(field))
             if left and right and left != right:
@@ -22676,6 +23361,10 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 or left_concept == right_concept):
             return left_concept == right_concept and left_concept is not None
 
+        cache_key = tuple(sorted((str(left_concept), str(right_concept))))
+        if cache_key in _concept_equivalence_cache:
+            return _concept_equivalence_cache[cache_key]
+
         family = df[
             df['Category'].eq(cat) & df['Label'].eq(label)
             & df['Concept'].isin([left_concept, right_concept])
@@ -22683,6 +23372,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         left = family[family['Concept'].eq(left_concept)].copy()
         right = family[family['Concept'].eq(right_concept)].copy()
         if left.empty or right.empty:
+            _concept_equivalence_cache[cache_key] = False
             return False
 
         def _context_map(rows):
@@ -22708,6 +23398,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         right_values = _context_map(right)
         overlap = sorted(set(left_values).intersection(right_values), key=str)
         if len(overlap) < 2:
+            _concept_equivalence_cache[cache_key] = False
             return False
         nonzero_matches = 0
         for context in overlap:
@@ -22715,10 +23406,13 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             right_value = right_values[context]
             scale = max(abs(left_value), abs(right_value))
             if abs(left_value - right_value) > scale * 0.001 + 1.0:
+                _concept_equivalence_cache[cache_key] = False
                 return False
             if scale > 1.0:
                 nonzero_matches += 1
-        return nonzero_matches >= 2
+        result = nonzero_matches >= 2
+        _concept_equivalence_cache[cache_key] = result
+        return result
 
     def _best_cumulative_pair(exhaustive_aspects=False):
         """Choose a YTD9/annual pair with exact or value-proven scope.
@@ -22763,6 +23457,16 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             ytd_row, annual_row = ytd_value[1], annual_value[1]
             if not _cumulative_pair_compatible(ytd_row, annual_row):
                 return None
+            if (cat == '3_Cash_Flow'
+                    and label in _NONNEGATIVE_CUMULATIVE_RESIDUAL_LABELS):
+                ytd_amount = float(ytd_value[0])
+                annual_amount = float(annual_value[0])
+                residual_tolerance = (
+                    max(abs(ytd_amount), abs(annual_amount), 1.0)
+                    * 0.001 + 1.0)
+                if (ytd_amount >= 0 and annual_amount >= 0
+                        and annual_amount + residual_tolerance < ytd_amount):
+                    return None
             family_concepts = [ytd_concept]
             if annual_concept != ytd_concept:
                 family_concepts.append(annual_concept)
@@ -22809,7 +23513,11 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             values = []
             if candidates.empty:
                 return values
-            exact = candidates[candidates['Concept'].eq(concept)]
+            identity_mask = [
+                _exact_subtraction_concept(candidate_row) == concept
+                for _, candidate_row in candidates.iterrows()
+            ]
+            exact = candidates.loc[identity_mask]
             for _, candidate_row in exact.iterrows():
                 values.append((float(candidate_row['Value']),
                                candidate_row.copy()))
@@ -23165,6 +23873,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         _duration_filter_cache.clear()
         _concept_resolve_cache.clear()
         _best_val_cache.clear()
+        _concept_equivalence_cache.clear()
         operating_period_basis = _gb_group_period_basis(group)
         is_operating_average = operating_period_basis in {
             _GB_BASIS_AVERAGE, _GB_BASIS_RATIO,
@@ -23231,6 +23940,7 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         _subtraction_concept = None
         _subtraction_annual_concept = None
         _subtraction_alias_verified = False
+        _subtraction_html_identity_verified = False
         if (ytd9 is not None and not is_avg
                 and not is_operating_nonadditive):
             (matching_ytd9, matching_ytd12, _subtraction_concept,
@@ -23241,6 +23951,13 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             # Preserve any directly filed Q4, but fail closed on derivation.
             ytd9 = matching_ytd9
             ytd12 = matching_ytd12
+            _subtraction_html_identity_verified = bool(
+                (ytd9 is not None
+                 and _verified_html_equivalent_concept(ytd9[1]) is not None)
+                or (ytd12 is not None
+                    and _verified_html_equivalent_concept(
+                        ytd12[1]) is not None)
+            )
 
             if _subtraction_concept is not None:
                 exact_ytd6 = get_best_val(
@@ -23278,6 +23995,45 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                         q_src[qn] = exact_quarter
                         q_vals[qn] = exact_quarter[0]
                         best_rows[qn] = exact_quarter[1]
+                    else:
+                        existing_row = best_rows.get(qn)
+                        existing_identity = _exact_subtraction_concept(
+                            existing_row)
+                        permitted_identities = {
+                            _subtraction_concept,
+                            *(
+                                [_subtraction_annual_concept]
+                                if (_subtraction_alias_verified
+                                    and _subtraction_annual_concept)
+                                else []
+                            ),
+                        }
+                        existing_is_value_proven_alias = bool(
+                            existing_identity is not None
+                            and any(
+                                _concepts_have_value_proven_equivalence(
+                                    existing_identity, family_identity)
+                                for family_identity in permitted_identities
+                                if family_identity is not None
+                            )
+                            and ytd9 is not None
+                            and _cumulative_aspects_compatible(
+                                existing_row, ytd9[1])
+                        )
+                        if (existing_row is not None
+                                and existing_identity
+                                not in permitted_identities
+                                and not existing_is_value_proven_alias):
+                            # A display row must not retain a direct quarter
+                            # from a different economic family merely because
+                            # no direct fact exists in the selected cumulative
+                            # family.  Clear it so same-family cumulative
+                            # subtraction can derive the quarter or leave it
+                            # unresolved.  This prevents cash repurchase
+                            # payments from mixing with equity-retirement value.
+                            q_src[qn] = None
+                            q_vals[qn] = None
+                            best_rows[qn] = None
 
         v6_ytd  = ytd6[0]  if ytd6  else None
         v9_ytd  = ytd9[0]  if ytd9  else None
@@ -23289,7 +24045,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             if q_vals['Q1'] is None and ytd6 is not None:
                 q2_qt_same_tag = get_best_val(
                     'Q2', 91, 40,
-                    concept_filter=ytd6[1].get('Concept'), exact_concept=True)
+                    concept_filter=_exact_subtraction_concept(ytd6[1]),
+                    exact_concept=True)
                 q1_bounds = (
                     _head_remainder_bounds(ytd6[1], q2_qt_same_tag[1])
                     if q2_qt_same_tag is not None else None)
@@ -23466,7 +24223,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             if q_vals['Q3'] is None and q3_ytd is not None:
                 ytd6_same_tag = get_best_val(
                     'Q2', 182, 40,
-                    concept_filter=q3_ytd[1].get('Concept'), exact_concept=True)
+                    concept_filter=_exact_subtraction_concept(q3_ytd[1]),
+                    exact_concept=True)
                 q3_bounds = (
                     _tail_remainder_bounds(q3_ytd[1], ytd6_same_tag[1])
                     if ytd6_same_tag is not None else None)
@@ -24125,9 +24883,11 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 baseline_name = 'YTD9'
                 q4_bounds = _tail_remainder_bounds(annual_row, baseline_row)
                 derivation = (
-                    'value_proven_alias_annual_minus_ytd9'
-                    if _subtraction_alias_verified
-                    else 'exact_concept_annual_minus_ytd9')
+                    'verified_html_equivalent_annual_minus_ytd9'
+                    if _subtraction_html_identity_verified
+                    else ('value_proven_alias_annual_minus_ytd9'
+                          if _subtraction_alias_verified
+                          else 'exact_concept_annual_minus_ytd9'))
             else:
                 baseline_value = _v9_synthetic
                 baseline_row = best_rows.get('Q3')
@@ -24156,6 +24916,13 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                             baseline_row.get('Accession')
                             if baseline_row is not None else None),
                         'AliasVerified': bool(_subtraction_alias_verified),
+                        'FallbackIdentityVerified': bool(
+                            _subtraction_html_identity_verified),
+                        'FallbackIdentityProof': (
+                            baseline_row.get('SourceCompositionProof')
+                            if (baseline_row is not None
+                                and _subtraction_html_identity_verified)
+                            else None),
                     },
                 )
 
@@ -39343,7 +40110,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-29.native-extraction.v38-debt-provenance-display"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-30.native-extraction.v39-verified-interest-family"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -39513,7 +40280,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-29.final-pivot.v83-debt-provenance-display"
+_FINAL_PIVOT_CACHE_VERSION = "2026-07-30.final-pivot.v84-verified-metric-family"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
