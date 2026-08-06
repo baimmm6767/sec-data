@@ -2398,11 +2398,12 @@ ul.task-list li.task-done::before {
                 return m ? m[1] : null;
             }
 
-            // Multi-company quarterly/TTM comparison uses relative quarter slots:
-            // slot 0 is each company's latest reported quarter, slot 1 is the
-            // immediately preceding reported quarter, and so on. This keeps
-            // companies with different fiscal calendars visually comparable.
-            const RELATIVE_PERIOD_PREFIX = '__LATEST_QUARTER_SLOT_';
+            // Multi-company quarterly/TTM comparison is normalized to the nearest
+            // calendar quarter end. This aligns comparable economic periods even when
+            // companies use different fiscal-year labels or 52/53-week calendars.
+            // Example: 2025-01-31 normalizes to 2024-12-31, while 2025-04-27
+            // normalizes to 2025-03-31.
+            const RELATIVE_PERIOD_PREFIX = '__LATEST_QUARTER_SLOT_'; // legacy read-only support
 
             function relativePeriodKey(index) {
                 return `${RELATIVE_PERIOD_PREFIX}${index}`;
@@ -2420,14 +2421,26 @@ ul.task-list li.task-done::before {
             }
 
             function useLatestQuarterAlignment() {
-                if (activePeriodType === 'annual' || companies.length < 2) return false;
-                // Mixed annual + quarterly workspaces retain the established annual
-                // compatibility behavior. Relative slots are only used when every
-                // loaded company has a native quarterly timeline.
-                return companies.every(c => c && !companyIsAnnualOnly(c) && Array.isArray(c.periods));
+                // Relative array-position alignment can compare non-overlapping periods
+                // and is intentionally disabled. Retained only so legacy helper calls
+                // remain harmless if an older saved state contains relative keys.
+                return false;
             }
 
             function getPriorYoYPeriod(periodStr, primaryPeriods = [], fallbackPeriods = []) {
+                if (isComparisonDatePeriod(periodStr)) {
+                    const current = parseComparisonDate(periodStr);
+                    if (current) {
+                        const priorKey = comparisonDateKey(new Date(
+                            current.getFullYear() - 1,
+                            current.getMonth(),
+                            current.getDate()
+                        ));
+                        return primaryPeriods.includes(priorKey)
+                            ? priorKey
+                            : (fallbackPeriods.includes(priorKey) ? priorKey : null);
+                    }
+                }
                 if (isRelativePeriod(periodStr)) {
                     return relativePeriodKey(getRelativePeriodIndex(periodStr) + 4);
                 }
@@ -2469,11 +2482,62 @@ ul.task-list li.task-done::before {
                 return `${yyyy}-${mm}-${dd}`;
             }
 
+            function parseLocalDate(value) {
+                if (value instanceof Date) {
+                    return isNaN(value.getTime()) ? null : new Date(value.getFullYear(), value.getMonth(), value.getDate());
+                }
+                const text = String(value || '').trim();
+                const iso = text.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+                if (iso) {
+                    const d = new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+                    return isNaN(d.getTime()) ? null : d;
+                }
+                const parsed = new Date(text);
+                return isNaN(parsed.getTime()) ? null : parsed;
+            }
+
+            function normalizeToComparableQuarterEnd(value) {
+                const dateObj = parseLocalDate(value);
+                if (!dateObj) return null;
+
+                const year = dateObj.getFullYear();
+                const candidates = [];
+                for (let y = year - 1; y <= year + 1; y++) {
+                    candidates.push(
+                        new Date(y, 2, 31),
+                        new Date(y, 5, 30),
+                        new Date(y, 8, 30),
+                        new Date(y, 11, 31)
+                    );
+                }
+
+                let nearest = null;
+                let nearestDiff = Infinity;
+                candidates.forEach(candidate => {
+                    const diff = Math.abs(candidate.getTime() - dateObj.getTime());
+                    if (diff < nearestDiff) {
+                        nearest = candidate;
+                        nearestDiff = diff;
+                    }
+                });
+                return nearest;
+            }
+
+            function normalizedQuarterKey(value) {
+                return comparisonDateKey(normalizeToComparableQuarterEnd(value));
+            }
+
+            function formatComparableQuarterLabel(periodStr) {
+                const d = parseComparisonDate(periodStr);
+                if (!d) return String(periodStr || '');
+                const quarter = Math.floor(d.getMonth() / 3) + 1;
+                return `Q${quarter} ${d.getFullYear()}`;
+            }
+
             function companyHasComparisonDates(company) {
                 if (!company || companyIsAnnualOnly(company) || !Array.isArray(company.periods)) return false;
-                const validCount = Array.isArray(company.exactDates)
-                    ? company.exactDates.filter(d => d instanceof Date && !isNaN(d.getTime())).length
-                    : 0;
+                const validCount = company.periods.reduce((count, _period, index) =>
+                    count + (getComparisonPeriodKey(company, index) ? 1 : 0), 0);
                 return validCount >= Math.min(4, company.periods.length);
             }
 
@@ -2484,8 +2548,39 @@ ul.task-list li.task-done::before {
             }
 
             function getComparisonPeriodKey(company, index) {
-                const exactDate = company && Array.isArray(company.exactDates) ? company.exactDates[index] : null;
-                return comparisonDateKey(exactDate) || company?.periods?.[index] || null;
+                if (!company || !Array.isArray(company.periods) || index < 0) return null;
+                const exactDate = Array.isArray(company.exactDates) ? company.exactDates[index] : null;
+                if (exactDate instanceof Date && !isNaN(exactDate.getTime())) {
+                    return normalizedQuarterKey(exactDate);
+                }
+
+                // Only date-like source labels are safe fallbacks. Fiscal labels such as
+                // FY2025-Q2 are deliberately not treated as calendar-quarter identifiers.
+                const sourcePeriod = company.periods[index];
+                return /^\d{4}-\d{2}-\d{2}$/.test(String(sourcePeriod || ''))
+                    ? normalizedQuarterKey(sourcePeriod)
+                    : null;
+            }
+
+            function getCompanyComparisonPeriodSet(company) {
+                const keys = new Set();
+                if (!company || !Array.isArray(company.periods)) return keys;
+                company.periods.forEach((_period, index) => {
+                    const key = getComparisonPeriodKey(company, index);
+                    if (key) keys.add(key);
+                });
+                return keys;
+            }
+
+            function getCommonComparisonPeriods() {
+                const quarterlyCompanies = companies.filter(c => c && !companyIsAnnualOnly(c));
+                if (quarterlyCompanies.length < 2) return [];
+
+                const sets = quarterlyCompanies.map(getCompanyComparisonPeriodSet);
+                if (sets.some(set => set.size === 0)) return [];
+
+                const [first, ...rest] = sets;
+                return Array.from(first).filter(key => rest.every(set => set.has(key)));
             }
 
             function findComparisonPeriodIndex(company, comparisonPeriod) {
@@ -3885,8 +3980,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (cat === '0_Period_Header' && label === 'Period Ending') {
                         originalExactDates = row.slice(sc, sc + originalPerds.length).map(v => {
                             if (!v || v.trim() === '') return null;
-                            const d = new Date(v.trim());
-                            return isNaN(d.getTime()) ? null : d;
+                            return parseLocalDate(v.trim());
                         });
                         continue;
                     }
@@ -3992,34 +4086,30 @@ document.addEventListener('DOMContentLoaded', () => {
 
             function rebuildGlobal() {
                 const pSet = new Set();
-                const alignByLatestQuarter = useLatestQuarterAlignment();
-                const alignByDate = !alignByLatestQuarter && useDateAlignedPeriods();
-                let maxRelativePeriods = 0;
+                const alignByDate = useDateAlignedPeriods();
                 allCategories.clear();
-                companies.forEach(c => { 
+
+                companies.forEach(c => {
                     if (!c || !Array.isArray(c.periods)) return;
-                    if (alignByLatestQuarter) {
-                        maxRelativePeriods = Math.max(maxRelativePeriods, c.periods.length);
-                    } else {
-                        c.periods.forEach((p, periodIndex) => {
+                    if (!alignByDate || activePeriodType === 'annual') {
+                        c.periods.forEach(p => {
                             if (activePeriodType === 'annual') {
                                 const annualKey = periodToAnnualKey(p);
                                 if (annualKey) pSet.add(annualKey);
-                            } else if (alignByDate) {
-                                const comparisonKey = getComparisonPeriodKey(c, periodIndex);
-                                if (comparisonKey) pSet.add(comparisonKey);
                             } else {
                                 pSet.add(p);
                             }
                         });
                     }
-                    if (c.categories) c.categories.forEach(cat => allCategories.add(cat)); 
+                    if (c.categories) c.categories.forEach(cat => allCategories.add(cat));
                 });
-                
+
                 if (activePeriodType === 'annual') {
                     globalPeriods = Array.from(pSet).sort((a, b) => parseInt(b) - parseInt(a));
-                } else if (alignByLatestQuarter) {
-                    globalPeriods = Array.from({ length: maxRelativePeriods }, (_, i) => relativePeriodKey(i));
+                } else if (alignByDate) {
+                    // Use the intersection, not the union: every displayed column is a
+                    // normalized quarter present for every compared quarterly company.
+                    globalPeriods = sortPeriods(getCommonComparisonPeriods());
                 } else {
                     globalPeriods = sortPeriods(Array.from(pSet));
                 }
@@ -4228,24 +4318,17 @@ document.addEventListener('DOMContentLoaded', () => {
     <div class="col-resizer"></div>
 </th>`;
 
-                    const latestQuarterAlignedHeaders = useLatestQuarterAlignment();
-                    const dateAlignedHeaders = !latestQuarterAlignedHeaders && useDateAlignedPeriods();
+                    const dateAlignedHeaders = useDateAlignedPeriods();
                     dispPeriods.forEach(p => {
                         const d = getExactDateForDisplay(company, p);
-                        const sourcePeriod = getSourcePeriodLabelForDisplay(company, p);
                         let primaryLabel = String(p || '');
                         let secondaryHtml = '';
 
-                        if (latestQuarterAlignedHeaders && isRelativePeriod(p)) {
-                            primaryLabel = d ? formatShortDate(d) : (sourcePeriod || formatDisplayPeriodLabel(p));
-                            if (d && sourcePeriod) {
-                                secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${esc(sourcePeriod)}</div>`;
-                            }
-                        } else if (dateAlignedHeaders && isComparisonDatePeriod(p)) {
+                        if (dateAlignedHeaders && isComparisonDatePeriod(p)) {
+                            // Show each company's actual period-end date while the small
+                            // label communicates the shared normalized comparison quarter.
                             primaryLabel = d ? formatShortDate(d) : formatDisplayPeriodLabel(p);
-                            if (sourcePeriod) {
-                                secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${esc(sourcePeriod)}</div>`;
-                            }
+                            secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${esc(formatComparableQuarterLabel(p))}</div>`;
                         } else if (d) {
                             secondaryHtml = `<div class="text-[10px] text-term-text-dimmer font-mono font-normal mt-0.5">${formatShortDate(d)}</div>`;
                         }
