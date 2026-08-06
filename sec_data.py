@@ -689,8 +689,7 @@ def _repair_misdirected_acquisition_cash_flows(df):
     )
     if not wrong.any():
         return out
-    if 'SourceCanonicalizedFrom' not in out.columns:
-        out['SourceCanonicalizedFrom'] = np.nan
+    _ensure_object_column(out, 'SourceCanonicalizedFrom')
     marker = 'cash_acquired_disclosure_to_acquisition_outflow'
     for idx in out.index[wrong]:
         concept = concept_text.at[idx]
@@ -729,7 +728,9 @@ def _repair_misdirected_acquisition_cash_flows(df):
             'SourceMetricIdentity': family,
         }
         for column, metadata_value in metadata.items():
-            if column not in out.columns:
+            if isinstance(metadata_value, (str, bool)):
+                _ensure_object_column(out, column)
+            elif column not in out.columns:
                 out[column] = np.nan
             out.at[idx, column] = metadata_value
         prior = str(out.at[idx, 'SourceCanonicalizedFrom'] or '').strip()
@@ -1279,27 +1280,50 @@ def _investment_row_source_label(row):
     return None
 
 
+def _ensure_object_column(frame, column):
+    """Ensure provenance/metadata columns can safely receive text values.
+
+    Pandas 3.x raises ``TypeError`` when text is assigned to a float64 column.
+    A column created from all-missing values is otherwise inferred as float64,
+    which is exactly what occurs for companies such as MSFT whose native cache
+    has no pre-existing ``SourceCanonicalizedFrom`` field.  Preserve existing
+    values while making the storage type explicit and forward-compatible.
+    """
+    if column not in frame.columns:
+        frame[column] = pd.Series(None, index=frame.index, dtype=object)
+    elif not pd.api.types.is_object_dtype(frame[column].dtype):
+        frame[column] = frame[column].astype(object)
+
+
 def _stamp_investment_family_metadata(out, idx, target, source_label,
                                       origin='fact_or_cache'):
     family_key = re.sub(r'[^a-z0-9]+', '_', target.casefold()).strip('_')
-    out.at[idx, 'SourceLabel'] = source_label
-    out.at[idx, 'SourceRawLabel'] = source_label
-    out.at[idx, 'SourceLabelOrigin'] = origin
-    out.at[idx, 'SourceAliasVerified'] = True
-    out.at[idx, 'SourceAliasRule'] = _INVESTMENT_FACE_ALIAS_RULE
-    out.at[idx, 'SourceEquivalentConcept'] = (
-        _INVESTMENT_EQUIVALENT_PREFIX + family_key)
-    out.at[idx, 'SourceMetricFamily'] = 'investing.' + family_key
-    out.at[idx, 'SourceMetricIdentity'] = family_key
-    out.at[idx, 'SourceSemanticType'] = target
+    metadata = {
+        'SourceLabel': source_label,
+        'SourceRawLabel': source_label,
+        'SourceLabelOrigin': origin,
+        'SourceAliasVerified': True,
+        'SourceAliasRule': _INVESTMENT_FACE_ALIAS_RULE,
+        'SourceEquivalentConcept': (
+            _INVESTMENT_EQUIVALENT_PREFIX + family_key),
+        'SourceMetricFamily': 'investing.' + family_key,
+        'SourceMetricIdentity': family_key,
+        'SourceSemanticType': target,
+    }
+    for column, value in metadata.items():
+        _ensure_object_column(out, column)
+        out.at[idx, column] = value
 
 
 def _append_source_marker(out, mask, marker):
-    if 'SourceCanonicalizedFrom' not in out.columns:
-        out['SourceCanonicalizedFrom'] = np.nan
+    _ensure_object_column(out, 'SourceCanonicalizedFrom')
     prior = out.loc[mask, 'SourceCanonicalizedFrom'].fillna('').astype(str)
-    out.loc[mask, 'SourceCanonicalizedFrom'] = np.where(
-        prior.eq(''), marker, prior + ';' + marker)
+    updated = pd.Series(
+        np.where(prior.eq(''), marker, prior + ';' + marker),
+        index=prior.index,
+        dtype=object,
+    )
+    out.loc[mask, 'SourceCanonicalizedFrom'] = updated
 
 
 def _compact_investing_text(*parts):
@@ -1401,8 +1425,7 @@ def _prepare_investing_cash_flow_facts(df):
     if df is None or df.empty or not required.issubset(df.columns):
         return df
     out = df.copy()
-    if 'SourceCanonicalizedFrom' not in out.columns:
-        out['SourceCanonicalizedFrom'] = np.nan
+    _ensure_object_column(out, 'SourceCanonicalizedFrom')
     out = _repair_misdirected_acquisition_cash_flows(out)
     out = _clear_standard_investment_face_aliases(out)
 
