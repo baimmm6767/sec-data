@@ -161,6 +161,9 @@ _DIVIDEND_CUMULATIVE_TRANSITION_GROUPS = (
 # deleting it later.
 _NONNEGATIVE_CUMULATIVE_RESIDUAL_LABELS = frozenset({
     'Capital Expenditures',
+    'Net Purchases of Productive Assets',
+    'PPE Purchase Incentives',
+    'PPE Sale Proceeds & Purchase Incentives',
     'Dividends Paid',
     'Income Taxes Paid, Net',
     'Interest Paid',
@@ -242,6 +245,15 @@ def _recompute_cf_residuals(df):
             li = ('3_Cash_Flow', lbl)
             if li in df.index:
                 ssum = ssum + _num_row(li).fillna(0) * w
+        if section == 'inv' and entry.get('productive_asset_basis'):
+            _productive = _productive_asset_bridge_contributions(
+                lambda label: (
+                    _num_row(('3_Cash_Flow', label))
+                    if ('3_Cash_Flow', label) in df.index
+                    else pd.Series(np.nan, index=df.columns)),
+                df.columns)
+            for contribution in _productive.values():
+                ssum = ssum + contribution
         res = (total.fillna(0) - ssum).where(total.notna())
         old = _num_row(ridx)
         if ((old.fillna(0) - res.fillna(0)).abs() > 1e6).any():
@@ -348,6 +360,179 @@ _INVESTMENT_CASH_FLOW_CONCEPTS = frozenset(
     | set(_INVESTMENT_PROCEEDS_AGGREGATE_CONCEPTS)
     | set(_SIGNED_OTHER_INVESTING_CONCEPTS)
 )
+
+# Productive-asset cash flows require basis-aware classification.  The first
+# concept is deliberately ambiguous: filers use it for either a gross purchase
+# line or a net-of-proceeds/incentives line.  The fact's own human-readable
+# label therefore decides its normalized family; missing/conflicting label
+# evidence fails closed to the net family rather than inflating gross CapEx.
+_PRODUCTIVE_ASSET_NET_CONCEPT = 'PaymentsForProceedsFromProductiveAssets'
+_PRODUCTIVE_ASSET_INCENTIVE_CONCEPT = (
+    'ProceedsFromRebatesOnPurchasesOfProductiveAssets')
+_PRODUCTIVE_ASSET_COMBINED_PROCEEDS_CONCEPT = (
+    'ProceedsFromPropertyPlantAndEquipmentSalesAndIncentives')
+_PRODUCTIVE_ASSET_AMBIGUOUS_CONCEPTS = frozenset({
+    _PRODUCTIVE_ASSET_NET_CONCEPT,
+    _PRODUCTIVE_ASSET_INCENTIVE_CONCEPT,
+    _PRODUCTIVE_ASSET_COMBINED_PROCEEDS_CONCEPT,
+})
+_PRODUCTIVE_ASSET_BRIDGE_LABELS = (
+    'Capital Expenditures',
+    'Net Purchases of Productive Assets',
+    'PPE Purchase Incentives',
+    'PPE Sale Proceeds & Purchase Incentives',
+)
+_GENUINE_PRODUCTIVE_ASSET_SALE_CONCEPTS = frozenset({
+    'ProceedsFromSaleOfPropertyPlantAndEquipment',
+    'ProceedsFromSaleOfIntangibleAssets',
+    'ProceedsFromSaleOfOtherAssets',
+    'ProceedsFromSaleOfProductiveAssets',
+    'ProceedsFromSaleOfOperatingLeaseAssets',
+    'ProceedsFromSaleOfRealEstate',
+})
+
+
+def _compact_productive_asset_text(*parts):
+    return re.sub(r'[^a-z0-9]+', '', ' '.join(
+        str(part or '') for part in parts).casefold())
+
+
+def _classify_productive_asset_cash_flow_line(concept,
+                                               presentation_labels=None):
+    """Return a basis-aware productive-asset cash-flow label.
+
+    ``PaymentsForProceedsFromProductiveAssets`` is not intrinsically gross or
+    net.  A strong filer label such as "Purchases of property and equipment"
+    proves gross CapEx, while "... net of proceeds/incentives" remains a net
+    family.  Unknown or conflicting evidence is kept net so the pipeline never
+    fabricates gross CapEx from an economically narrower amount.
+    """
+    local = str(concept or '').split(':')[-1]
+    if local in _GENUINE_PRODUCTIVE_ASSET_SALE_CONCEPTS:
+        return 'Proceeds from Asset Sales'
+    if local == _PRODUCTIVE_ASSET_INCENTIVE_CONCEPT:
+        return 'PPE Purchase Incentives'
+    if local == _PRODUCTIVE_ASSET_COMBINED_PROCEEDS_CONCEPT:
+        return 'PPE Sale Proceeds & Purchase Incentives'
+    if local != _PRODUCTIVE_ASSET_NET_CONCEPT:
+        return None
+
+    if isinstance(presentation_labels, str) or presentation_labels is None:
+        labels = [presentation_labels]
+    else:
+        labels = list(presentation_labels)
+
+    saw_gross_purchase = False
+    saw_net_or_conflict = False
+    saw_sale_only = False
+    for label in labels:
+        text = _compact_productive_asset_text(label)
+        if not text:
+            continue
+        if 'paymentsforproceedsfromproductiveassets' in text:
+            # Generic taxonomy wording carries no gross-vs-net evidence.
+            continue
+        has_purchase = any(token in text for token in (
+            'purchaseof', 'purchasesof', 'paymentstoacquire', 'paymentfor',
+            'capitalexpenditure', 'capitalspending', 'additionstoproperty',
+            'acquisitionofproperty'))
+        has_sale = any(token in text for token in (
+            'proceedsfromsale', 'saleofproperty', 'salesofproperty',
+            'disposalofproperty', 'assetproceeds'))
+        has_incentive = any(token in text for token in (
+            'incentive', 'rebate', 'reimbursement',
+            'tenantimprovementallowance'))
+        explicit_net = (
+            'netof' in text or text.endswith('net')
+            or 'netpurchase' in text)
+        if has_purchase and not explicit_net and not has_sale and not has_incentive:
+            saw_gross_purchase = True
+        elif has_sale and not has_purchase:
+            saw_sale_only = True
+        elif has_purchase or explicit_net or has_incentive or has_sale:
+            saw_net_or_conflict = True
+
+    if saw_net_or_conflict:
+        return 'Net Purchases of Productive Assets'
+    if saw_gross_purchase and not saw_sale_only:
+        return 'Capital Expenditures'
+    if saw_sale_only and not saw_gross_purchase:
+        return 'Proceeds from Asset Sales'
+    return 'Net Purchases of Productive Assets'
+
+
+def _productive_asset_source_label(labels, target_label):
+    """Choose one deterministic source label supporting the classification."""
+    if isinstance(labels, str) or labels is None:
+        labels = [labels]
+    cleaned = [re.sub(r'\s+', ' ', str(label or '')).strip()
+               for label in labels]
+    cleaned = [label for label in cleaned if label]
+    for label in cleaned:
+        if (_classify_productive_asset_cash_flow_line(
+                _PRODUCTIVE_ASSET_NET_CONCEPT, label) == target_label):
+            return label
+    return cleaned[0] if cleaned else None
+
+
+def _collect_productive_asset_face_labels(xbrl):
+    """Collect filer-authored cash-flow face labels for fallback evidence."""
+    result = defaultdict(list)
+    try:
+        role_to_cat = _classify_statement_roles(xbrl)
+        trees = getattr(xbrl, 'presentation_trees', None) or {}
+    except Exception:
+        return {}
+    for role, category in role_to_cat.items():
+        if category != '3_Cash_Flow':
+            continue
+        tree = trees.get(role)
+        nodes = getattr(tree, 'all_nodes', None)
+        if not nodes:
+            continue
+        for elem_id in _presentation_order(tree):
+            node = nodes.get(elem_id)
+            if node is None or getattr(node, 'is_abstract', False):
+                continue
+            concept = elem_id.replace('_', ':', 1).split(':')[-1]
+            if concept not in _PRODUCTIVE_ASSET_AMBIGUOUS_CONCEPTS:
+                continue
+            label = (getattr(node, 'standard_label', None)
+                     or getattr(node, 'display_label', None) or '')
+            label = re.sub(r'\s+', ' ', str(label)).strip().rstrip(':')
+            if label and label not in result[concept]:
+                result[concept].append(label)
+    return {concept: tuple(labels) for concept, labels in result.items()}
+
+
+def _productive_asset_bridge_contributions(getrow, index):
+    """Return mutually exclusive productive-asset bridge contributions.
+
+    Gross purchases plus separately reported incentives/proceeds are preferred.
+    When gross purchases are unavailable, a net productive-assets line is used
+    once and any separately surfaced incentive/combined row is suppressed from
+    bridge arithmetic for that period to prevent double counting.
+    """
+    def _row(label):
+        values = pd.to_numeric(getrow(label), errors='coerce')
+        return values.reindex(index)
+
+    gross = _row('Capital Expenditures')
+    net = _row('Net Purchases of Productive Assets')
+    incentives = _row('PPE Purchase Incentives')
+    combined = _row('PPE Sale Proceeds & Purchase Incentives')
+    gross_basis = gross.notna()
+    net_basis = ~gross_basis & net.notna()
+    allow_positive_components = ~net_basis
+    return {
+        'Capital Expenditures': -gross.where(gross_basis, 0.0).fillna(0.0),
+        'Net Purchases of Productive Assets':
+            -net.where(net_basis, 0.0).fillna(0.0),
+        'PPE Purchase Incentives':
+            incentives.where(allow_positive_components, 0.0).fillna(0.0),
+        'PPE Sale Proceeds & Purchase Incentives':
+            combined.where(allow_positive_components, 0.0).fillna(0.0),
+    }
 
 
 def _compact_investing_text(*parts):
@@ -623,7 +808,9 @@ def _is_investment_asset_cash_flow_concept(concept, presentation_label=None):
         str(part or '') for part in (local, presentation_label)).casefold())
     if not text:
         return False
-    if local in _INVESTMENT_CASH_FLOW_CONCEPTS:
+    if (local in _INVESTMENT_CASH_FLOW_CONCEPTS
+            or local in _PRODUCTIVE_ASSET_AMBIGUOUS_CONCEPTS
+            or local in _GENUINE_PRODUCTIVE_ASSET_SALE_CONCEPTS):
         return True
     security_asset = any(token in text for token in (
         'marketablesecurit', 'marketabledebtsecurit', 'availableforsale', 'heldtomaturity',
@@ -4018,6 +4205,9 @@ CONCEPT_MAP = {
     'Change in Other Liabilities': {'tags': ['IncreaseDecreaseInOtherOperatingLiabilities', 'IncreaseDecreaseInOtherCurrentLiabilities', 'IncreaseDecreaseInOtherNoncurrentLiabilities'], 'cat': '3_Cash_Flow'},
     'Operating Cash Flow': {'tags': ['NetCashProvidedByUsedInOperatingActivities', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations', 'NetCashProvidedByUsedInOperatingActivitiesDiscontinuedOperations'], 'cat': '3_Cash_Flow'},
     'Capital Expenditures': {'tags': ['PaymentsToAcquireProductiveAssets', 'PaymentsToAcquirePropertyPlantAndEquipment', 'PaymentsForCapitalImprovements', 'PurchasesOfPropertyAndEquipment', 'PropertyPlantAndEquipmentAdditions', 'AcquisitionsOfPropertyPlantAndEquipment', 'PaymentsToAcquirePropertyAndEquipment', 'PurchaseOfPropertyPlantAndEquipment', 'PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets', 'PurchasesOfPropertyAndEquipmentAndIntangibleAssets'], 'cat': '3_Cash_Flow'},
+    'Net Purchases of Productive Assets': {'tags': ['PaymentsForProceedsFromProductiveAssets'], 'cat': '3_Cash_Flow'},
+    'PPE Purchase Incentives': {'tags': ['ProceedsFromRebatesOnPurchasesOfProductiveAssets'], 'cat': '3_Cash_Flow'},
+    'PPE Sale Proceeds & Purchase Incentives': {'tags': ['ProceedsFromPropertyPlantAndEquipmentSalesAndIncentives'], 'cat': '3_Cash_Flow'},
     'Capital Expenditures (Software)': {'tags': ['PaymentsToAcquireSoftware', 'PaymentsToDevelopSoftware'], 'cat': '3_Cash_Flow'},
     'Capital Expenditures (Intangibles)': {'tags': ['PaymentsToAcquireIntangibleAssets'], 'cat': '3_Cash_Flow'},
     'Capital Expenditures (Equipment & Buildings)': {'tags': ['PaymentsToAcquireOtherPropertyPlantAndEquipment', 'PaymentsToAcquireMachineryAndEquipment', 'PaymentsToAcquireBuildings', 'PaymentsToAcquireLandAndBuildingsAndImprovements', 'PaymentsForConstructionInProcess', 'PaymentsToDevelopRealEstate', 'CapitalExpendituresIncurredButNotYetPaid'], 'cat': '3_Cash_Flow'},
@@ -4032,7 +4222,7 @@ CONCEPT_MAP = {
     'Proceeds from Non-Marketable / Other Investments': {'tags': ['ProceedsFromSaleAndMaturityOfOtherInvestments', 'ProceedsFromSaleOfInvestments'], 'cat': '3_Cash_Flow'},
     'Proceeds from Alternative Investments': {'tags': ['ProceedsFromSalesOfAlternativeInvestments'], 'cat': '3_Cash_Flow'},
     'Proceeds from Investments': {'tags': ['ProceedsFromSaleAndMaturityOfInvestments'], 'cat': '3_Cash_Flow'},
-    'Proceeds from Asset Sales': {'tags': ['ProceedsFromSaleOfPropertyPlantAndEquipment', 'ProceedsFromSaleOfIntangibleAssets', 'ProceedsFromSaleOfOtherAssets', 'ProceedsFromSaleOfProductiveAssets', 'ProceedsFromSaleOfOperatingLeaseAssets', 'ProceedsFromSaleOfRealEstate', 'PaymentsForProceedsFromProductiveAssets', 'ProceedsFromPropertyPlantAndEquipmentSalesAndIncentives', 'ProceedsFromRebatesOnPurchasesOfProductiveAssets'], 'cat': '3_Cash_Flow'},
+    'Proceeds from Asset Sales': {'tags': ['ProceedsFromSaleOfPropertyPlantAndEquipment', 'ProceedsFromSaleOfIntangibleAssets', 'ProceedsFromSaleOfOtherAssets', 'ProceedsFromSaleOfProductiveAssets', 'ProceedsFromSaleOfOperatingLeaseAssets', 'ProceedsFromSaleOfRealEstate'], 'cat': '3_Cash_Flow'},
     'Other Investing Activities': {'tags': ['PaymentsForProceedsFromOtherInvestingActivities'], 'cat': '3_Cash_Flow'},
     'Investing Cash Flow': {'tags': ['NetCashProvidedByUsedInInvestingActivities', 'NetCashProvidedByUsedInInvestingActivitiesContinuingOperations', 'NetCashProvidedByUsedInInvestingActivitiesDiscontinuedOperations'], 'cat': '3_Cash_Flow'},
     # Debt cash flows are first preserved by instrument family.  The legacy
@@ -14753,6 +14943,12 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                     _tag_to_labels.setdefault(_t, []).append(_lbl)
                     _tag_rank_lookup[(_lbl, _t)] = _rank
 
+    try:
+        _productive_asset_face_labels = _collect_productive_asset_face_labels(
+            xbrl)
+    except Exception:
+        _productive_asset_face_labels = {}
+
     extracted = []
     with _ProfileTimer("extract_prepare_columns"):
         dim_cols = [c for c in facts_df.columns if c.startswith('dim_')]
@@ -15021,7 +15217,37 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
 
         # 1. Check for Standard Concepts (Consolidated)
         captured_by_concept_map = False
-        target_labels = _tag_to_labels.get(concept)
+        _source_fact_label = None
+        _source_fact_label_origin = None
+        if concept in _PRODUCTIVE_ASSET_AMBIGUOUS_CONCEPTS:
+            for _label_column in (
+                    'label', 'label_text', 'standard_label',
+                    'concept_label', 'name'):
+                _candidate_label = row.get(_label_column, None)
+                if (_candidate_label is not None
+                        and not pd.isna(_candidate_label)
+                        and str(_candidate_label).strip()):
+                    _source_fact_label = str(_candidate_label).strip()
+                    _source_fact_label_origin = 'fact'
+                    break
+            # The fact-level label is the strongest evidence because it is
+            # attached to this exact context.  Presentation-tree labels are a
+            # fallback only; combining both could let an old comparative/net
+            # face label override a directly labelled gross purchase fact.
+            _productive_labels = (
+                [_source_fact_label] if _source_fact_label else list(
+                    _productive_asset_face_labels.get(concept, ())))
+            _productive_target = _classify_productive_asset_cash_flow_line(
+                concept, _productive_labels)
+            target_labels = (
+                (_productive_target,) if _productive_target else None)
+            if _productive_target and not _source_fact_label:
+                _source_fact_label = _productive_asset_source_label(
+                    _productive_labels, _productive_target)
+                if _source_fact_label:
+                    _source_fact_label_origin = 'presentation_tree'
+        else:
+            target_labels = _tag_to_labels.get(concept)
                 
         # Strict financing-equity fallback runs before generic fuzzy matching.
         # This catches issuer extensions even when presentation/calculation
@@ -15102,7 +15328,7 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 if end_str is None:
                     end_str = end_dt.strftime('%Y-%m-%d')
                     start_str = _start_dt.strftime('%Y-%m-%d') if pd.notna(_start_dt) else None
-                extracted.append({
+                _extracted_fact = {
                     'Category': info['cat'], 'Label': target_label, 'Value': val,
                     'FY': fy, 'Q': q, 'End': end_str, 'Start': start_str, 'Duration': dur,
                     'Filed': _filing_date_raw, 'TagRank': rank,
@@ -15115,7 +15341,35 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                     'SourceDirectness': ('calculation_linkbase' if is_calculated else 'reported'),
                     'SourceClassificationConfidence': 1.0,
                     'SourceTableRole': 'xbrl_statement_fact',
-                })
+                }
+                if _source_fact_label:
+                    _extracted_fact['SourceLabel'] = _source_fact_label
+                    _extracted_fact['SourceRawLabel'] = _source_fact_label
+                    _extracted_fact['SourceLabelOrigin'] = (
+                        _source_fact_label_origin)
+                if (concept == _PRODUCTIVE_ASSET_NET_CONCEPT
+                        and target_label == 'Capital Expenditures'
+                        and _source_fact_label
+                        and _classify_productive_asset_cash_flow_line(
+                            concept, _source_fact_label)
+                        == 'Capital Expenditures'):
+                    # A filer-authored face label proves that this otherwise
+                    # ambiguous legacy concept is gross productive-asset
+                    # purchases.  Record a narrow audited equivalence so the
+                    # quarterizer may bridge a taxonomy transition without
+                    # weakening exact-concept arithmetic for any other metric.
+                    _extracted_fact.update({
+                        'SourceEquivalentConcept':
+                            'PaymentsToAcquireProductiveAssets',
+                        'SourceAliasVerified': True,
+                        'SourceAliasRule':
+                            'productive_asset_gross_face_label',
+                        'SourceMetricFamily':
+                            'capital_expenditures.gross_productive_assets',
+                        'SourceMetricIdentity':
+                            'gross_productive_asset_purchases',
+                    })
+                extracted.append(_extracted_fact)
                 captured_by_concept_map = True
 
         # 2. Check for Segment/Dimensional Breakdowns
@@ -23099,11 +23353,54 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             return None
         return 'InterestExpenseNonoperating'
 
+    def _verified_productive_asset_equivalent_concept(row):
+        """Return the gross-CapEx identity proven by a filer face label."""
+        if row is None:
+            return None
+        if str(row.get('Category') or '').strip() != '3_Cash_Flow':
+            return None
+        if str(row.get('Label') or '').strip() != 'Capital Expenditures':
+            return None
+        if str(row.get('Concept') or '').split(':')[-1] != (
+                _PRODUCTIVE_ASSET_NET_CONCEPT):
+            return None
+        if not bool(row.get('SourceAliasVerified', False)):
+            return None
+        if str(row.get('SourceAliasRule') or '').strip() != (
+                'productive_asset_gross_face_label'):
+            return None
+        if str(row.get('SourceEquivalentConcept') or '').strip() != (
+                'PaymentsToAcquireProductiveAssets'):
+            return None
+        if str(row.get('SourceMetricFamily') or '').strip() != (
+                'capital_expenditures.gross_productive_assets'):
+            return None
+        if str(row.get('SourceMetricIdentity') or '').strip() != (
+                'gross_productive_asset_purchases'):
+            return None
+        source_label = str(row.get('SourceLabel') or '').strip()
+        if (_classify_productive_asset_cash_flow_line(
+                _PRODUCTIVE_ASSET_NET_CONCEPT, source_label)
+                != 'Capital Expenditures'):
+            return None
+        dim_count = pd.to_numeric(
+            pd.Series([row.get('DimCount')]), errors='coerce').iloc[0]
+        if pd.isna(dim_count) or int(dim_count) != 0:
+            return None
+        start = _parse_plain_date_cached(row.get('Start'))
+        end = _parse_plain_date_cached(row.get('End'))
+        if pd.isna(start) or pd.isna(end) or end <= start:
+            return None
+        return 'PaymentsToAcquireProductiveAssets'
+
     def _exact_subtraction_concept(row):
         """Return a concrete concept suitable for cumulative subtraction."""
         if row is None:
             return None
         verified_equivalent = _verified_html_equivalent_concept(row)
+        if verified_equivalent is not None:
+            return verified_equivalent
+        verified_equivalent = _verified_productive_asset_equivalent_concept(row)
         if verified_equivalent is not None:
             return verified_equivalent
         concept = row.get('Concept')
@@ -24367,7 +24664,11 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                     'General & Administrative', 'Selling, General & Admin', 'Total Operating Expenses',
                     'Marketing Expense', 'Depreciation & Amortization',
                     'Amortization of Intangibles', 'Stock-Based Compensation',
-                    'Capital Expenditures', 'Share Repurchases', 'Dividends Paid'
+                    'Capital Expenditures',
+                    'Net Purchases of Productive Assets',
+                    'PPE Purchase Incentives',
+                    'PPE Sale Proceeds & Purchase Incentives',
+                    'Share Repurchases', 'Dividends Paid'
                 )
                 is_cumulative = label in _CUMULATIVE_METRICS or any(label.startswith(m + ' - ') for m in _CUMULATIVE_METRICS)
 
@@ -27016,6 +27317,9 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
         'Proceeds from Non-Marketable / Other Investments',
         'Proceeds from Alternative Investments',
         'Proceeds from Asset Sales',
+        'Net Purchases of Productive Assets',
+        'PPE Purchase Incentives',
+        'PPE Sale Proceeds & Purchase Incentives',
         'Other Investing Activities',
     }
 
@@ -33565,14 +33869,24 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
         _inv_contribs = {}
         
         inv_components = [
-            'Capital Expenditures', 'Acquisitions', 'Purchases of Investments',
+            'Capital Expenditures', 'Net Purchases of Productive Assets',
+            'PPE Purchase Incentives',
+            'PPE Sale Proceeds & Purchase Incentives',
+            'Acquisitions', 'Purchases of Investments',
             'Proceeds from Investments', 'Proceeds from Asset Sales',
             'Divestitures', 'Other Investing Activities',
             *_INVESTMENT_COMPONENT_LABELS,
         ]
 
+        _productive_contribs = _productive_asset_bridge_contributions(
+            lambda label: get_num(label, preferred_cat='3_Cash_Flow'),
+            pivoted.columns)
+        for _productive_label, _productive_contribution in (
+                _productive_contribs.items()):
+            inv_sum += _productive_contribution
+            _inv_contribs[_productive_label] = _productive_contribution
+
         _fixed_investing_components = (
-            ('Capital Expenditures', -1.0, None),
             ('Acquisitions', -1.0, None),
             ('Purchases of Investments', -1.0, purchases_of_investments_n),
             ('Proceeds from Investments', 1.0, proceeds_from_investments_n),
@@ -33676,8 +33990,21 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
         fin_residual = pd.to_numeric(fin_total, errors='coerce').fillna(0) - fin_sum
         _CF_BRIDGE_SPEC.clear()
         for _sec, _ctr in (('op', _ocf_contribs), ('inv', _inv_contribs), ('fin', _fin_contribs)):
-            _sp, _cm = _spec_from_contribs(_ctr, lambda l: get_row(l, preferred_cat='3_Cash_Flow'))
-            _CF_BRIDGE_SPEC[_sec] = {'spec': _sp, 'complete': _cm}
+            _spec_contribs = _ctr
+            if _sec == 'inv':
+                _spec_contribs = {
+                    label: contribution
+                    for label, contribution in _ctr.items()
+                    if label not in _PRODUCTIVE_ASSET_BRIDGE_LABELS
+                }
+            _sp, _cm = _spec_from_contribs(
+                _spec_contribs,
+                lambda l: get_row(l, preferred_cat='3_Cash_Flow'))
+            _CF_BRIDGE_SPEC[_sec] = {
+                'spec': _sp,
+                'complete': _cm,
+                'productive_asset_basis': (_sec == 'inv'),
+            }
         _BRIDGE_USED_LABELS.clear()
         for _ctr in (_ocf_contribs, _inv_contribs, _fin_contribs):
             _BRIDGE_USED_LABELS.update(_ctr.keys())
@@ -34110,6 +34437,8 @@ def _repair_always_positive(df):
     ALWAYS_POSITIVE_CF_LABELS = {
         'Depreciation & Amortization', 'Depreciation', 'Amortization',
         'Stock-Based Compensation', 'Capital Expenditures', 'Capital Expenditure',
+        'Net Purchases of Productive Assets', 'PPE Purchase Incentives',
+        'PPE Sale Proceeds & Purchase Incentives',
         'Capex', 'Dividends Paid',
         'Taxes Paid on Stock Awards', 'Total Debt Repaid', 'Short-term Debt Repaid', 
         'Long-term Debt Repaid', 'Share Repurchases',
