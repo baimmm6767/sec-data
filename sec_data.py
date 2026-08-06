@@ -244,7 +244,12 @@ def _recompute_cf_residuals(df):
         for lbl, w in spec.items():
             li = ('3_Cash_Flow', lbl)
             if li in df.index:
-                ssum = ssum + _num_row(li).fillna(0) * w
+                values = _num_row(li)
+                if section == 'inv' and lbl == 'Purchases of Investments':
+                    values, _ = (
+                        _bridge_investment_purchases_excluding_acquisition_overlap(
+                            df, values))
+                ssum = ssum + values.fillna(0) * w
         if section == 'inv' and entry.get('productive_asset_basis'):
             _productive = _productive_asset_bridge_contributions(
                 lambda label: (
@@ -299,6 +304,31 @@ _INVESTMENT_PROCEEDS_COMPONENT_LABELS = (
 _INVESTMENT_COMPONENT_LABELS = frozenset(
     _INVESTMENT_PURCHASE_COMPONENT_LABELS
     + _INVESTMENT_PROCEEDS_COMPONENT_LABELS)
+
+# Signed net business-combination cash flow is separate from ordinary
+# acquisition outflows.  The row uses the same normalized convention as
+# acquisition outflows: positive values are investing outflows and negative
+# values are investing inflows (for example, acquired cash exceeding cash paid).
+_BUSINESS_COMBINATIONS_NET_LABEL = (
+    'Business Combinations, Net of Cash Acquired')
+_INVESTMENT_FACE_TARGET_LABELS = frozenset({
+    *_INVESTMENT_COMPONENT_LABELS,
+    'Purchases of Investments', 'Proceeds from Investments',
+    'Other Investing Activities', _BUSINESS_COMBINATIONS_NET_LABEL,
+})
+_INVESTMENT_MIGRATION_PURCHASE_LABELS = frozenset({
+    'Purchases of Non-Marketable / Other Investments',
+    'Purchases of Alternative Investments',
+})
+_INVESTMENT_LATE_BASELINE_LABELS = frozenset({
+    'Purchases of Non-Marketable / Other Investments',
+    'Purchases of Alternative Investments',
+    'Proceeds from Alternative Investments',
+    _BUSINESS_COMBINATIONS_NET_LABEL,
+})
+_INVESTMENT_FACE_ALIAS_RULE = 'investing_cash_flow_face_family'
+_INVESTMENT_MIGRATION_RULE = 'investing_family_presentation_migration'
+_INVESTMENT_EQUIVALENT_PREFIX = 'VerifiedInvestmentCashFlowFamily:'
 
 _INVESTMENT_PURCHASE_AGGREGATE_CONCEPTS = frozenset({
     'PaymentsToAcquireInvestments',
@@ -524,15 +554,752 @@ def _productive_asset_bridge_contributions(getrow, index):
     gross_basis = gross.notna()
     net_basis = ~gross_basis & net.notna()
     allow_positive_components = ~net_basis
+    # The combined row is an aggregate that already includes purchase
+    # incentives.  When both are published for one period (Amazon 2020-2021),
+    # count the aggregate once and suppress the narrower incentive component.
+    combined_basis = allow_positive_components & combined.notna()
+    incentive_basis = allow_positive_components & ~combined_basis
     return {
         'Capital Expenditures': -gross.where(gross_basis, 0.0).fillna(0.0),
         'Net Purchases of Productive Assets':
             -net.where(net_basis, 0.0).fillna(0.0),
         'PPE Purchase Incentives':
-            incentives.where(allow_positive_components, 0.0).fillna(0.0),
+            incentives.where(incentive_basis, 0.0).fillna(0.0),
         'PPE Sale Proceeds & Purchase Incentives':
-            combined.where(allow_positive_components, 0.0).fillna(0.0),
+            combined.where(combined_basis, 0.0).fillna(0.0),
     }
+
+
+# Acquisition cash-flow lines can migrate between standard and issuer-specific
+# XBRL concepts while retaining the same filer-authored statement-face meaning.
+# Keep measurement families separate so a pure business-acquisition line is
+# never quarterized against a broader line that also includes non-marketable
+# investments, intangibles, divestitures, or other assets.
+_ACQUISITION_EQUIVALENT_PREFIX = 'VerifiedAcquisitionCashFlowFamily:'
+_ACQUISITION_ALIAS_RULE = 'acquisition_cash_flow_face_family'
+
+
+def _compact_acquisition_text(*parts):
+    return re.sub(r'[^a-z0-9]+', '', ' '.join(
+        str(part or '') for part in parts).casefold())
+
+
+def _classify_acquisition_cash_flow_family(presentation_label):
+    """Return a conservative acquisition cash-flow measurement family.
+
+    The result is used only as a subtraction identity inside one normalized
+    ``Acquisitions`` row.  It does not change the displayed label or combine
+    economically different acquisition/investment scopes.
+    """
+    text = _compact_acquisition_text(presentation_label)
+    if not text:
+        return None
+    has_acquisition = any(token in text for token in (
+        'acquisition', 'acquirebusiness', 'acquiredbusiness',
+        'businesscombination', 'purchaseofbusiness', 'purchaseofcompan',
+        'cashpaymentsnetofacquiredcash'))
+    if not has_acquisition:
+        return None
+
+    # Combined company/intangible/other-asset or divestiture presentations.
+    # Test this before the broad ``and other`` family because labels such as
+    # Microsoft's explicitly contain both constructions.
+    if any(token in text for token in (
+            'intangible', 'otherasset', 'intellectualproperty',
+            'divestiture', 'divested')):
+        return 'acquisitions_and_intangibles_other_assets_net'
+
+    # Broad investment activity, used by Amazon and similar filers.
+    if any(token in text for token in (
+            'nonmarketableinvestment', 'nonmarketable',
+            'otherinvestmentactivity', 'otherinvestment',
+            'investmentandother', 'acquisitionandotherinvestment',
+            'acquisitionsandother', 'strategicinvestment',
+            'convertiblenote', 'andothernet', 'andother')):
+        return 'acquisitions_and_other_investment_activity_net'
+
+    if 'gross' in text and 'netofcashacquired' not in text:
+        return 'business_acquisitions_gross'
+
+    # A face line explicitly limited to businesses/acquisitions, normally net
+    # of acquired cash.  Generic taxonomy labels fall into this family only
+    # when they contain acquisition language and no broader-scope tokens above.
+    return 'business_acquisitions_net_of_cash_acquired'
+
+
+
+def _is_acquisition_cash_outflow_concept(concept):
+    """Return True for cash payments to acquire businesses or related assets.
+
+    Taxonomy and issuer-extension names frequently contain ``NetOfCashAcquired``.
+    That phrase describes the *measurement basis* of an acquisition payment; it
+    does not turn the outflow into cash received.  Directional payment/purchase
+    language therefore wins over the embedded words ``cash acquired``.
+    """
+    text = _compact_acquisition_text(concept)
+    if not text:
+        return False
+    has_business_scope = any(token in text for token in (
+        'acquirebusiness', 'acquisition', 'businesscombination',
+        'purchaseofbusiness', 'purchaseofcompan'))
+    if not has_business_scope:
+        return False
+    has_outflow_direction = any(token in text for token in (
+        'paymentstoacquire', 'paymenttoacquire', 'paymentsforacquisition',
+        'paymentforacquisition', 'cashpaymentsfor', 'cashpaymentfor',
+        'purchaseofbusiness', 'purchasesofbusiness',
+        'acquisitionsnetofcashacquired'))
+    return bool(has_outflow_direction)
+
+
+def _is_cash_acquired_in_business_acquisition_concept(concept):
+    """Return True only for genuine cash balances received in acquisitions."""
+    if _is_acquisition_cash_outflow_concept(concept):
+        return False
+    text = _compact_acquisition_text(concept)
+    if not text:
+        return False
+    return bool(
+        'cash' in text
+        and any(token in text for token in (
+            'acquiredinbusinessacquisition',
+            'acquiredinbusinesscombination',
+            'cashacquiredinacquisition',
+            'cashacquiredinbusiness'))
+    )
+
+
+def _repair_misdirected_acquisition_cash_flows(df):
+    """Move payment concepts misrouted as acquired-cash disclosures to CF.
+
+    This is deliberately concept-direction based and therefore also repairs
+    warm native-extraction caches produced by older mapping logic.  Genuine
+    ``CashCashEquivalents...AcquiredInBusinessAcquisitions`` disclosures are
+    untouched because they contain no payment/purchase direction.
+    """
+    required = {'Category', 'Label', 'Concept', 'Value'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    concept_text = out['Concept'].fillna('').astype(str).map(
+        lambda value: value.split(':')[-1])
+    wrong = (
+        out['Label'].eq('Cash Acquired in Business Acquisitions')
+        & concept_text.map(_is_acquisition_cash_outflow_concept)
+    )
+    if not wrong.any():
+        return out
+    if 'SourceCanonicalizedFrom' not in out.columns:
+        out['SourceCanonicalizedFrom'] = np.nan
+    marker = 'cash_acquired_disclosure_to_acquisition_outflow'
+    for idx in out.index[wrong]:
+        concept = concept_text.at[idx]
+        value = pd.to_numeric(pd.Series([out.at[idx, 'Value']]),
+                              errors='coerce').iloc[0]
+        family = _classify_acquisition_cash_flow_family(concept)
+        if family is None:
+            family = 'business_acquisitions_net_of_cash_acquired'
+        source_label = str(out.at[idx, 'SourceLabel'] or '').strip() \
+            if 'SourceLabel' in out.columns and pd.notna(out.at[idx, 'SourceLabel']) else ''
+        if not source_label:
+            source_label = concept
+        out.at[idx, 'Category'] = '3_Cash_Flow'
+        out.at[idx, 'Label'] = 'Acquisitions'
+        if pd.notna(value):
+            out.at[idx, 'Value'] = abs(float(value))
+        if 'TagRank' in out.columns:
+            tags = CONCEPT_MAP.get('Acquisitions', {}).get('tags', [])
+            try:
+                out.at[idx, 'TagRank'] = tags.index(concept)
+            except ValueError:
+                out.at[idx, 'TagRank'] = 999
+        metadata = {
+            'SourceKind': 'xbrl',
+            'SourceAdmissionRule': 'acquisition_payment_direction_repair',
+            'SourceSemanticType': 'Acquisitions',
+            'SourceAnalyticalBasis': 'consolidated_statement',
+            'SourceTableRole': 'xbrl_statement_fact',
+            'SourceLabel': source_label,
+            'SourceRawLabel': source_label,
+            'SourceLabelOrigin': 'concept_name_repair',
+            'SourceEquivalentConcept': _ACQUISITION_EQUIVALENT_PREFIX + family,
+            'SourceAliasVerified': True,
+            'SourceAliasRule': _ACQUISITION_ALIAS_RULE,
+            'SourceMetricFamily': 'acquisitions.' + family,
+            'SourceMetricIdentity': family,
+        }
+        for column, metadata_value in metadata.items():
+            if column not in out.columns:
+                out[column] = np.nan
+            out.at[idx, column] = metadata_value
+        prior = str(out.at[idx, 'SourceCanonicalizedFrom'] or '').strip()
+        out.at[idx, 'SourceCanonicalizedFrom'] = (
+            marker if not prior or prior == 'nan' else prior + ';' + marker)
+    print(f"  [Acquisition Direction] Reclassified {int(wrong.sum())} payment "
+          "fact(s) from acquired-cash disclosure to Acquisitions.")
+    return out
+
+
+
+def _acquisition_nonmarketable_overlap_periods(frame):
+    """Return periods where Acquisitions already includes non-marketable buys.
+
+    The selected-fact audit is the only safe evidence here.  The acquisition
+    row must carry the verified broad acquisition/investment family and its
+    filer-authored label or concept must explicitly mention non-marketable
+    investments.  A directly filed ``Purchases of Investments`` aggregate
+    blocks suppression because its composition may differ from the granular
+    component sum.
+    """
+    if frame is None or getattr(frame, 'empty', True):
+        return set()
+    audit = getattr(frame, 'attrs', {}).get('fact_audit')
+    if not isinstance(audit, pd.DataFrame) or audit.empty:
+        return set()
+    required = {'Category', 'Label', 'Period'}
+    if not required.issubset(audit.columns):
+        return set()
+    cash = audit['Category'].astype(str).eq('3_Cash_Flow')
+    acquisitions = audit.loc[
+        cash & audit['Label'].astype(str).eq('Acquisitions')].copy()
+    if acquisitions.empty:
+        return set()
+    family = acquisitions.get(
+        'SourceMetricFamily', pd.Series('', index=acquisitions.index)
+    ).fillna('').astype(str)
+    broad = family.eq(
+        'acquisitions.acquisitions_and_other_investment_activity_net')
+    source_text = pd.Series('', index=acquisitions.index, dtype=object)
+    for column in ('SourceRawLabel', 'SourceLabel', 'Concept'):
+        if column in acquisitions.columns:
+            source_text = source_text + ' ' + acquisitions[column].fillna('').astype(str)
+    explicit_nonmarketable = source_text.map(
+        lambda value: 'nonmarketable' in _compact_acquisition_text(value))
+    periods = set(acquisitions.loc[
+        broad & explicit_nonmarketable, 'Period'].dropna().astype(str))
+    if not periods:
+        return set()
+    # A source-backed aggregate is not interchangeable with the component sum.
+    direct_parent_periods = set(audit.loc[
+        cash & audit['Label'].astype(str).eq('Purchases of Investments'),
+        'Period'].dropna().astype(str))
+    return periods - direct_parent_periods
+
+
+def _bridge_investment_purchases_excluding_acquisition_overlap(
+        frame, purchases_series):
+    """Remove separately displayed non-marketable buys already in Acquisitions.
+
+    The displayed detailed row remains intact.  Only the bridge contribution is
+    adjusted, analogous to aggregate/component arbitration elsewhere in the
+    cash-flow engine.  Returns ``(adjusted_series, suppressed_mask)``.
+    """
+    purchases = pd.to_numeric(purchases_series, errors='coerce').copy()
+    purchases = purchases.reindex(frame.columns)
+    periods = _acquisition_nonmarketable_overlap_periods(frame)
+    mask = pd.Series(False, index=frame.columns)
+    if not periods:
+        return purchases, mask
+    component_idx = (
+        '3_Cash_Flow', 'Purchases of Non-Marketable / Other Investments')
+    if component_idx not in frame.index:
+        return purchases, mask
+    component = pd.to_numeric(frame.loc[component_idx], errors='coerce').reindex(
+        frame.columns)
+    mask = pd.Series(frame.columns.astype(str).isin(periods), index=frame.columns)
+    mask &= purchases.notna() & component.notna()
+    candidate = purchases - component.fillna(0.0)
+    tolerance = pd.concat(
+        [purchases.abs(), component.abs()], axis=1).max(axis=1).mul(0.001).add(1.0)
+    mask &= candidate >= -tolerance
+    adjusted = purchases.copy()
+    adjusted.loc[mask] = candidate.loc[mask].clip(lower=0.0)
+    return adjusted, mask
+
+
+def _collect_acquisition_face_labels(xbrl):
+    """Collect acquisition-family labels from cash-flow presentation trees.
+
+    This includes issuer-extension concepts learned at runtime.  Concepts whose
+    labels do not prove an acquisition measurement family are ignored.
+    """
+    result = defaultdict(list)
+    try:
+        role_to_cat = _classify_statement_roles(xbrl)
+        trees = getattr(xbrl, 'presentation_trees', None) or {}
+    except Exception:
+        return {}
+    for role, category in role_to_cat.items():
+        if category != '3_Cash_Flow':
+            continue
+        tree = trees.get(role)
+        nodes = getattr(tree, 'all_nodes', None)
+        if not nodes:
+            continue
+        for elem_id in _presentation_order(tree):
+            node = nodes.get(elem_id)
+            if node is None or getattr(node, 'is_abstract', False):
+                continue
+            label = (getattr(node, 'standard_label', None)
+                     or getattr(node, 'display_label', None) or '')
+            label = re.sub(r'\s+', ' ', str(label)).strip().rstrip(':')
+            family = _classify_acquisition_cash_flow_family(label)
+            if family is None:
+                continue
+            concept = elem_id.replace('_', ':', 1).split(':')[-1]
+            if label not in result[concept]:
+                result[concept].append(label)
+    return {concept: tuple(labels) for concept, labels in result.items()}
+
+
+def _acquisition_source_label(labels):
+    if isinstance(labels, str) or labels is None:
+        labels = [labels]
+    cleaned = [re.sub(r'\s+', ' ', str(label or '')).strip()
+               for label in labels]
+    for label in cleaned:
+        if label and _classify_acquisition_cash_flow_family(label):
+            return label
+    return None
+
+
+def _classify_investment_face_label(presentation_label):
+    """Classify one filer-authored investing-statement face label.
+
+    This deliberately requires directional and instrument-specific wording.
+    Generic note captions and balance-sheet investment labels return ``None``.
+    The function is used before concept-name heuristics because issuer
+    extensions often have opaque names while the cash-flow face label is clear.
+    """
+    text = re.sub(r'[^a-z0-9]+', '', str(
+        presentation_label or '').casefold())
+    if not text:
+        return None
+
+    if ('businesscombination' in text and 'netofcashacquired' in text):
+        return _BUSINESS_COMBINATIONS_NET_LABEL
+
+    # A combined acquisition/investment line (Amazon and similar filers) is not
+    # a pure investment-purchase family.  Let the acquisition classifier retain
+    # the complete filed scope instead of carving the same fact into a second
+    # non-marketable-investment row.
+    if (any(token in text for token in (
+            'acquisition', 'businesscombination', 'acquiredbusiness',
+            'cashacquired'))
+            and any(token in text for token in (
+                'investment', 'securit', 'convertiblenote'))):
+        return None
+
+    # The broad signed residual family must be exact enough that footnote prose
+    # such as "other investments" is not swept into the cash-flow line.
+    if text in {
+            'otherinvestingactivities', 'otherinvestingactivity',
+            'otherinvestingactivitiesnet', 'otherinvestingactivitynet'}:
+        return 'Other Investing Activities'
+
+    purchase = any(token in text for token in (
+        'purchaseof', 'purchasesof', 'paymentstoacquire',
+        'paymentforacquisition', 'acquisitionof'))
+    proceeds = any(token in text for token in (
+        'proceedsfrom', 'salesandredemptionof', 'saleandredemptionof',
+        'proceedsfromsales', 'proceedsfromsale', 'redemptionof'))
+    if purchase == proceeds:
+        return None
+
+    prefix = 'Purchases of ' if purchase else 'Proceeds from '
+    if 'alternativeinvestment' in text:
+        return prefix + 'Alternative Investments'
+    if any(token in text for token in (
+            'privatelyheldsecurit', 'privateheldsecurit',
+            'privatelyheldinvestment', 'nonmarketableinvestment',
+            'nonmarketablesecurit', 'privateinvestment')):
+        return prefix + 'Non-Marketable / Other Investments'
+    if any(token in text for token in (
+            'marketablesecurit', 'availableforsale',
+            'shortterminvestment')):
+        return prefix + 'Marketable Securities'
+    if 'investment' in text or 'securit' in text:
+        return 'Purchases of Investments' if purchase else 'Proceeds from Investments'
+    return None
+
+
+
+_STANDARD_INVESTMENT_CONCEPT_TARGETS = {
+    **_INVESTMENT_COMPONENT_CONCEPT_LABELS,
+    **{concept: 'Purchases of Investments'
+       for concept in _INVESTMENT_PURCHASE_AGGREGATE_CONCEPTS},
+    **{concept: 'Proceeds from Investments'
+       for concept in _INVESTMENT_PROCEEDS_AGGREGATE_CONCEPTS},
+    **{concept: 'Other Investing Activities'
+       for concept in _SIGNED_OTHER_INVESTING_CONCEPTS},
+}
+
+
+def _investment_face_override_is_safe(concept, existing_labels, face_target,
+                                      source_label=None):
+    """Allow face-label overrides only for opaque or genuinely broad concepts.
+
+    Standard US-GAAP purchase/proceeds concepts keep exact-concept arithmetic.
+    Giving every standard concept one shared family identity lets zero
+    subcomponents replace valid cumulative totals during quarterization.
+    """
+    local = str(concept or '').split(':')[-1]
+    existing = {
+        str(label).strip() for label in (existing_labels or ())
+        if str(label).strip()
+    }
+    label_text = _compact_investing_text(source_label)
+    concept_text = _compact_investing_text(local)
+    combined_text = label_text or concept_text
+    if (any(token in combined_text for token in (
+            'acquisition', 'businesscombination', 'acquiredbusiness',
+            'cashacquired'))
+            and any(token in combined_text for token in (
+                'investment', 'securit', 'convertiblenote'))
+            and face_target != _BUSINESS_COMBINATIONS_NET_LABEL):
+        return False
+
+    standard_target = _STANDARD_INVESTMENT_CONCEPT_TARGETS.get(local)
+    if standard_target is not None:
+        # Preserve the source label for audit, but never replace or alias a
+        # standard exact concept merely because its face wording is familiar.
+        return False
+
+    if 'Acquisitions' in existing:
+        return face_target == _BUSINESS_COMBINATIONS_NET_LABEL
+
+    broad = {
+        'Other Investing Activities',
+        'Purchases of Investments',
+        'Proceeds from Investments',
+        'Proceeds from Asset Sales',
+    }
+    if not existing:
+        return True
+    if face_target in existing:
+        # Opaque extensions already routed to the right row still need a
+        # verified family identity for safe within-family subtraction.
+        return True
+    return existing.issubset(broad)
+
+
+def _clear_standard_investment_face_aliases(frame):
+    """Undo v3-style aliases on standard concepts while retaining raw labels."""
+    if frame is None or frame.empty or 'Concept' not in frame.columns:
+        return frame
+    out = frame
+    local = out['Concept'].fillna('').astype(str).str.split(':').str[-1]
+    rule = out.get(
+        'SourceAliasRule', pd.Series('', index=out.index)
+    ).fillna('').astype(str)
+    mask = (
+        local.isin(_STANDARD_INVESTMENT_CONCEPT_TARGETS)
+        & rule.eq(_INVESTMENT_FACE_ALIAS_RULE)
+    )
+    if not mask.any():
+        return out
+    if 'SourceAliasVerified' in out.columns:
+        out.loc[mask, 'SourceAliasVerified'] = False
+    for column in (
+            'SourceAliasRule', 'SourceEquivalentConcept',
+            'SourceMetricFamily', 'SourceMetricIdentity'):
+        if column in out.columns:
+            out.loc[mask, column] = np.nan
+    return out
+
+
+def _dedupe_overlapping_investing_cash_flow_facts(df):
+    """Remove exact source facts duplicated across mutually exclusive rows.
+
+    Runtime/fuzzy mappings can emit one filed fact under both Acquisitions and
+    an investment component, or under both a specific investment family and
+    broad Other.  Only exact same-context, same-value duplicates are removed.
+    """
+    required = {'Category', 'Label', 'Concept', 'Value', 'FY', 'Q'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    cash = out['Category'].eq('3_Cash_Flow')
+    if not cash.any():
+        return out
+
+    key_columns = [
+        column for column in (
+            'Concept', 'FY', 'Q', 'Start', 'End', 'Duration', 'Filed',
+            'Accession', 'DimCount')
+        if column in out.columns
+    ]
+    work = out.loc[cash].copy()
+    work['_ExactInvestingValue'] = pd.to_numeric(
+        work['Value'], errors='coerce').round(6)
+    group_columns = key_columns + ['_ExactInvestingValue']
+    drop_indices = set()
+
+    specific = set(_INVESTMENT_COMPONENT_LABELS) | {
+        _BUSINESS_COMBINATIONS_NET_LABEL}
+    broad = {
+        'Purchases of Investments', 'Proceeds from Investments',
+        'Other Investing Activities', 'Proceeds from Asset Sales'}
+    investment_like = specific | broad
+
+    for _, group in work.groupby(group_columns, dropna=False, sort=False):
+        labels = set(group['Label'].astype(str))
+        if len(labels) < 2:
+            continue
+
+        if _BUSINESS_COMBINATIONS_NET_LABEL in labels:
+            keep = group[group['Label'].eq(
+                _BUSINESS_COMBINATIONS_NET_LABEL)].index
+            drop_indices.update(
+                idx for idx in group.index if idx not in set(keep)
+                and str(group.at[idx, 'Label']) in (
+                    investment_like | {'Acquisitions'}))
+            continue
+
+        if 'Acquisitions' in labels and labels.intersection(investment_like):
+            acquisition_evidence = False
+            for _, row in group[group['Label'].eq('Acquisitions')].iterrows():
+                candidates = (
+                    row.get('SourceLabel'), row.get('SourceRawLabel'),
+                    row.get('Concept'))
+                if any(_classify_acquisition_cash_flow_family(value)
+                       for value in candidates if value is not None):
+                    acquisition_evidence = True
+                    break
+                if str(row.get('SourceMetricFamily') or '').startswith(
+                        'acquisitions.'):
+                    acquisition_evidence = True
+                    break
+            if acquisition_evidence:
+                drop_indices.update(
+                    idx for idx in group.index
+                    if str(group.at[idx, 'Label']) in investment_like)
+                continue
+
+        detailed = labels.intersection(specific)
+        if len(detailed) == 1:
+            detail = next(iter(detailed))
+            # Keep one detailed rendering and discard only broad duplicates of
+            # the same exact fact.  Different concepts or values are untouched.
+            drop_indices.update(
+                idx for idx in group.index
+                if str(group.at[idx, 'Label']) in broad
+                and str(group.at[idx, 'Label']) != detail)
+
+    if not drop_indices:
+        return out
+    out = out.drop(index=sorted(drop_indices)).copy()
+    print(
+        f"  [Investing Dedup] Removed {len(drop_indices)} exact cross-family "
+        "duplicate fact(s).")
+    return out
+
+
+
+_MARKETABLE_PROCEEDS_SCOPE_RANK = {
+    # Complete marketable-security proceeds totals.
+    'ProceedsFromSaleAndMaturityOfMarketableSecurities': 0,
+    'ProceedsFromSaleAndMaturityOfAvailableForSaleSecurities': 0,
+    'ProceedsFromSaleAndMaturityOfAvailableForSaleSecuritiesDebt': 0,
+    # Partial maturity or sale components.
+    'ProceedsFromMaturitiesPrepaymentsAndCallsOfAvailableForSaleSecurities': 2,
+    'ProceedsFromSaleOfMarketableSecurities': 2,
+    'ProceedsFromMaturitiesOfMarketableSecurities': 2,
+    'ProceedsFromSaleOfAvailableForSaleSecuritiesDebt': 3,
+}
+
+
+def _arbitrate_standard_investment_scope_facts(df):
+    """Remove proven subcomponent facts from a broader normalized row.
+
+    Some filers expose both a complete marketable-security proceeds total and
+    a narrower sale-only component under concepts that resolve to the same
+    normalized label.  Latest-filing-first candidate selection can otherwise
+    let a later comparative zero component replace the complete cumulative
+    total.  Suppression is allowed only within one fiscal year when:
+
+    * a recognized complete-total concept and a lower-scope concept coexist;
+    * they overlap in at least two cumulative contexts;
+    * the total is never smaller than the component; and
+    * at least one overlap proves the total is materially broader.
+
+    The source facts remain in the raw native cache; only the normalized
+    quarterization cohort is narrowed.
+    """
+    required = {'Category', 'Label', 'Concept', 'Value', 'FY', 'Q', 'Duration'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    mask = (
+        out['Category'].eq('3_Cash_Flow')
+        & out['Label'].eq('Proceeds from Marketable Securities')
+        & pd.to_numeric(out.get('DimCount', 0), errors='coerce').fillna(0).eq(0)
+    )
+    if not mask.any():
+        return out
+
+    qrank = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
+
+    def _is_cumulative(row):
+        q = str(row.get('Q') or '')
+        dur = pd.to_numeric(pd.Series([row.get('Duration')]), errors='coerce').iloc[0]
+        if pd.isna(dur):
+            return False
+        bounds = {'Q1': (45, 125), 'Q2': (140, 230),
+                  'Q3': (220, 320), 'Q4': (300, 400)}
+        lo_hi = bounds.get(q)
+        return bool(lo_hi and lo_hi[0] <= float(dur) <= lo_hi[1])
+
+    drop = set()
+    work = out.loc[mask].copy()
+    work['_LocalConcept'] = work['Concept'].fillna('').astype(str).str.split(':').str[-1]
+    work['_ScopeRank'] = work['_LocalConcept'].map(
+        _MARKETABLE_PROCEEDS_SCOPE_RANK).fillna(99).astype(int)
+    work['_QRank'] = work['Q'].astype(str).map(qrank).fillna(0).astype(int)
+    work['_Cumulative'] = work.apply(_is_cumulative, axis=1)
+    work['_NumericValue'] = pd.to_numeric(work['Value'], errors='coerce')
+
+    for fiscal_year, year in work.groupby(
+            pd.to_numeric(work['FY'], errors='coerce'), dropna=True, sort=False):
+        cumulative = year[year['_Cumulative'] & year['_NumericValue'].notna()].copy()
+        if cumulative.empty:
+            continue
+        complete_concepts = sorted(set(cumulative.loc[
+            cumulative['_ScopeRank'].eq(0), '_LocalConcept']))
+        if not complete_concepts:
+            continue
+
+        # Pick the complete concept with the broadest quarter coverage, then
+        # latest filing as a deterministic tie-breaker.
+        def _complete_score(concept):
+            rows = cumulative[cumulative['_LocalConcept'].eq(concept)]
+            coverage = rows['_QRank'].nunique()
+            filed = pd.to_datetime(rows.get(
+                'Filed', pd.Series(pd.NaT, index=rows.index)), errors='coerce').max()
+            filed_score = int(filed.value) if pd.notna(filed) else -1
+            return (coverage, filed_score, concept)
+
+        preferred = max(complete_concepts, key=_complete_score)
+        preferred_rows = cumulative[cumulative['_LocalConcept'].eq(preferred)]
+        if preferred_rows['_QRank'].nunique() < 2:
+            continue
+
+        for component in sorted(set(cumulative.loc[
+                cumulative['_ScopeRank'].gt(0) & cumulative['_ScopeRank'].lt(99),
+                '_LocalConcept'])):
+            component_rows = cumulative[cumulative['_LocalConcept'].eq(component)]
+            overlaps = []
+            for rank in sorted(set(preferred_rows['_QRank']) & set(component_rows['_QRank'])):
+                p_rows = preferred_rows[preferred_rows['_QRank'].eq(rank)]
+                c_rows = component_rows[component_rows['_QRank'].eq(rank)]
+                if p_rows.empty or c_rows.empty:
+                    continue
+                p_val = float(p_rows.sort_values(
+                    ['Duration', 'Filed'], ascending=[False, False]).iloc[0]['_NumericValue'])
+                c_val = float(c_rows.sort_values(
+                    ['Duration', 'Filed'], ascending=[False, False]).iloc[0]['_NumericValue'])
+                overlaps.append((p_val, c_val))
+            if len(overlaps) < 2:
+                continue
+            never_smaller = True
+            materially_broader = False
+            for p_val, c_val in overlaps:
+                tolerance = max(abs(p_val), abs(c_val), 1.0) * 0.001 + 1.0
+                if abs(p_val) + tolerance < abs(c_val):
+                    never_smaller = False
+                    break
+                if abs(p_val) > abs(c_val) + tolerance:
+                    materially_broader = True
+            if not (never_smaller and materially_broader):
+                continue
+            component_idx = year[year['_LocalConcept'].eq(component)].index
+            drop.update(component_idx.tolist())
+
+    if not drop:
+        return out
+    out = out.drop(index=sorted(drop)).copy()
+    print(
+        f"  [Investing Scope] Suppressed {len(drop)} proven marketable-"
+        "proceeds subcomponent fact(s) from normalized quarterization.")
+    return out
+
+
+def _collect_investment_face_labels(xbrl):
+    """Collect strong investing-family labels from cash-flow presentation trees."""
+    result = defaultdict(list)
+    try:
+        role_to_cat = _classify_statement_roles(xbrl)
+        trees = getattr(xbrl, 'presentation_trees', None) or {}
+    except Exception:
+        return {}
+    for role, category in role_to_cat.items():
+        if category != '3_Cash_Flow':
+            continue
+        tree = trees.get(role)
+        nodes = getattr(tree, 'all_nodes', None)
+        if not nodes:
+            continue
+        for elem_id in _presentation_order(tree):
+            node = nodes.get(elem_id)
+            if node is None or getattr(node, 'is_abstract', False):
+                continue
+            label = (getattr(node, 'standard_label', None)
+                     or getattr(node, 'display_label', None) or '')
+            label = re.sub(r'\s+', ' ', str(label)).strip().rstrip(':')
+            if _classify_investment_face_label(label) is None:
+                continue
+            concept = elem_id.replace('_', ':', 1).split(':')[-1]
+            if label not in result[concept]:
+                result[concept].append(label)
+    return {concept: tuple(labels) for concept, labels in result.items()}
+
+
+def _investment_source_label(labels):
+    if isinstance(labels, str) or labels is None:
+        labels = [labels]
+    cleaned = [re.sub(r'\s+', ' ', str(label or '')).strip()
+               for label in labels]
+    for label in cleaned:
+        if label and _classify_investment_face_label(label):
+            return label
+    return None
+
+
+def _investment_row_source_label(row):
+    for field in ('SourceLabel', 'SourceRawLabel', 'label', 'label_text',
+                  'standard_label', 'concept_label', 'name'):
+        try:
+            value = row.get(field)
+        except Exception:
+            value = None
+        if value is not None and not pd.isna(value) and str(value).strip():
+            label = re.sub(r'\s+', ' ', str(value)).strip()
+            if _classify_investment_face_label(label):
+                return label
+    return None
+
+
+def _stamp_investment_family_metadata(out, idx, target, source_label,
+                                      origin='fact_or_cache'):
+    family_key = re.sub(r'[^a-z0-9]+', '_', target.casefold()).strip('_')
+    out.at[idx, 'SourceLabel'] = source_label
+    out.at[idx, 'SourceRawLabel'] = source_label
+    out.at[idx, 'SourceLabelOrigin'] = origin
+    out.at[idx, 'SourceAliasVerified'] = True
+    out.at[idx, 'SourceAliasRule'] = _INVESTMENT_FACE_ALIAS_RULE
+    out.at[idx, 'SourceEquivalentConcept'] = (
+        _INVESTMENT_EQUIVALENT_PREFIX + family_key)
+    out.at[idx, 'SourceMetricFamily'] = 'investing.' + family_key
+    out.at[idx, 'SourceMetricIdentity'] = family_key
+    out.at[idx, 'SourceSemanticType'] = target
+
+
+def _append_source_marker(out, mask, marker):
+    if 'SourceCanonicalizedFrom' not in out.columns:
+        out['SourceCanonicalizedFrom'] = np.nan
+    prior = out.loc[mask, 'SourceCanonicalizedFrom'].fillna('').astype(str)
+    out.loc[mask, 'SourceCanonicalizedFrom'] = np.where(
+        prior.eq(''), marker, prior + ';' + marker)
 
 
 def _compact_investing_text(*parts):
@@ -560,6 +1327,12 @@ def _classify_investment_cash_flow_concept(concept):
 
     text = _compact_investing_text(concept)
     if not any(token in text for token in ('investment', 'securit')):
+        return None
+    if (any(token in text for token in (
+            'acquisition', 'businesscombination', 'acquiredbusiness',
+            'cashacquired'))
+            and any(token in text for token in (
+                'investment', 'securit', 'convertiblenote'))):
         return None
     purchase = any(token in text for token in (
         'paymentstoacquire', 'paymentforacquisition', 'purchaseof',
@@ -616,37 +1389,137 @@ def _investing_calc_weight(concept, max_hops=5):
 
 
 def _prepare_investing_cash_flow_facts(df):
-    """Split broad investment rows and sign true net investing lines.
+    """Split, sign, and provenance-stamp investing cash-flow families.
 
-    This migration also repairs facts loaded from older native-extraction
-    caches whose labels predate the granular map.  It is intentionally limited
-    to cash-flow rows already mapped to investment/asset-sale families.
+    Filer-authored statement-face labels take precedence over concept-name
+    heuristics for opaque issuer extensions.  The older concept classifier then
+    repairs caches that lack face-label provenance.  Finally, acquisition rows
+    receive a conservative semantic family identity so verified concept
+    migrations can quarterize without weakening exact-concept rules elsewhere.
     """
-    if df is None or df.empty or not {'Category', 'Label', 'Concept', 'Value'}.issubset(df.columns):
+    required = {'Category', 'Label', 'Concept', 'Value'}
+    if df is None or df.empty or not required.issubset(df.columns):
         return df
+    out = df.copy()
+    if 'SourceCanonicalizedFrom' not in out.columns:
+        out['SourceCanonicalizedFrom'] = np.nan
+    out = _repair_misdirected_acquisition_cash_flows(out)
+    out = _clear_standard_investment_face_aliases(out)
+
+    cash_mask = out['Category'].eq('3_Cash_Flow')
+    face_changed = 0
+    face_signed = 0
+
+    # First pass: exact filer face labels.  This is the path needed for PLTR's
+    # opaque extension concepts (private securities, alternative investments,
+    # and net business-combination cash flow).
+    for idx, row in out.loc[cash_mask].iterrows():
+        source_label = _investment_row_source_label(row)
+        if not source_label:
+            continue
+        target = _classify_investment_face_label(source_label)
+        if target is None:
+            continue
+        concept = str(row.get('Concept') or '').split(':')[-1]
+        if not _investment_face_override_is_safe(
+                concept, (row.get('Label'),), target, source_label):
+            continue
+        value = pd.to_numeric(pd.Series([row.get('Value')]),
+                              errors='coerce').iloc[0]
+        if pd.isna(value):
+            continue
+        weight = _investing_calc_weight(concept)
+
+        # A signed business-combination line cannot be normalized safely
+        # without its calculation-linkbase polarity.  Fall back to the existing
+        # Acquisitions mapping when the filing does not provide that evidence.
+        if target == _BUSINESS_COMBINATIONS_NET_LABEL:
+            if weight is None:
+                continue
+            normalized = -abs(float(value)) * (1.0 if float(weight) > 0 else -1.0)
+        elif target == 'Other Investing Activities':
+            marker = 'investment_face_calc_weight_signed'
+            prior_markers = str(row.get('SourceCanonicalizedFrom') or '').split(';')
+            if marker in prior_markers:
+                normalized = float(value)
+            elif weight is not None:
+                normalized = abs(float(value)) * (1.0 if float(weight) > 0 else -1.0)
+                face_signed += 1
+            else:
+                # Preserve an already signed cached value.  Do not guess a sign
+                # from a label alone when calculation ancestry is unavailable.
+                normalized = float(value)
+        else:
+            normalized = abs(float(value))
+
+        if str(row.get('Label')) != target:
+            face_changed += 1
+        out.at[idx, 'Label'] = target
+        out.at[idx, 'Value'] = normalized
+        _stamp_investment_family_metadata(
+            out, idx, target, source_label,
+            origin=str(row.get('SourceLabelOrigin') or 'fact_or_cache'))
+        _append_source_marker(
+            out, pd.Series(out.index == idx, index=out.index),
+            'investment_face_family_classification')
+        if target == 'Other Investing Activities' and weight is not None:
+            _append_source_marker(
+                out, pd.Series(out.index == idx, index=out.index),
+                'investment_face_calc_weight_signed')
+
+    # Cached/native rows can lack a usable face label even when the concept
+    # itself explicitly says business combinations net of cash acquired.
+    # Recover only that exact semantic construction and require investing
+    # calculation ancestry for the economic sign.
+    business_candidate = (
+        out['Category'].eq('3_Cash_Flow')
+        & out['Label'].isin({'Other Investing Activities', 'Acquisitions'})
+    )
+    for idx, row in out.loc[business_candidate].iterrows():
+        concept = str(row.get('Concept') or '').split(':')[-1]
+        compact = _compact_acquisition_text(concept)
+        if not ('businesscombination' in compact
+                and 'netofcashacquired' in compact):
+            continue
+        weight = _investing_calc_weight(concept)
+        if weight is None:
+            continue
+        value = pd.to_numeric(
+            pd.Series([row.get('Value')]), errors='coerce').iloc[0]
+        if pd.isna(value):
+            continue
+        out.at[idx, 'Label'] = _BUSINESS_COMBINATIONS_NET_LABEL
+        out.at[idx, 'Value'] = -abs(float(value)) * (
+            1.0 if float(weight) > 0 else -1.0)
+        _stamp_investment_family_metadata(
+            out, idx, _BUSINESS_COMBINATIONS_NET_LABEL,
+            concept, origin='concept_name')
+
+    # Second pass: exact/semantic concept classification for rows without a
+    # verified face-family override.  This preserves the previous behavior for
+    # standard concepts and repairs older native-extraction caches.
     candidate = (
-        df['Category'].eq('3_Cash_Flow')
-        & df['Label'].isin({
+        out['Category'].eq('3_Cash_Flow')
+        & out['Label'].isin({
             'Purchases of Investments', 'Proceeds from Investments',
             'Proceeds from Asset Sales', 'Other Investing Activities',
             *_INVESTMENT_COMPONENT_LABELS,
         })
     )
-    if not candidate.any():
-        return df
-    out = df.copy()
     changed = 0
     signed = 0
+    face_verified = out.get(
+        'SourceAliasRule', pd.Series('', index=out.index)
+    ).fillna('').astype(str).eq(_INVESTMENT_FACE_ALIAS_RULE)
     for concept in out.loc[candidate, 'Concept'].dropna().astype(str).unique():
         short = concept.split(':')[-1]
-        concept_mask = candidate & out['Concept'].astype(str).eq(concept)
+        concept_mask = (
+            candidate & out['Concept'].astype(str).eq(concept)
+            & ~face_verified)
+        if not concept_mask.any():
+            continue
         target = _classify_investment_cash_flow_concept(short)
         weight = _investing_calc_weight(short)
-
-        # A concept heuristically placed in a broad investment row but lacking
-        # purchase/proceeds direction (for example a reverse-repurchase net
-        # activity concept) is a signed investing contribution, not an
-        # investment purchase or sale total.
         current_labels = set(out.loc[concept_mask, 'Label'].astype(str))
         if (target is None
                 and current_labels.intersection({
@@ -658,10 +1531,6 @@ def _prepare_investing_cash_flow_facts(df):
                 label != target for label in current_labels):
             out.loc[concept_mask, 'Label'] = target
             if 'TagRank' in out.columns:
-                # Preserve curated aggregate-before-component priority.  A
-                # blanket rank=0 would let a later footnote subcomponent
-                # overwrite a statement-face aggregate and disable the
-                # taxonomy-poisoning guard.
                 target_info = CONCEPT_MAP.get(target, {})
                 target_tags = (target_info.get('tags') or []
                                if isinstance(target_info, dict) else [])
@@ -674,30 +1543,1231 @@ def _prepare_investing_cash_flow_facts(df):
 
         if target == 'Other Investing Activities' and weight is not None:
             marker = 'investing_calc_weight_signed'
-            already_signed = pd.Series(False, index=out.index)
-            if 'SourceCanonicalizedFrom' in out.columns:
-                already_signed = (
-                    out['SourceCanonicalizedFrom'].fillna('').astype(str)
-                    .str.split(';').map(lambda parts: marker in parts)
-                )
+            already_signed = (
+                out['SourceCanonicalizedFrom'].fillna('').astype(str)
+                .str.split(';').map(lambda parts: marker in parts)
+            )
             sign_mask = concept_mask & ~already_signed
             numeric = pd.to_numeric(
                 out.loc[sign_mask, 'Value'], errors='coerce')
-            out.loc[sign_mask, 'Value'] = numeric * float(weight)
+            out.loc[sign_mask, 'Value'] = numeric.abs() * (
+                1.0 if float(weight) > 0 else -1.0)
             signed += int(numeric.notna().sum())
-            if 'SourceCanonicalizedFrom' in out.columns and sign_mask.any():
-                prior = (out.loc[sign_mask, 'SourceCanonicalizedFrom']
-                         .fillna('').astype(str))
-                out.loc[sign_mask, 'SourceCanonicalizedFrom'] = np.where(
-                    prior.eq(''), marker, prior + ';' + marker)
+            if sign_mask.any():
+                _append_source_marker(out, sign_mask, marker)
 
-    if changed or signed:
+    # Repair acquisition-family provenance even when the live extractor did not
+    # expose a usable presentation-tree label.  Strong issuer concept names are
+    # sufficient semantic evidence, but the origin is recorded truthfully.
+    acquisition_mask = (
+        out['Category'].eq('3_Cash_Flow')
+        & out['Label'].eq('Acquisitions'))
+    for idx, row in out.loc[acquisition_mask].iterrows():
+        source_label = str(row.get('SourceLabel') or '').strip()
+        family = _classify_acquisition_cash_flow_family(source_label)
+        origin = str(row.get('SourceLabelOrigin') or '').strip()
+        if family is None:
+            concept = str(row.get('Concept') or '').split(':')[-1]
+            family = _classify_acquisition_cash_flow_family(concept)
+            if family:
+                source_label = concept
+                origin = 'concept_name'
+        if not family:
+            continue
+        equivalent = _ACQUISITION_EQUIVALENT_PREFIX + family
+        out.at[idx, 'SourceLabel'] = source_label
+        out.at[idx, 'SourceRawLabel'] = source_label
+        out.at[idx, 'SourceLabelOrigin'] = origin or 'fact_or_cache'
+        out.at[idx, 'SourceEquivalentConcept'] = equivalent
+        out.at[idx, 'SourceAliasVerified'] = True
+        out.at[idx, 'SourceAliasRule'] = _ACQUISITION_ALIAS_RULE
+        out.at[idx, 'SourceMetricFamily'] = 'acquisitions.' + family
+        out.at[idx, 'SourceMetricIdentity'] = family
+
+    if face_changed or face_signed or changed or signed:
         print(
-            f"  [Investing Granularity] Reclassified {changed} investment "
-            f"fact(s); signed {signed} net investing fact(s) from the "
-            "calculation linkbase.")
+            f"  [Investing Granularity] Face-classified {face_changed} fact(s), "
+            f"signed {face_signed}; concept-reclassified {changed}, signed "
+            f"{signed}.")
     return out
 
+
+
+def _repair_broad_other_granular_overlaps(df):
+    """Remove stale broad-Other facts proven to duplicate granular rows.
+
+    Comparative filings sometimes restate a prior broad ``Other investing
+    activities`` amount after the activity has already been separated into a
+    granular investment or business-combination line.  The latest broad fact
+    can then double count the granular row.  This repair requires an exact
+    same-context decomposition or a zero-before/zero-after continuity proof.
+    """
+    required = {'Category', 'Label', 'Concept', 'Value', 'FY', 'Q',
+                'Start', 'End', 'Duration'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    cash = out['Category'].eq('3_Cash_Flow')
+    granular_labels = {
+        'Purchases of Non-Marketable / Other Investments',
+        'Purchases of Alternative Investments',
+        'Proceeds from Non-Marketable / Other Investments',
+        'Proceeds from Alternative Investments',
+        _BUSINESS_COMBINATIONS_NET_LABEL,
+    }
+    relevant = cash & out['Label'].isin(
+        granular_labels | {'Other Investing Activities'})
+    if not relevant.any():
+        return out
+
+    work = out.loc[relevant].copy()
+    work['_Num'] = pd.to_numeric(work['Value'], errors='coerce')
+    work = work[work['_Num'].notna()]
+    context_cols = ['FY', 'Q', 'Start', 'End', 'Duration']
+    drop = set()
+
+    # Stage 1: same-context decomposition.  Keep the smallest broad amount
+    # when the difference to a larger comparative broad amount is exactly
+    # explained by one or more granular rows in that same context.
+    for _, group in work.groupby(context_cols, dropna=False, sort=False):
+        broad = group[group['Label'].eq('Other Investing Activities')].copy()
+        granular = group[group['Label'].isin(granular_labels)].copy()
+        if broad.empty or granular.empty:
+            continue
+        broad_values = sorted(set(float(v) for v in broad['_Num']))
+        if len(broad_values) < 2:
+            continue
+        genuine = min(broad_values, key=abs)
+        granular_by_label = []
+        for _, label_rows in granular.groupby('Label', sort=False):
+            # One normalized family contribution per context.
+            vals = sorted(set(abs(float(v)) for v in label_rows['_Num']))
+            if vals:
+                granular_by_label.append(max(vals))
+        possible = set(granular_by_label)
+        if granular_by_label:
+            possible.add(sum(granular_by_label))
+        for larger in broad_values:
+            if larger == genuine:
+                continue
+            delta = abs(abs(larger) - abs(genuine))
+            tolerance = max(abs(larger), abs(genuine), delta, 1.0) * 0.001 + 1.0
+            if not any(abs(delta - amount) <= tolerance for amount in possible):
+                continue
+            rows = broad[broad['_Num'].sub(larger).abs().le(tolerance)]
+            drop.update(rows.index.tolist())
+
+    if drop:
+        out = out.drop(index=sorted(drop)).copy()
+
+    # Stage 2: a lone broad amount equal to a granular amount is a duplicate
+    # only when the same broad concept is zero in both an earlier and later
+    # cumulative period while the granular family persists.
+    cash = out['Category'].eq('3_Cash_Flow')
+    work = out.loc[cash & out['Label'].isin(
+        granular_labels | {'Other Investing Activities'})].copy()
+    work['_Num'] = pd.to_numeric(work['Value'], errors='coerce')
+    qrank = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
+    work['_QRank'] = work['Q'].astype(str).map(qrank).fillna(0).astype(int)
+    stage2_drop = set()
+    for fiscal_year, year in work.groupby(
+            pd.to_numeric(work['FY'], errors='coerce'), dropna=True, sort=False):
+        broad = year[year['Label'].eq('Other Investing Activities')].copy()
+        granular = year[year['Label'].isin(granular_labels)].copy()
+        if broad.empty or granular.empty:
+            continue
+        for idx, row in broad.iterrows():
+            value = float(row['_Num'])
+            if abs(value) <= 1.0:
+                continue
+            rank = int(row['_QRank'])
+            same = granular[granular['_QRank'].eq(rank)]
+            if same.empty:
+                continue
+            tolerance = max(abs(value), 1.0) * 0.001 + 1.0
+            matching = same[same['_Num'].abs().sub(abs(value)).abs().le(tolerance)]
+            if matching.empty:
+                continue
+            concept = str(row.get('Concept') or '')
+            peers = broad[broad['Concept'].fillna('').astype(str).eq(concept)]
+            prior_zero = peers[peers['_QRank'].lt(rank) & peers['_Num'].abs().le(1.0)]
+            later_zero = peers[peers['_QRank'].gt(rank) & peers['_Num'].abs().le(1.0)]
+            target_labels = set(matching['Label'].astype(str))
+            later_granular = granular[
+                granular['_QRank'].gt(rank)
+                & granular['Label'].astype(str).isin(target_labels)]
+            if (not prior_zero.empty and not later_zero.empty
+                    and not later_granular.empty):
+                stage2_drop.add(idx)
+
+    if stage2_drop:
+        out = out.drop(index=sorted(stage2_drop)).copy()
+    removed = len(drop) + len(stage2_drop)
+    if removed:
+        print(
+            f"  [Investing Overlap] Removed {removed} stale broad-Other "
+            "comparative duplicate fact(s).")
+    return out
+
+
+def _repair_standard_investment_zero_baselines(df):
+    """Repair late granular investment families without inventing quarters.
+
+    A newly visible granular row does not by itself prove that all earlier
+    activity was zero.  Three cases are handled separately:
+
+    * If the same exact concept already has a discrete quarterly fact, a zero
+      baseline is forbidden.  When an annual total exactly equals the sum of
+      the available nonnegative direct quarters, a synthetic YTD9 baseline is
+      created from that proven sum so Q4 can be derived correctly.
+    * If an annual-only marketable component exactly equals a broader
+      purchases/proceeds aggregate for the same year, the matching aggregate
+      concept's YTD9 value is used as the component baseline.  Because these
+      are nonnegative gross cash-flow families, exact annual equality proves
+      that the aggregate contains no other component for that year.
+    * Only when neither source of prior activity exists may the original
+      exact-concept zero baseline be added.
+
+    This preserves PLTR's genuinely late granular families while preventing
+    annual cumulative facts from being published as discrete AMZN quarters.
+    """
+    required = {'Category', 'Label', 'Concept', 'Value', 'FY', 'Q',
+                'Start', 'End', 'Duration'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    cash = out['Category'].eq('3_Cash_Flow')
+    targets = set(_INVESTMENT_COMPONENT_LABELS) | {
+        _BUSINESS_COMBINATIONS_NET_LABEL,
+        'Other Investing Activities'}
+    qrank = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
+
+    def _cumulative(frame):
+        d = pd.to_numeric(frame['Duration'], errors='coerce')
+        q = frame['Q'].astype(str)
+        return (
+            q.eq('Q1') & d.between(45, 125)
+            | q.eq('Q2') & d.between(140, 230)
+            | q.eq('Q3') & d.between(220, 320)
+            | q.eq('Q4') & d.between(300, 400))
+
+    def _discrete_quarter(frame):
+        d = pd.to_numeric(frame['Duration'], errors='coerce')
+        q = frame['Q'].astype(str)
+        # Q1 is both discrete and YTD, and never needs a prior baseline.
+        return q.isin({'Q2', 'Q3', 'Q4'}) & d.between(20, 125)
+
+    def _best(rows):
+        if rows.empty:
+            return None
+        work = rows.copy()
+        work['_FiledSort'] = pd.to_datetime(
+            work.get('Filed', pd.Series(pd.NaT, index=work.index)),
+            errors='coerce')
+        work['_CalcSort'] = work.get(
+            'IsCalculated', pd.Series(False, index=work.index)
+        ).fillna(False).astype(bool)
+        work['_TagSort'] = pd.to_numeric(
+            work.get('TagRank', pd.Series(999, index=work.index)),
+            errors='coerce').fillna(999)
+        return work.sort_values(
+            ['_FiledSort', '_CalcSort', '_TagSort'],
+            ascending=[False, True, True]).iloc[0]
+
+    def _same_amount(left, right):
+        try:
+            left = float(left); right = float(right)
+        except (TypeError, ValueError):
+            return False
+        tolerance = max(abs(left), abs(right), 1.0) * 0.001 + 1.0
+        return abs(left - right) <= tolerance
+
+    def _clean_baseline(anchor, target, concept, value, first_source,
+                        derivation, marker):
+        baseline = anchor.copy()
+        baseline['Label'] = target
+        baseline['Value'] = float(value)
+        baseline['Concept'] = concept
+        baseline['IsCalculated'] = True
+        baseline['TagRank'] = -1
+        baseline['SourceAliasVerified'] = False
+        baseline['SourceAliasRule'] = np.nan
+        baseline['SourceEquivalentConcept'] = np.nan
+        baseline['SourceMetricFamily'] = np.nan
+        baseline['SourceMetricIdentity'] = np.nan
+        baseline['SourceSemanticType'] = target
+        baseline['SourceLabel'] = first_source.get('SourceLabel')
+        baseline['SourceRawLabel'] = first_source.get('SourceRawLabel')
+        baseline['SourceLabelOrigin'] = (
+            first_source.get('SourceLabelOrigin')
+            or 'verified_investment_quarterization')
+        baseline['SourceDerivation'] = derivation
+        baseline['SourcePeriodRole'] = 'derived_reclassification'
+        baseline['SourceCanonicalizedFrom'] = marker
+        return baseline.drop(
+            labels=['_QRank', '_Cumulative', '_DiscreteQuarter',
+                    '_FiledSort', '_CalcSort', '_TagSort'],
+            errors='ignore')
+
+    def _aggregate_parent(target):
+        if target in _INVESTMENT_PURCHASE_COMPONENT_LABELS:
+            return 'Purchases of Investments'
+        if target in _INVESTMENT_PROCEEDS_COMPONENT_LABELS:
+            return 'Proceeds from Investments'
+        return None
+
+    additions = []
+    repaired = []
+    fiscal_years = pd.to_numeric(
+        out.loc[cash, 'FY'], errors='coerce').dropna().astype(int).unique()
+    for fiscal_year in sorted(fiscal_years):
+        year = out.loc[
+            cash & pd.to_numeric(out['FY'], errors='coerce').eq(fiscal_year)
+        ].copy()
+        if year.empty:
+            continue
+        year['_QRank'] = year['Q'].astype(str).map(qrank).fillna(0).astype(int)
+        year['_Cumulative'] = _cumulative(year)
+        year['_DiscreteQuarter'] = _discrete_quarter(year)
+        totals = year[
+            year['Label'].eq('Investing Cash Flow') & year['_Cumulative']]
+        broad_other = year[
+            year['Label'].eq('Other Investing Activities')
+            & year['_Cumulative']]
+
+        for target in sorted(targets):
+            target_rows = year[
+                year['Label'].eq(target) & year['_Cumulative']].copy()
+            if target_rows.empty:
+                continue
+            for concept, concept_rows in target_rows.groupby(
+                    target_rows['Concept'].fillna('').astype(str),
+                    sort=False):
+                if not concept:
+                    continue
+                first_rank = int(concept_rows['_QRank'].min())
+                if first_rank <= 1:
+                    continue
+                prior_rank = first_rank - 1
+                if not totals['_QRank'].eq(prior_rank).any():
+                    continue
+                if target_rows['_QRank'].lt(first_rank).any():
+                    continue
+
+                first_source = _best(concept_rows[
+                    concept_rows['_QRank'].eq(first_rank)])
+                if first_source is None:
+                    continue
+                first_value = pd.to_numeric(
+                    pd.Series([first_source.get('Value')]),
+                    errors='coerce').iloc[0]
+                if pd.isna(first_value):
+                    continue
+                first_value = float(first_value)
+
+                all_concept_rows = year[
+                    year['Label'].eq(target)
+                    & year['Concept'].fillna('').astype(str).eq(concept)
+                ].copy()
+                direct_rows = all_concept_rows[
+                    all_concept_rows['_DiscreteQuarter']
+                    & all_concept_rows['_QRank'].le(first_rank)]
+
+                # A direct fact proves the family was not absent before the
+                # first cumulative rendering.  Never manufacture a zero.  For
+                # an annual-only cumulative fact, derive a YTD9 baseline only
+                # when the annual total exactly equals the nonnegative direct
+                # quarterly facts already reported through Q3.
+                if not direct_rows.empty:
+                    if (first_rank == 4
+                            and target in _INVESTMENT_COMPONENT_LABELS
+                            and first_value >= 0):
+                        quarter_values = []
+                        conflict = False
+                        for rank in (1, 2, 3):
+                            rows_at_rank = direct_rows[
+                                direct_rows['_QRank'].eq(rank)].copy()
+                            if rows_at_rank.empty:
+                                continue
+                            numeric = pd.to_numeric(
+                                rows_at_rank['Value'], errors='coerce').dropna()
+                            distinct = []
+                            for value in numeric:
+                                value = float(value)
+                                if not any(_same_amount(value, prior)
+                                           for prior in distinct):
+                                    distinct.append(value)
+                            if len(distinct) != 1 or distinct[0] < 0:
+                                conflict = True
+                                break
+                            quarter_values.append(distinct[0])
+                        direct_sum = float(sum(quarter_values))
+                        if (not conflict and quarter_values
+                                and _same_amount(first_value, direct_sum)):
+                            anchor = _best(totals[
+                                totals['_QRank'].eq(3)])
+                            if anchor is not None:
+                                additions.append(_clean_baseline(
+                                    anchor, target, concept, direct_sum,
+                                    first_source,
+                                    'reported_direct_quarters_sum_to_annual_'
+                                    'investment_family_ytd9_baseline',
+                                    _INVESTMENT_MIGRATION_RULE
+                                    + ':direct_quarters_equal_annual'))
+
+                                # A mathematically proven zero Q4 can be lost by
+                                # generic publication cleanup when represented
+                                # only as annual minus YTD.  Preserve it as an
+                                # explicit derived discrete-quarter fact.
+                                q4_zero = first_source.copy()
+                                q3_end = pd.to_datetime(
+                                    anchor.get('End'), errors='coerce')
+                                annual_end = pd.to_datetime(
+                                    first_source.get('End'), errors='coerce')
+                                if pd.notna(q3_end) and pd.notna(annual_end):
+                                    q4_start = q3_end + pd.Timedelta(days=1)
+                                    q4_zero['Start'] = q4_start.strftime('%Y-%m-%d')
+                                    q4_zero['End'] = annual_end.strftime('%Y-%m-%d')
+                                    q4_zero['Duration'] = int(
+                                        (annual_end - q4_start).days)
+                                    q4_zero['Q'] = 'Q4'
+                                    q4_zero['Value'] = 0.0
+                                    q4_zero['Concept'] = concept
+                                    q4_zero['IsCalculated'] = True
+                                    q4_zero['TagRank'] = -2
+                                    q4_zero['SourceAliasVerified'] = False
+                                    q4_zero['SourceAliasRule'] = np.nan
+                                    q4_zero['SourceEquivalentConcept'] = np.nan
+                                    q4_zero['SourceMetricFamily'] = np.nan
+                                    q4_zero['SourceMetricIdentity'] = np.nan
+                                    q4_zero['SourceSemanticType'] = target
+                                    q4_zero['SourceDerivation'] = (
+                                        'annual_equals_reported_direct_quarters_'
+                                        'derived_zero_q4')
+                                    q4_zero['SourcePeriodRole'] = (
+                                        'derived_discrete_quarter')
+                                    q4_zero['SourceCanonicalizedFrom'] = (
+                                        _INVESTMENT_MIGRATION_RULE
+                                        + ':direct_quarters_equal_annual_zero_q4')
+                                    additions.append(q4_zero.drop(
+                                        labels=['_QRank', '_Cumulative',
+                                                '_DiscreteQuarter', '_FiledSort',
+                                                '_CalcSort', '_TagSort'],
+                                        errors='ignore'))
+                                repaired.append(
+                                    f'FY{fiscal_year}:{target}:{concept}:'
+                                    'direct-sum-ytd9-zero-q4')
+                    continue
+
+                # A later standard component can be a taxonomy refinement of a
+                # broader parent.  Exact annual equality plus the same parent
+                # concept's YTD9 fact proves a safe baseline for nonnegative
+                # purchase/proceeds families.  Use the matching parent concept,
+                # not another aggregate component in the same normalized row.
+                parent_label = _aggregate_parent(target)
+                if (first_rank == 4 and parent_label
+                        and first_value > 1.0):
+                    parent_annual = year[
+                        year['Label'].eq(parent_label)
+                        & year['_Cumulative']
+                        & year['_QRank'].eq(4)].copy()
+                    parent_annual['_Num'] = pd.to_numeric(
+                        parent_annual['Value'], errors='coerce')
+                    matching_annual = parent_annual[
+                        parent_annual['_Num'].map(
+                            lambda value: pd.notna(value)
+                            and _same_amount(value, first_value))]
+                    parent_match = _best(matching_annual)
+                    if parent_match is not None:
+                        parent_concept = str(
+                            parent_match.get('Concept') or '').strip()
+                        parent_prior = year[
+                            year['Label'].eq(parent_label)
+                            & year['_Cumulative']
+                            & year['_QRank'].eq(3)]
+                        if parent_concept:
+                            parent_prior = parent_prior[
+                                parent_prior['Concept'].fillna('').astype(str)
+                                .eq(parent_concept)]
+                        prior_source = _best(parent_prior)
+                        if prior_source is not None:
+                            prior_value = pd.to_numeric(
+                                pd.Series([prior_source.get('Value')]),
+                                errors='coerce').iloc[0]
+                            if (pd.notna(prior_value)
+                                    and 0 <= float(prior_value)
+                                    <= first_value + max(
+                                        first_value * 0.001, 1.0)):
+                                additions.append(_clean_baseline(
+                                    prior_source, target, concept,
+                                    float(prior_value), first_source,
+                                    'broader_investment_parent_annual_equals_'
+                                    'component_annual_ytd9_baseline',
+                                    _INVESTMENT_MIGRATION_RULE
+                                    + ':aggregate_annual_equals_component'))
+                                repaired.append(
+                                    f'FY{fiscal_year}:{target}:{concept}:'
+                                    'aggregate-equality-ytd9')
+                                continue
+
+                prior_broad = broad_other[
+                    broad_other['_QRank'].eq(prior_rank)]
+                if not prior_broad.empty:
+                    prior_abs = float(pd.to_numeric(
+                        prior_broad['Value'], errors='coerce').abs().max())
+                    tolerance = max(abs(first_value), prior_abs, 1.0) * 0.001 + 1.0
+                    # A comparable prior broad amount is a migration candidate,
+                    # not proof of zero history.
+                    if (prior_abs > 1_000_000.0
+                            and abs(prior_abs - abs(first_value)) <= max(
+                                tolerance, abs(first_value) * 0.25)):
+                        continue
+
+                anchor = _best(totals[totals['_QRank'].eq(prior_rank)])
+                if anchor is None:
+                    continue
+                baseline = _clean_baseline(
+                    anchor, target, concept, 0.0, first_source,
+                    'prior_cumulative_statement_zero_baseline_for_late_'
+                    'investment_family',
+                    _INVESTMENT_MIGRATION_RULE + ':exact_zero_prior_period')
+                if bool(first_source.get('SourceAliasVerified', False)):
+                    baseline['SourceAliasVerified'] = True
+                    for metadata_column in (
+                            'SourceAliasRule', 'SourceEquivalentConcept',
+                            'SourceMetricFamily', 'SourceMetricIdentity'):
+                        baseline[metadata_column] = first_source.get(
+                            metadata_column)
+                additions.append(baseline)
+                repaired.append(
+                    f'FY{fiscal_year}:{target}:{concept}:zero')
+
+    if additions:
+        out = pd.concat([out, pd.DataFrame(additions)],
+                        ignore_index=True, sort=False)
+        print('  [Investing Baseline] Added verified prior baseline(s): ' +
+              ', '.join(repaired))
+    return out
+
+def _repair_investment_family_migrations(df):
+    """Transfer a proven broad-Other baseline into a later granular family.
+
+    Some filers initially present a purchase in ``Other investing activities``
+    and later separate the same year-to-date cash flow as private/non-marketable
+    or alternative-investment purchases.  Ordinary cumulative subtraction then
+    creates a false reversal in Other.  This repair changes classification only,
+    never total investing cash flow, and requires a narrow within-year pattern:
+
+    * the granular family first appears in a later cumulative period;
+    * an earlier nonzero broad-Other outflow exists with no granular peer;
+    * the later granular cumulative amount contains that earlier baseline; and
+    * broad Other disappears or becomes immaterial after the transition.
+
+    Ambiguous years or multiple matching granular families fail closed.
+    """
+    required = {'Category', 'Label', 'Value', 'FY', 'Q', 'Duration'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    cash = out['Category'].eq('3_Cash_Flow')
+    if not cash.any():
+        return out
+
+    qrank = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
+
+    def _rank_series(frame):
+        return frame['Q'].astype(str).map(qrank).fillna(0).astype(int)
+
+    def _is_cumulative_row(row):
+        quarter = str(row.get('Q') or '')
+        duration = pd.to_numeric(
+            pd.Series([row.get('Duration')]), errors='coerce').iloc[0]
+        if pd.isna(duration):
+            return False
+        if quarter == 'Q1':
+            return 45 <= float(duration) <= 125
+        lower = {'Q2': 140, 'Q3': 220, 'Q4': 300}.get(quarter)
+        upper = {'Q2': 230, 'Q3': 320, 'Q4': 400}.get(quarter)
+        return lower is not None and lower <= float(duration) <= upper
+
+    def _best_period_row(rows):
+        if rows.empty:
+            return None
+        work = rows.copy()
+        work['_FiledSort'] = pd.to_datetime(
+            work.get('Filed', pd.Series(pd.NaT, index=work.index)),
+            errors='coerce')
+        work['_CalcSort'] = work.get(
+            'IsCalculated', pd.Series(False, index=work.index)
+        ).fillna(False).astype(bool)
+        work['_RankSort'] = pd.to_numeric(
+            work.get('TagRank', pd.Series(999, index=work.index)),
+            errors='coerce').fillna(999)
+        return work.sort_values(
+            ['_FiledSort', '_CalcSort', '_RankSort'],
+            ascending=[False, True, True]).iloc[0]
+
+    migrated = []
+    fiscal_years = pd.to_numeric(
+        out.loc[cash, 'FY'], errors='coerce').dropna().astype(int).unique()
+    for fiscal_year in sorted(fiscal_years):
+        year = out.loc[
+            cash & pd.to_numeric(out['FY'], errors='coerce').eq(fiscal_year)
+        ].copy()
+        if year.empty:
+            continue
+        year['_QRank'] = _rank_series(year)
+        year['_Cumulative'] = year.apply(_is_cumulative_row, axis=1)
+        broad = year[
+            year['Label'].eq('Other Investing Activities')
+            & year['_Cumulative']].copy()
+        if broad.empty:
+            continue
+
+        candidates = []
+        for target in sorted(_INVESTMENT_MIGRATION_PURCHASE_LABELS):
+            specific = year[
+                year['Label'].eq(target) & year['_Cumulative']
+                & pd.to_numeric(year['Value'], errors='coerce').gt(0)
+            ].copy()
+            if specific.empty:
+                continue
+            first_rank = int(specific['_QRank'].min())
+            if first_rank <= 1:
+                continue
+            prior_specific = specific[specific['_QRank'] < first_rank]
+            if not prior_specific.empty:
+                continue
+            prior_broad = broad[
+                (broad['_QRank'] < first_rank)
+                & pd.to_numeric(broad['Value'], errors='coerce').lt(0)
+            ].copy()
+            if prior_broad.empty:
+                continue
+            prior_rank = int(prior_broad['_QRank'].max())
+            prior_row = _best_period_row(
+                prior_broad[prior_broad['_QRank'].eq(prior_rank)])
+            first_row = _best_period_row(
+                specific[specific['_QRank'].eq(first_rank)])
+            if prior_row is None or first_row is None:
+                continue
+            baseline = abs(float(prior_row['Value']))
+            first_total = abs(float(first_row['Value']))
+            tolerance = max(1.0, 0.001 * max(baseline, first_total, 1.0))
+            if baseline <= tolerance or first_total + tolerance < baseline:
+                continue
+
+            later_broad = broad[broad['_QRank'] >= first_rank].copy()
+            # A later comparative filing can repeat the newly separated
+            # granular cumulative amount under the old broad-Other concept.
+            # Treat that row as a stale presentation duplicate only when a
+            # subsequent granular period persists and broad Other then
+            # disappears or becomes immaterial.  This is the PLTR 2025 pattern:
+            # Q2 broad Other == Q2 private purchases, followed by Q3 private
+            # purchases plus only a $1M genuine Other outflow.
+            immaterial_limit = max(1_000_000.0, 0.10 * baseline)
+            duplicate_later_indices = set()
+            if not later_broad.empty:
+                for duplicate_rank in sorted(set(
+                        later_broad['_QRank']) & set(specific['_QRank'])):
+                    broad_at_rank = later_broad[
+                        later_broad['_QRank'].eq(duplicate_rank)]
+                    specific_at_rank = specific[
+                        specific['_QRank'].eq(duplicate_rank)]
+                    broad_row = _best_period_row(broad_at_rank)
+                    specific_row = _best_period_row(specific_at_rank)
+                    if broad_row is None or specific_row is None:
+                        continue
+                    broad_value = abs(float(broad_row['Value']))
+                    specific_value = abs(float(specific_row['Value']))
+                    equal_tolerance = max(
+                        1.0, 0.001 * max(broad_value, specific_value, 1.0))
+                    if abs(broad_value - specific_value) > equal_tolerance:
+                        continue
+                    future_specific = specific[
+                        specific['_QRank'].gt(duplicate_rank)]
+                    if future_specific.empty:
+                        continue
+                    future_broad = broad[
+                        broad['_QRank'].gt(duplicate_rank)]
+                    future_material = 0.0
+                    if not future_broad.empty:
+                        future_material = float(pd.to_numeric(
+                            future_broad['Value'], errors='coerce').abs().max())
+                    if future_material > immaterial_limit + equal_tolerance:
+                        continue
+                    matching = broad_at_rank[
+                        pd.to_numeric(broad_at_rank['Value'], errors='coerce')
+                        .abs().sub(specific_value).abs().le(equal_tolerance)
+                    ]
+                    duplicate_later_indices.update(matching.index.tolist())
+
+            later_for_materiality = later_broad.drop(
+                index=list(duplicate_later_indices), errors='ignore')
+            later_material = 0.0
+            if not later_for_materiality.empty:
+                later_material = float(pd.to_numeric(
+                    later_for_materiality['Value'], errors='coerce').abs().max())
+            # A surviving broad amount must be immaterial relative to the
+            # transferred baseline; otherwise it may represent a genuine other
+            # activity rather than a scope reset.
+            if later_material > immaterial_limit + tolerance:
+                continue
+
+            latest_rank = int(specific['_QRank'].max())
+            latest_row = _best_period_row(
+                specific[specific['_QRank'].eq(latest_rank)])
+            if latest_row is None:
+                continue
+            latest_total = abs(float(latest_row['Value']))
+            if latest_total + tolerance < baseline:
+                continue
+            # A single late annual disclosure is accepted only when it exactly
+            # identifies the prior broad baseline.  Otherwise require persistence
+            # across at least two cumulative filings.
+            distinct_specific_periods = specific['_QRank'].nunique()
+            if (distinct_specific_periods < 2
+                    and abs(latest_total - baseline) > tolerance):
+                continue
+            target_concepts = {
+                str(value).strip() for value in specific['Concept'].dropna()
+                if str(value).strip()
+            } if 'Concept' in specific.columns else set()
+            target_concept = (
+                next(iter(target_concepts)) if len(target_concepts) == 1
+                else None)
+            broad_concept_rows = pd.concat(
+                [prior_broad, later_for_materiality], ignore_index=False,
+                sort=False)
+            broad_concepts = {
+                str(value).strip()
+                for value in broad_concept_rows.get(
+                    'Concept', pd.Series(dtype=object)).dropna()
+                if str(value).strip()
+            }
+            broad_concept = (
+                next(iter(broad_concepts)) if len(broad_concepts) == 1
+                else None)
+            candidates.append((
+                target, first_rank, baseline,
+                tuple(sorted(duplicate_later_indices)),
+                target_concept, broad_concept))
+
+        if len(candidates) != 1:
+            continue
+        (target, first_rank, baseline, duplicate_later_indices,
+         target_concept, broad_concept) = candidates[0]
+
+        # Standard concepts normally keep exact-concept identity, but a proven
+        # broad-Other -> granular migration also needs the reported later
+        # cumulative rows and the reclassified earlier baseline to share one
+        # publication identity.  Restore the strong filer-face identity only
+        # for this exact concept, fiscal year, and target row.  This does not
+        # alias different standard concepts and therefore cannot recreate the
+        # marketable-security scope collision that the global scrub prevents.
+        if target_concept:
+            target_year_mask = (
+                cash
+                & pd.to_numeric(out['FY'], errors='coerce').eq(fiscal_year)
+                & out['Label'].eq(target)
+                & out.get('Concept', pd.Series('', index=out.index))
+                    .fillna('').astype(str).eq(target_concept)
+                & out.apply(_is_cumulative_row, axis=1)
+            )
+            for target_idx in out.index[target_year_mask]:
+                source_label = _investment_row_source_label(
+                    out.loc[target_idx])
+                if (_classify_investment_face_label(source_label)
+                        == target):
+                    _stamp_investment_family_metadata(
+                        out, target_idx, target, source_label,
+                        origin='verified_migration_target_face')
+
+        migration_mask = (
+            cash & pd.to_numeric(out['FY'], errors='coerce').eq(fiscal_year)
+            & out['Label'].eq('Other Investing Activities')
+            & out.apply(_is_cumulative_row, axis=1)
+            & out['Q'].astype(str).map(qrank).fillna(0).lt(first_rank)
+            & pd.to_numeric(out['Value'], errors='coerce').lt(0)
+            & pd.to_numeric(out['Value'], errors='coerce').abs().le(
+                baseline * 1.001 + 1.0)
+        )
+        if not migration_mask.any():
+            continue
+
+        # Neutralize stale broad-Other comparative duplicates that equal the
+        # newly separated granular family.  Keep the rows as explicit derived
+        # zero baselines so later quarter selection cannot resurrect them.
+        if duplicate_later_indices:
+            duplicate_mask = out.index.isin(duplicate_later_indices)
+            out.loc[duplicate_mask, 'Value'] = 0.0
+            # Preserve the original broad concept so later genuine Other
+            # cumulative facts remain exact-concept compatible.
+            out.loc[duplicate_mask, 'IsCalculated'] = True
+            out.loc[duplicate_mask, 'TagRank'] = -1
+            out.loc[duplicate_mask, 'SourceAliasVerified'] = True
+            out.loc[duplicate_mask, 'SourceAliasRule'] = (
+                _INVESTMENT_MIGRATION_RULE)
+            out.loc[duplicate_mask, 'SourceEquivalentConcept'] = (
+                _INVESTMENT_EQUIVALENT_PREFIX
+                + 'other_investing_activities')
+            out.loc[duplicate_mask, 'SourceMetricFamily'] = (
+                'investing.other_investing_activities')
+            out.loc[duplicate_mask, 'SourceMetricIdentity'] = (
+                'other_investing_activities')
+            out.loc[duplicate_mask, 'SourceSemanticType'] = (
+                'Other Investing Activities')
+            out.loc[duplicate_mask, 'SourceDerivation'] = (
+                'stale_broad_other_duplicate_of_granular_family')
+            out.loc[duplicate_mask, 'SourcePeriodRole'] = (
+                'derived_reclassification')
+            _append_source_marker(
+                out, pd.Series(duplicate_mask, index=out.index),
+                _INVESTMENT_MIGRATION_RULE
+                + ':stale_broad_other_duplicate')
+            if broad_concept:
+                # The reclassified baseline now carries the same concrete
+                # concept as the later cumulative family.  Exact-concept
+                # arithmetic must win over the synthetic alias identity.
+                out.loc[duplicate_mask, 'SourceAliasVerified'] = False
+                out.loc[duplicate_mask, 'SourceAliasRule'] = np.nan
+                out.loc[duplicate_mask, 'SourceEquivalentConcept'] = np.nan
+
+        source_rows = out.loc[migration_mask].copy()
+        if target_concept:
+            if 'SourceOriginalConcept' not in out.columns:
+                out['SourceOriginalConcept'] = np.nan
+            out.loc[migration_mask, 'SourceOriginalConcept'] = (
+                out.loc[migration_mask, 'Concept'])
+            out.loc[migration_mask, 'Concept'] = target_concept
+        out.loc[migration_mask, 'Label'] = target
+        out.loc[migration_mask, 'Value'] = pd.to_numeric(
+            out.loc[migration_mask, 'Value'], errors='coerce').abs()
+        out.loc[migration_mask, 'IsCalculated'] = True
+        out.loc[migration_mask, 'SourceAliasVerified'] = True
+        out.loc[migration_mask, 'SourceAliasRule'] = _INVESTMENT_MIGRATION_RULE
+        _target_identity = re.sub(
+            r'[^a-z0-9]+', '_', target.casefold()).strip('_')
+        out.loc[migration_mask, 'SourceEquivalentConcept'] = (
+            _INVESTMENT_EQUIVALENT_PREFIX + _target_identity)
+        out.loc[migration_mask, 'SourceMetricFamily'] = (
+            'investing.' + _target_identity)
+        out.loc[migration_mask, 'SourceMetricIdentity'] = _target_identity
+        out.loc[migration_mask, 'SourceSemanticType'] = target
+        out.loc[migration_mask, 'SourceDerivation'] = (
+            'broad_other_reclassified_to_later_granular_family')
+        out.loc[migration_mask, 'SourcePeriodRole'] = 'derived_reclassification'
+        _append_source_marker(
+            out, migration_mask,
+            _INVESTMENT_MIGRATION_RULE + ':' + target)
+        # The reclassified row is derived from a verified within-year face-line
+        # migration.  Retain that narrow family proof even when the later
+        # granular concept is concrete; otherwise publication gates can discard
+        # the reported Q1 baseline before cumulative quarterization.  This alias
+        # is confined to the migration-derived row and does not make unrelated
+        # standard investment concepts interchangeable.
+
+        # Preserve a zero broad-family baseline for the same periods so the
+        # quarterizer cannot subtract the pre-reclassification amount from a
+        # later genuine Other line.
+        zeros = source_rows.copy()
+        zeros['Label'] = 'Other Investing Activities'
+        zeros['Value'] = 0.0
+        zeros['Concept'] = (
+            broad_concept or 'DerivedInvestmentFamilyMigrationOtherBaseline')
+        zeros['IsCalculated'] = True
+        zeros['TagRank'] = -1
+        zeros['SourceAliasVerified'] = True
+        zeros['SourceAliasRule'] = _INVESTMENT_MIGRATION_RULE
+        zeros['SourceEquivalentConcept'] = (
+            _INVESTMENT_EQUIVALENT_PREFIX
+            + 'other_investing_activities')
+        zeros['SourceMetricFamily'] = 'investing.other_investing_activities'
+        zeros['SourceMetricIdentity'] = 'other_investing_activities'
+        zeros['SourceSemanticType'] = 'Other Investing Activities'
+        zeros['SourceDerivation'] = (
+            'broad_other_baseline_reset_after_granular_reclassification')
+        zeros['SourcePeriodRole'] = 'derived_reclassification'
+        zeros['SourceCanonicalizedFrom'] = (
+            _INVESTMENT_MIGRATION_RULE + ':zero_other_baseline')
+        if broad_concept:
+            zeros['SourceAliasVerified'] = False
+            zeros['SourceAliasRule'] = np.nan
+            zeros['SourceEquivalentConcept'] = np.nan
+
+        # Also create a zero broad-Other cumulative baseline for each granular
+        # filing period where the filer no longer presents an Other line.  The
+        # transition quarter is essential: without a Q2 zero in PLTR 2025, the
+        # later nine-month $1M Other outflow cannot be isolated as Q3.
+        specific_period_rows = out.loc[
+            cash & pd.to_numeric(out['FY'], errors='coerce').eq(fiscal_year)
+            & out['Label'].eq(target)
+            & out.apply(_is_cumulative_row, axis=1)
+        ].copy()
+        existing_broad_ranks = set(
+            _rank_series(out.loc[
+                cash & pd.to_numeric(out['FY'], errors='coerce').eq(fiscal_year)
+                & out['Label'].eq('Other Investing Activities')
+                & out.apply(_is_cumulative_row, axis=1)
+            ]).tolist())
+        existing_broad_ranks.update(_rank_series(zeros).tolist())
+        synthetic_period_zeros = []
+        if not specific_period_rows.empty:
+            specific_period_rows['_QRank'] = _rank_series(
+                specific_period_rows)
+            for period_rank, period_rows in specific_period_rows.groupby(
+                    '_QRank', sort=True):
+                if int(period_rank) in existing_broad_ranks:
+                    continue
+                period_row = _best_period_row(period_rows)
+                if period_row is None:
+                    continue
+                zero = period_row.copy()
+                zero['Label'] = 'Other Investing Activities'
+                zero['Value'] = 0.0
+                zero['Concept'] = (
+                    broad_concept
+                    or 'DerivedInvestmentFamilyMigrationOtherBaseline')
+                zero['IsCalculated'] = True
+                zero['TagRank'] = -1
+                zero['SourceAliasVerified'] = True
+                zero['SourceAliasRule'] = _INVESTMENT_MIGRATION_RULE
+                zero['SourceEquivalentConcept'] = (
+                    _INVESTMENT_EQUIVALENT_PREFIX
+                    + 'other_investing_activities')
+                zero['SourceMetricFamily'] = (
+                    'investing.other_investing_activities')
+                zero['SourceMetricIdentity'] = (
+                    'other_investing_activities')
+                zero['SourceSemanticType'] = (
+                    'Other Investing Activities')
+                zero['SourceDerivation'] = (
+                    'missing_broad_other_period_reset_after_granular_'
+                    'reclassification')
+                zero['SourcePeriodRole'] = 'derived_reclassification'
+                zero['SourceCanonicalizedFrom'] = (
+                    _INVESTMENT_MIGRATION_RULE
+                    + ':zero_other_transition_period')
+                if broad_concept:
+                    zero['SourceAliasVerified'] = False
+                    zero['SourceAliasRule'] = np.nan
+                    zero['SourceEquivalentConcept'] = np.nan
+                synthetic_period_zeros.append(zero.drop(
+                    labels=['_QRank', '_Cumulative', '_FiledSort',
+                            '_CalcSort', '_RankSort'], errors='ignore'))
+
+        # When the transferred broad baseline first appears after Q1, a
+        # directly extracted prior-quarter Investing Cash Flow context proves
+        # that the earlier filing exists and omitted both the broad and granular
+        # family.  Add a zero granular cumulative baseline so the transferred
+        # amount is assigned to the correct discrete quarter rather than left
+        # in the bridge residual (PLTR 2024 H1 -> Q2).
+        synthetic_target_baselines = []
+        synthetic_prior_other_baselines = []
+        migrated_ranks = sorted(set(
+            out.loc[migration_mask, 'Q'].astype(str)
+            .map(qrank).fillna(0).astype(int).tolist()))
+        if migrated_ranks and migrated_ranks[0] > 1:
+            prior_rank = migrated_ranks[0] - 1
+            prior_total = year[
+                year['Label'].eq('Investing Cash Flow')
+                & year['_Cumulative']
+                & year['_QRank'].eq(prior_rank)
+            ]
+            prior_target = year[
+                year['Label'].eq(target)
+                & year['_Cumulative']
+                & year['_QRank'].eq(prior_rank)
+            ]
+            prior_broad_existing = broad[broad['_QRank'].eq(prior_rank)]
+            if (not prior_total.empty and prior_target.empty
+                    and prior_broad_existing.empty):
+                anchor = _best_period_row(prior_total)
+                if anchor is not None:
+                    zero_target = anchor.copy()
+                    zero_target['Label'] = target
+                    zero_target['Value'] = 0.0
+                    zero_target['Concept'] = (
+                        target_concept
+                        or 'DerivedInvestmentFamilyMigrationTargetBaseline')
+                    zero_target['IsCalculated'] = True
+                    zero_target['TagRank'] = -1
+                    zero_target['SourceAliasVerified'] = True
+                    zero_target['SourceAliasRule'] = (
+                        _INVESTMENT_MIGRATION_RULE)
+                    zero_target['SourceEquivalentConcept'] = (
+                        _INVESTMENT_EQUIVALENT_PREFIX + _target_identity)
+                    zero_target['SourceMetricFamily'] = (
+                        'investing.' + _target_identity)
+                    zero_target['SourceMetricIdentity'] = _target_identity
+                    zero_target['SourceSemanticType'] = target
+                    zero_target['SourceDerivation'] = (
+                        'prior_filing_zero_baseline_for_migrated_'
+                        'granular_family')
+                    zero_target['SourcePeriodRole'] = (
+                        'derived_reclassification')
+                    zero_target['SourceCanonicalizedFrom'] = (
+                        _INVESTMENT_MIGRATION_RULE
+                        + ':zero_target_prior_period')
+                    # This zero exists only because the same verified
+                    # migration proves that the later granular family was absent
+                    # in the prior filing.  Retain the migration-family identity
+                    # so the zero and the reclassified cumulative amount remain
+                    # quarterizable even when the later concept is concrete.
+                    synthetic_target_baselines.append(zero_target.drop(
+                        labels=['_QRank', '_Cumulative', '_FiledSort',
+                                '_CalcSort', '_RankSort'], errors='ignore'))
+
+                    zero_other_prior = anchor.copy()
+                    zero_other_prior['Label'] = (
+                        'Other Investing Activities')
+                    zero_other_prior['Value'] = 0.0
+                    zero_other_prior['Concept'] = (
+                        broad_concept
+                        or 'DerivedInvestmentFamilyMigrationOtherBaseline')
+                    zero_other_prior['IsCalculated'] = True
+                    zero_other_prior['TagRank'] = -1
+                    zero_other_prior['SourceAliasVerified'] = True
+                    zero_other_prior['SourceAliasRule'] = (
+                        _INVESTMENT_MIGRATION_RULE)
+                    zero_other_prior['SourceEquivalentConcept'] = (
+                        _INVESTMENT_EQUIVALENT_PREFIX
+                        + 'other_investing_activities')
+                    zero_other_prior['SourceMetricFamily'] = (
+                        'investing.other_investing_activities')
+                    zero_other_prior['SourceMetricIdentity'] = (
+                        'other_investing_activities')
+                    zero_other_prior['SourceSemanticType'] = (
+                        'Other Investing Activities')
+                    zero_other_prior['SourceDerivation'] = (
+                        'prior_filing_zero_baseline_for_migrated_other_'
+                        'family')
+                    zero_other_prior['SourcePeriodRole'] = (
+                        'derived_reclassification')
+                    zero_other_prior['SourceCanonicalizedFrom'] = (
+                        _INVESTMENT_MIGRATION_RULE
+                        + ':zero_other_prior_period')
+                    if broad_concept:
+                        zero_other_prior['SourceAliasVerified'] = False
+                        zero_other_prior['SourceAliasRule'] = np.nan
+                        zero_other_prior['SourceEquivalentConcept'] = np.nan
+                    synthetic_prior_other_baselines.append(
+                        zero_other_prior.drop(
+                            labels=['_QRank', '_Cumulative', '_FiledSort',
+                                    '_CalcSort', '_RankSort'],
+                            errors='ignore'))
+
+        pieces = [out, zeros]
+        if synthetic_period_zeros:
+            pieces.append(pd.DataFrame(synthetic_period_zeros))
+        if synthetic_target_baselines:
+            pieces.append(pd.DataFrame(synthetic_target_baselines))
+        if synthetic_prior_other_baselines:
+            pieces.append(pd.DataFrame(synthetic_prior_other_baselines))
+        out = pd.concat(pieces, ignore_index=True, sort=False)
+        migrated.append(f'FY{fiscal_year}:{target}')
+
+    if migrated:
+        print('  [Investing Migration] Reclassified broad Other baseline(s): '
+              + ', '.join(migrated))
+    return out
+
+
+
+def _repair_late_new_investment_family_baselines(df):
+    """Add a zero YTD9 baseline for a proven annual-only granular family.
+
+    A filer may introduce a granular investing line in the 10-K after reporting
+    zero activity through nine months.  Without a YTD9 zero, the quarterizer
+    cannot assign the annual amount to Q4 and leaves it in the bridge residual.
+    This repair is deliberately narrow: it applies only to strong face-verified
+    granular families first appearing in Q4, requires an extracted Q3 investing
+    statement, and requires the broad Other line to continue from Q3 to Q4 with
+    only an immaterial movement.  A material broad-line reset is handled by the
+    separate presentation-migration repair and is not treated as zero history.
+    """
+    required = {'Category', 'Label', 'Value', 'FY', 'Q', 'Duration'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return df
+    out = df.copy()
+    cash = out['Category'].eq('3_Cash_Flow')
+    if not cash.any():
+        return out
+
+    qrank = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
+
+    def _cumulative(frame):
+        durations = pd.to_numeric(frame['Duration'], errors='coerce')
+        quarters = frame['Q'].astype(str)
+        return (
+            quarters.eq('Q1') & durations.between(45, 125)
+            | quarters.eq('Q2') & durations.between(140, 230)
+            | quarters.eq('Q3') & durations.between(220, 320)
+            | quarters.eq('Q4') & durations.between(300, 400)
+        )
+
+    def _best(rows):
+        if rows.empty:
+            return None
+        work = rows.copy()
+        work['_FiledSort'] = pd.to_datetime(
+            work.get('Filed', pd.Series(pd.NaT, index=work.index)),
+            errors='coerce')
+        work['_CalcSort'] = work.get(
+            'IsCalculated', pd.Series(False, index=work.index)
+        ).fillna(False).astype(bool)
+        work['_TagSort'] = pd.to_numeric(
+            work.get('TagRank', pd.Series(999, index=work.index)),
+            errors='coerce').fillna(999)
+        return work.sort_values(
+            ['_FiledSort', '_CalcSort', '_TagSort'],
+            ascending=[False, True, True]).iloc[0]
+
+    additions = []
+    repaired = []
+    fiscal_years = pd.to_numeric(
+        out.loc[cash, 'FY'], errors='coerce').dropna().astype(int).unique()
+    for fiscal_year in sorted(fiscal_years):
+        year_mask = (
+            cash & pd.to_numeric(out['FY'], errors='coerce').eq(fiscal_year))
+        year = out.loc[year_mask].copy()
+        if year.empty:
+            continue
+        year['_QRank'] = year['Q'].astype(str).map(qrank).fillna(0).astype(int)
+        year['_Cumulative'] = _cumulative(year)
+
+        q3_total = _best(year[
+            year['Label'].eq('Investing Cash Flow')
+            & year['_Cumulative'] & year['_QRank'].eq(3)])
+        if q3_total is None:
+            continue
+        other_q3 = _best(year[
+            year['Label'].eq('Other Investing Activities')
+            & year['_Cumulative'] & year['_QRank'].eq(3)])
+        other_q4 = _best(year[
+            year['Label'].eq('Other Investing Activities')
+            & year['_Cumulative'] & year['_QRank'].eq(4)])
+        if other_q4 is None:
+            continue
+        other_q3_missing = other_q3 is None
+        other_prior = (
+            0.0 if other_q3_missing else pd.to_numeric(
+                pd.Series([other_q3.get('Value')]),
+                errors='coerce').iloc[0])
+        other_annual = pd.to_numeric(
+            pd.Series([other_q4.get('Value')]), errors='coerce').iloc[0]
+        if pd.isna(other_prior) or pd.isna(other_annual):
+            continue
+        other_delta = float(other_annual) - float(other_prior)
+        other_zero_added = False
+
+        for target in sorted(_INVESTMENT_LATE_BASELINE_LABELS):
+            # Missing prior broad Other is accepted only for the explicitly
+            # signed business-combination family.  For purchase/proceeds
+            # families, the Q3-to-annual broad continuity must be observable.
+            if other_q3_missing and target != _BUSINESS_COMBINATIONS_NET_LABEL:
+                continue
+            target_rows = year[
+                year['Label'].eq(target) & year['_Cumulative']].copy()
+            if target_rows.empty:
+                continue
+            target_rows['_QRank'] = target_rows['Q'].astype(str).map(
+                qrank).fillna(0).astype(int)
+            if int(target_rows['_QRank'].min()) != 4:
+                continue
+            annual_rows = target_rows[target_rows['_QRank'].eq(4)]
+            annual = _best(annual_rows)
+            if annual is None:
+                continue
+            # Only a strong filer face identity can prove the annual family.
+            if (not bool(annual.get('SourceAliasVerified', False))
+                    or str(annual.get('SourceAliasRule') or '').strip()
+                    != _INVESTMENT_FACE_ALIAS_RULE):
+                continue
+            source_label = str(annual.get('SourceLabel') or '').strip()
+            if _classify_investment_face_label(source_label) != target:
+                continue
+            annual_value = pd.to_numeric(
+                pd.Series([annual.get('Value')]), errors='coerce').iloc[0]
+            if pd.isna(annual_value) or abs(float(annual_value)) <= 1.0:
+                continue
+            scale = abs(float(annual_value))
+            tolerance = max(1_000_000.0, scale * 0.25)
+            if abs(other_delta) > tolerance:
+                continue
+            # If the prior broad line is itself approximately the annual family,
+            # this is a presentation transfer, not zero prior activity.
+            if abs(abs(float(other_prior)) - scale) <= max(
+                    1_000_000.0, scale * 0.10):
+                continue
+
+            identity = re.sub(
+                r'[^a-z0-9]+', '_', target.casefold()).strip('_')
+            zero = q3_total.copy()
+            zero['Label'] = target
+            zero['Value'] = 0.0
+            zero['Concept'] = 'DerivedLateInvestmentFamilyZeroBaseline'
+            zero['IsCalculated'] = True
+            zero['TagRank'] = -1
+            zero['SourceAliasVerified'] = True
+            zero['SourceAliasRule'] = _INVESTMENT_MIGRATION_RULE
+            zero['SourceEquivalentConcept'] = (
+                _INVESTMENT_EQUIVALENT_PREFIX + identity)
+            zero['SourceMetricFamily'] = 'investing.' + identity
+            zero['SourceMetricIdentity'] = identity
+            zero['SourceSemanticType'] = target
+            zero['SourceDerivation'] = (
+                'annual_only_granular_family_zero_ytd9_baseline')
+            zero['SourcePeriodRole'] = 'derived_reclassification'
+            zero['SourceCanonicalizedFrom'] = (
+                _INVESTMENT_MIGRATION_RULE + ':late_family_zero_ytd9')
+            additions.append(zero.drop(
+                labels=['_QRank', '_Cumulative', '_FiledSort',
+                        '_CalcSort', '_TagSort'], errors='ignore'))
+
+            if (other_q3_missing
+                    and target == _BUSINESS_COMBINATIONS_NET_LABEL
+                    and not other_zero_added):
+                zero_other = q3_total.copy()
+                zero_other['Label'] = 'Other Investing Activities'
+                zero_other['Value'] = 0.0
+                zero_other['Concept'] = (
+                    'DerivedLateInvestmentFamilyOtherZeroBaseline')
+                zero_other['IsCalculated'] = True
+                zero_other['TagRank'] = -1
+                zero_other['SourceAliasVerified'] = True
+                zero_other['SourceAliasRule'] = (
+                    _INVESTMENT_MIGRATION_RULE)
+                zero_other['SourceEquivalentConcept'] = (
+                    _INVESTMENT_EQUIVALENT_PREFIX
+                    + 'other_investing_activities')
+                zero_other['SourceMetricFamily'] = (
+                    'investing.other_investing_activities')
+                zero_other['SourceMetricIdentity'] = (
+                    'other_investing_activities')
+                zero_other['SourceSemanticType'] = (
+                    'Other Investing Activities')
+                zero_other['SourceDerivation'] = (
+                    'annual_other_line_zero_ytd9_baseline_for_'
+                    'business_combination_split')
+                zero_other['SourcePeriodRole'] = (
+                    'derived_reclassification')
+                zero_other['SourceCanonicalizedFrom'] = (
+                    _INVESTMENT_MIGRATION_RULE
+                    + ':late_other_zero_ytd9')
+                additions.append(zero_other.drop(
+                    labels=['_QRank', '_Cumulative', '_FiledSort',
+                            '_CalcSort', '_TagSort'], errors='ignore'))
+                other_zero_added = True
+
+            repaired.append(f'FY{fiscal_year}:{target}')
+
+    if additions:
+        out = pd.concat([out, pd.DataFrame(additions)],
+                        ignore_index=True, sort=False)
+        print('  [Investing Baseline] Added verified zero YTD9 baseline(s): '
+              + ', '.join(repaired))
+    return out
 
 def _compact_equity_issuance_text(*parts):
     return re.sub(r'[^a-z0-9]+', '', ' '.join(
@@ -4212,6 +6282,7 @@ CONCEPT_MAP = {
     'Capital Expenditures (Intangibles)': {'tags': ['PaymentsToAcquireIntangibleAssets'], 'cat': '3_Cash_Flow'},
     'Capital Expenditures (Equipment & Buildings)': {'tags': ['PaymentsToAcquireOtherPropertyPlantAndEquipment', 'PaymentsToAcquireMachineryAndEquipment', 'PaymentsToAcquireBuildings', 'PaymentsToAcquireLandAndBuildingsAndImprovements', 'PaymentsForConstructionInProcess', 'PaymentsToDevelopRealEstate', 'CapitalExpendituresIncurredButNotYetPaid'], 'cat': '3_Cash_Flow'},
     'Acquisitions': {'tags': ['PaymentsToAcquireBusinessesNetOfCashAcquired', 'PaymentsToAcquireBusinessesGross', 'PaymentsToAcquireBusinessesAndIntangibles', 'AcquisitionsNetOfCashAcquiredAndPurchasesOfIntangibleAndOtherAssets'], 'cat': '3_Cash_Flow'},
+    'Business Combinations, Net of Cash Acquired': {'tags': [], 'cat': '3_Cash_Flow'},
     'Cash Acquired in Business Acquisitions': {'tags': ['CashCashEquivalentsAndSegregatedCashAcquiredInBusinessAcquisitions', 'CashCashEquivalentsAndSegregatedCashAcquiredInBusinessAcquisitionsAndAssetAcquisitions'], 'cat': '6_Disclosures'},
     'Divestitures': {'tags': ['ProceedsFromDivestitureOfBusinesses', 'ProceedsFromSalesOfBusinessesNetOfCashDivested', 'ProceedsFromDivestitureOfBusinessesNetOfCashDivested', 'ProceedsFromSaleOfBusiness', 'ProceedsFromDivestitures', 'ProceedsFromSaleOfSubsidiaries', 'ProceedsFromSaleOfBusinessesAndInterestsInAffiliates', 'ProceedsFromDivestitureOfBusinessesAndInterestsInAffiliates', 'ProceedsFromSaleOfBusinessSegment'], 'cat': '3_Cash_Flow'},
     'Purchases of Marketable Securities': {'tags': ['PaymentsToAcquireMarketableSecurities', 'PaymentsToAcquireAvailableForSaleSecurities', 'PaymentsToAcquireShortTermInvestments', 'PaymentsToAcquireAvailableForSaleSecuritiesDebt'], 'cat': '3_Cash_Flow'},
@@ -7793,9 +9864,14 @@ def resolve_custom_tags(calc_trees):
                     target_label = None
                     
                     if parent_clean in investing_parents:
-                        if ('cash' in lbl_lower and 'acquir' in lbl_lower
-                                and ('business' in lbl_lower
-                                     or 'acquisition' in lbl_lower)):
+                        # Directional payment/purchase language wins over the
+                        # embedded phrase "net of cash acquired".  The prior
+                        # ordering misclassified Amazon's annual acquisition
+                        # outflow as cash received in a business acquisition.
+                        if _is_acquisition_cash_outflow_concept(child_clean):
+                            target_label = 'Acquisitions'
+                        elif _is_cash_acquired_in_business_acquisition_concept(
+                                child_clean):
                             target_label = 'Cash Acquired in Business Acquisitions'
                         elif 'property' in lbl_lower or 'equipment' in lbl_lower or 'capital' in lbl_lower:
                             if node.weight < 0:
@@ -14948,6 +17024,14 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
             xbrl)
     except Exception:
         _productive_asset_face_labels = {}
+    try:
+        _acquisition_face_labels = _collect_acquisition_face_labels(xbrl)
+    except Exception:
+        _acquisition_face_labels = {}
+    try:
+        _investment_face_labels = _collect_investment_face_labels(xbrl)
+    except Exception:
+        _investment_face_labels = {}
 
     extracted = []
     with _ProfileTimer("extract_prepare_columns"):
@@ -15248,7 +17332,47 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                     _source_fact_label_origin = 'presentation_tree'
         else:
             target_labels = _tag_to_labels.get(concept)
-                
+
+        # Strong cash-flow face labels override opaque issuer concept names for
+        # investment/security families.  Standard exact mappings resolve to the
+        # same target and therefore remain unchanged.
+        _investment_source_fact_label = None
+        _investment_source_label_origin = None
+        for _label_column in (
+                'label', 'label_text', 'standard_label',
+                'concept_label', 'name'):
+            _candidate_label = row.get(_label_column, None)
+            if (_candidate_label is not None
+                    and not pd.isna(_candidate_label)
+                    and str(_candidate_label).strip()
+                    and _classify_investment_face_label(_candidate_label)):
+                _investment_source_fact_label = str(_candidate_label).strip()
+                _investment_source_label_origin = 'fact'
+                break
+        if not _investment_source_fact_label:
+            _investment_source_fact_label = _investment_source_label(
+                _investment_face_labels.get(concept, ()))
+            if _investment_source_fact_label:
+                _investment_source_label_origin = 'presentation_tree'
+        _investment_face_target = _classify_investment_face_label(
+            _investment_source_fact_label)
+        _investment_face_override_applied = False
+        if (_investment_face_target
+                and _investment_face_override_is_safe(
+                    concept, target_labels or (),
+                    _investment_face_target,
+                    _investment_source_fact_label)):
+            if _investment_face_target == _BUSINESS_COMBINATIONS_NET_LABEL:
+                _business_combination_weight = _investing_calc_weight(concept)
+                if _business_combination_weight is not None:
+                    target_labels = (_investment_face_target,)
+                    val = -abs(float(val)) * (
+                        1.0 if float(_business_combination_weight) > 0 else -1.0)
+                    _investment_face_override_applied = True
+            else:
+                target_labels = (_investment_face_target,)
+                _investment_face_override_applied = True
+
         # Strict financing-equity fallback runs before generic fuzzy matching.
         # This catches issuer extensions even when presentation/calculation
         # learning is unavailable, while refusing share-count and APIC concepts.
@@ -15297,6 +17421,28 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
         if not target_labels:
             target_labels = ()
 
+        _acquisition_source_fact_label = None
+        _acquisition_source_label_origin = None
+        if 'Acquisitions' in target_labels:
+            for _label_column in (
+                    'label', 'label_text', 'standard_label',
+                    'concept_label', 'name'):
+                _candidate_label = row.get(_label_column, None)
+                if (_candidate_label is not None
+                        and not pd.isna(_candidate_label)
+                        and str(_candidate_label).strip()
+                        and _classify_acquisition_cash_flow_family(
+                            _candidate_label)):
+                    _acquisition_source_fact_label = str(
+                        _candidate_label).strip()
+                    _acquisition_source_label_origin = 'fact'
+                    break
+            if not _acquisition_source_fact_label:
+                _acquisition_source_fact_label = _acquisition_source_label(
+                    _acquisition_face_labels.get(concept, ()))
+                if _acquisition_source_fact_label:
+                    _acquisition_source_label_origin = 'presentation_tree'
+
         is_consolidated_fact = (dim_count == 0)
         if target_labels and dim_count > 0:
             if active_dim_cols is None:
@@ -15342,11 +17488,21 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                     'SourceClassificationConfidence': 1.0,
                     'SourceTableRole': 'xbrl_statement_fact',
                 }
-                if _source_fact_label:
-                    _extracted_fact['SourceLabel'] = _source_fact_label
-                    _extracted_fact['SourceRawLabel'] = _source_fact_label
+                _current_source_label = _source_fact_label
+                _current_source_origin = _source_fact_label_origin
+                if (target_label == 'Acquisitions'
+                        and _acquisition_source_fact_label):
+                    _current_source_label = _acquisition_source_fact_label
+                    _current_source_origin = _acquisition_source_label_origin
+                if (target_label in _INVESTMENT_FACE_TARGET_LABELS
+                        and _investment_source_fact_label):
+                    _current_source_label = _investment_source_fact_label
+                    _current_source_origin = _investment_source_label_origin
+                if _current_source_label:
+                    _extracted_fact['SourceLabel'] = _current_source_label
+                    _extracted_fact['SourceRawLabel'] = _current_source_label
                     _extracted_fact['SourceLabelOrigin'] = (
-                        _source_fact_label_origin)
+                        _current_source_origin)
                 if (concept == _PRODUCTIVE_ASSET_NET_CONCEPT
                         and target_label == 'Capital Expenditures'
                         and _source_fact_label
@@ -15369,6 +17525,38 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                         'SourceMetricIdentity':
                             'gross_productive_asset_purchases',
                     })
+                if (target_label in _INVESTMENT_FACE_TARGET_LABELS
+                        and _current_source_label
+                        and _investment_face_override_applied):
+                    _investment_family_key = re.sub(
+                        r'[^a-z0-9]+', '_',
+                        target_label.casefold()).strip('_')
+                    _extracted_fact.update({
+                        'SourceEquivalentConcept': (
+                            _INVESTMENT_EQUIVALENT_PREFIX
+                            + _investment_family_key),
+                        'SourceAliasVerified': True,
+                        'SourceAliasRule': _INVESTMENT_FACE_ALIAS_RULE,
+                        'SourceMetricFamily':
+                            'investing.' + _investment_family_key,
+                        'SourceMetricIdentity': _investment_family_key,
+                    })
+                if target_label == 'Acquisitions' and _current_source_label:
+                    _acquisition_family = (
+                        _classify_acquisition_cash_flow_family(
+                            _current_source_label))
+                    if _acquisition_family:
+                        _equivalent = (
+                            _ACQUISITION_EQUIVALENT_PREFIX
+                            + _acquisition_family)
+                        _extracted_fact.update({
+                            'SourceEquivalentConcept': _equivalent,
+                            'SourceAliasVerified': True,
+                            'SourceAliasRule': _ACQUISITION_ALIAS_RULE,
+                            'SourceMetricFamily':
+                                'acquisitions.' + _acquisition_family,
+                            'SourceMetricIdentity': _acquisition_family,
+                        })
                 extracted.append(_extracted_fact)
                 captured_by_concept_map = True
 
@@ -22294,6 +24482,12 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
     df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
     df = df.dropna(subset=['Value'])
     df = _prepare_investing_cash_flow_facts(df)
+    df = _dedupe_overlapping_investing_cash_flow_facts(df)
+    df = _arbitrate_standard_investment_scope_facts(df)
+    df = _repair_broad_other_granular_overlaps(df)
+    df = _repair_investment_family_migrations(df)
+    df = _repair_standard_investment_zero_baselines(df)
+    df = _repair_late_new_investment_family_baselines(df)
     df = _gb_prepare_operating_measure_facts(df)
     df = _gb_quarantine_conflicting_semantic_duplicates(df)
     def normalize_segment_label(label):
@@ -23393,6 +25587,101 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             return None
         return 'PaymentsToAcquireProductiveAssets'
 
+    def _verified_acquisition_equivalent_concept(row):
+        """Return a face-label-proven acquisition measurement identity."""
+        if row is None:
+            return None
+        if str(row.get('Category') or '').strip() != '3_Cash_Flow':
+            return None
+        if str(row.get('Label') or '').strip() != 'Acquisitions':
+            return None
+        if not bool(row.get('SourceAliasVerified', False)):
+            return None
+        if str(row.get('SourceAliasRule') or '').strip() != (
+                _ACQUISITION_ALIAS_RULE):
+            return None
+        source_label = str(row.get('SourceLabel') or '').strip()
+        family = _classify_acquisition_cash_flow_family(source_label)
+        if not family:
+            return None
+        equivalent = str(row.get('SourceEquivalentConcept') or '').strip()
+        expected = _ACQUISITION_EQUIVALENT_PREFIX + family
+        if equivalent != expected:
+            return None
+        if str(row.get('SourceMetricFamily') or '').strip() != (
+                'acquisitions.' + family):
+            return None
+        if str(row.get('SourceMetricIdentity') or '').strip() != family:
+            return None
+        dim_count = pd.to_numeric(
+            pd.Series([row.get('DimCount')]), errors='coerce').iloc[0]
+        if pd.isna(dim_count) or int(dim_count) != 0:
+            return None
+        start = _parse_plain_date_cached(row.get('Start'))
+        end = _parse_plain_date_cached(row.get('End'))
+        if pd.isna(start) or pd.isna(end) or end <= start:
+            return None
+        return equivalent
+
+    def _verified_investment_equivalent_concept(row):
+        """Return a narrowly verified investing measurement identity.
+
+        Face-label identities require the filer-authored label to classify to
+        the published row.  Migration identities are accepted only for rows
+        created by the explicit within-year broad-Other transfer rule.
+        """
+        if row is None:
+            return None
+        if str(row.get('Category') or '').strip() != '3_Cash_Flow':
+            return None
+        label_value = str(row.get('Label') or '').strip()
+        if label_value not in _INVESTMENT_FACE_TARGET_LABELS:
+            return None
+        if not bool(row.get('SourceAliasVerified', False)):
+            return None
+        rule = str(row.get('SourceAliasRule') or '').strip()
+        if rule not in {
+                _INVESTMENT_FACE_ALIAS_RULE,
+                _INVESTMENT_MIGRATION_RULE}:
+            return None
+        identity = re.sub(
+            r'[^a-z0-9]+', '_', label_value.casefold()).strip('_')
+        equivalent = str(
+            row.get('SourceEquivalentConcept') or '').strip()
+        expected = _INVESTMENT_EQUIVALENT_PREFIX + identity
+        if equivalent != expected:
+            return None
+        if str(row.get('SourceMetricFamily') or '').strip() != (
+                'investing.' + identity):
+            return None
+        if str(row.get('SourceMetricIdentity') or '').strip() != identity:
+            return None
+        if rule == _INVESTMENT_FACE_ALIAS_RULE:
+            source_label = str(row.get('SourceLabel') or '').strip()
+            if _classify_investment_face_label(source_label) != label_value:
+                return None
+        else:
+            derivation = str(row.get('SourceDerivation') or '').strip()
+            if derivation not in {
+                    'broad_other_reclassified_to_later_granular_family',
+                    'broad_other_baseline_reset_after_granular_reclassification',
+                    'missing_broad_other_period_reset_after_granular_reclassification',
+                    'prior_filing_zero_baseline_for_migrated_granular_family',
+                    'prior_filing_zero_baseline_for_migrated_other_family',
+                    'annual_only_granular_family_zero_ytd9_baseline',
+                    'annual_other_line_zero_ytd9_baseline_for_business_combination_split'}:
+                return None
+        dim_count = pd.to_numeric(
+            pd.Series([row.get('DimCount')]), errors='coerce').iloc[0]
+        if pd.isna(dim_count) or int(dim_count) != 0:
+            return None
+        start = _parse_plain_date_cached(row.get('Start'))
+        end = _parse_plain_date_cached(row.get('End'))
+        if pd.isna(start) or pd.isna(end) or end <= start:
+            return None
+        return equivalent
+
+
     def _exact_subtraction_concept(row):
         """Return a concrete concept suitable for cumulative subtraction."""
         if row is None:
@@ -23403,6 +25692,14 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         verified_equivalent = _verified_productive_asset_equivalent_concept(row)
         if verified_equivalent is not None:
             return verified_equivalent
+        verified_equivalent = _verified_investment_equivalent_concept(row)
+        if verified_equivalent is not None:
+            return verified_equivalent
+        # Acquisition face-family equivalence is applied only as a fallback
+        # between different concepts inside _best_cumulative_pair.  Preserve
+        # the historical exact-concept identity first so an unchanged concept
+        # can never regress merely because one filing exposes a different
+        # presentation label.
         concept = row.get('Concept')
         if concept is None or pd.isna(concept):
             return None
@@ -23519,6 +25816,26 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         result = (float(selected['Value']), selected)
         _best_val_cache[_cache_key] = result
         return result[0], result[1].copy()
+
+    def _best_acquisition_family_val(q_label, target_dur, family_identity,
+                                     max_distance=40):
+        """Select a fact from one verified acquisition face family."""
+        if (cat != '3_Cash_Flow' or label != 'Acquisitions'
+                or not family_identity):
+            return None
+        candidates = _duration_candidates(q_label, target_dur, max_distance)
+        if candidates.empty:
+            return None
+        family_mask = [
+            _verified_acquisition_equivalent_concept(candidate_row)
+            == family_identity
+            for _, candidate_row in candidates.iterrows()
+        ]
+        candidates = candidates.loc[family_mask]
+        if candidates.empty:
+            return None
+        selected = candidates.iloc[0].copy()
+        return float(selected['Value']), selected
 
     _CUMULATIVE_ASPECT_FIELDS = (
         'DimCount', 'DimensionSignature', 'SourceUnitSignature',
@@ -23750,7 +26067,8 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
 
         def _pair_diagnostics(ytd_value, annual_value,
                               ytd_concept, annual_concept,
-                              allow_exact_direct_mismatch=False):
+                              allow_exact_direct_mismatch=False,
+                              acquisition_family_identity=None):
             ytd_row, annual_row = ytd_value[1], annual_value[1]
             if not _cumulative_pair_compatible(ytd_row, annual_row):
                 return None
@@ -23769,6 +26087,14 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 family_concepts.append(annual_concept)
             direct_values = {}
             for quarter in ('Q1', 'Q2', 'Q3'):
+                if acquisition_family_identity is not None:
+                    direct = _best_acquisition_family_val(
+                        quarter, 91, acquisition_family_identity, 40)
+                    if (direct is not None
+                            and _cumulative_aspects_compatible(
+                                direct[1], ytd_row)):
+                        direct_values[quarter] = direct
+                    continue
                 for concept in family_concepts:
                     direct = get_best_val(
                         quarter, 91, 40, concept_filter=concept,
@@ -23816,6 +26142,20 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
             ]
             exact = candidates.loc[identity_mask]
             for _, candidate_row in exact.iterrows():
+                values.append((float(candidate_row['Value']),
+                               candidate_row.copy()))
+            return values
+
+        def _acquisition_family_values(candidates, family_identity):
+            values = []
+            if candidates.empty or not family_identity:
+                return values
+            family_mask = [
+                _verified_acquisition_equivalent_concept(candidate_row)
+                == family_identity
+                for _, candidate_row in candidates.iterrows()
+            ]
+            for _, candidate_row in candidates.loc[family_mask].iterrows():
                 values.append((float(candidate_row['Value']),
                                candidate_row.copy()))
             return values
@@ -23901,7 +26241,76 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                                 concept, concept, False,
                                 diagnostics[0], diagnostics[1]))
 
+        def _append_acquisition_family_pairs(use_all_aspects):
+            if cat != '3_Cash_Flow' or label != 'Acquisitions':
+                return
+            ytd_families = {
+                _verified_acquisition_equivalent_concept(row)
+                for _, row in ytd_candidates.iterrows()
+            }
+            annual_families = {
+                _verified_acquisition_equivalent_concept(row)
+                for _, row in annual_candidates.iterrows()
+            }
+            ytd_families.discard(None)
+            annual_families.discard(None)
+            for family_identity in sorted(
+                    ytd_families & annual_families):
+                legacy_ytd = _best_acquisition_family_val(
+                    'Q3', 273, family_identity, 40)
+                legacy_annual = _best_acquisition_family_val(
+                    'Q4', 365, family_identity, 50)
+                if legacy_ytd is None or legacy_annual is None:
+                    continue
+                # Exact-concept pairs were already attempted.  This fallback
+                # exists only to bridge a verified concept migration.
+                ytd_raw = str(legacy_ytd[1].get('Concept') or '').strip()
+                annual_raw = str(
+                    legacy_annual[1].get('Concept') or '').strip()
+                if ytd_raw and annual_raw and ytd_raw == annual_raw:
+                    continue
+                if use_all_aspects:
+                    ytd_values = [
+                        value for value in _acquisition_family_values(
+                            ytd_candidates, family_identity)
+                        if (_same_reported_value(value, legacy_ytd)
+                            and _same_source_filing(value, legacy_ytd))
+                    ]
+                    annual_values = [
+                        value for value in _acquisition_family_values(
+                            annual_candidates, family_identity)
+                        if (_same_reported_value(value, legacy_annual)
+                            and _same_source_filing(value, legacy_annual))
+                    ]
+                else:
+                    ytd_values = [legacy_ytd]
+                    annual_values = [legacy_annual]
+                for ytd_value in ytd_values:
+                    for annual_value in annual_values:
+                        ytd_concept = str(
+                            ytd_value[1].get('Concept') or '').strip()
+                        annual_concept = str(
+                            annual_value[1].get('Concept') or '').strip()
+                        diagnostics = _pair_diagnostics(
+                            ytd_value, annual_value,
+                            ytd_concept, annual_concept,
+                            acquisition_family_identity=family_identity)
+                        if diagnostics is not None:
+                            pairs.append((
+                                ytd_value, annual_value,
+                                ytd_concept, annual_concept, True,
+                                diagnostics[0], diagnostics[1]))
+
         def _append_alias_pairs(use_all_aspects):
+            # Acquisition cash-flow concepts can carry materially different
+            # scopes (pure business acquisitions versus acquisitions plus
+            # investments/other).  Their cross-concept arithmetic is allowed
+            # only through the verified filer-face family path above.  The
+            # generic historical value-overlap alias is too broad here and
+            # incorrectly paired Amazon FY2015's pure interim concept with a
+            # broader annual concept.
+            if cat == '3_Cash_Flow' and label == 'Acquisitions':
+                return
             for ytd_concept in sorted(ytd_concepts):
                 for annual_concept in sorted(annual_concepts):
                     if not _concepts_have_value_proven_equivalence(
@@ -23952,9 +26361,13 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
         # quarterly family merely because another filed presentation exists.
         _append_exact_pairs(use_all_aspects=False)
         if not pairs:
+            _append_acquisition_family_pairs(use_all_aspects=False)
+        if not pairs:
             _append_alias_pairs(use_all_aspects=False)
         if not pairs and exhaustive_aspects:
             _append_exact_pairs(use_all_aspects=True)
+        if not pairs and exhaustive_aspects:
+            _append_acquisition_family_pairs(use_all_aspects=True)
         if not pairs and exhaustive_aspects:
             _append_alias_pairs(use_all_aspects=True)
 
@@ -27321,6 +29734,7 @@ def _repair_total_net_debt_from_components(df: pd.DataFrame) -> pd.DataFrame:
         'PPE Purchase Incentives',
         'PPE Sale Proceeds & Purchase Incentives',
         'Other Investing Activities',
+        _BUSINESS_COMBINATIONS_NET_LABEL,
     }
 
     def _audit_cell_concepts(label, period):
@@ -33858,6 +36272,15 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
     purchases_of_investments_n = _investment_parent(
         'Purchases of Investments',
         _INVESTMENT_PURCHASE_COMPONENT_LABELS)
+    (purchases_of_investments_bridge_n,
+     _acquisition_purchase_overlap_mask) = (
+        _bridge_investment_purchases_excluding_acquisition_overlap(
+            pivoted, purchases_of_investments_n))
+    if _acquisition_purchase_overlap_mask.any():
+        _periods = ', '.join(str(period) for period in
+                            pivoted.columns[_acquisition_purchase_overlap_mask])
+        print('  [Bridge] Suppressed non-marketable investment component '
+              'already included in Acquisitions: ' + _periods)
     proceeds_from_investments_n = _investment_parent(
         'Proceeds from Investments',
         _INVESTMENT_PROCEEDS_COMPONENT_LABELS)
@@ -33872,7 +36295,8 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
             'Capital Expenditures', 'Net Purchases of Productive Assets',
             'PPE Purchase Incentives',
             'PPE Sale Proceeds & Purchase Incentives',
-            'Acquisitions', 'Purchases of Investments',
+            'Acquisitions', _BUSINESS_COMBINATIONS_NET_LABEL,
+            'Purchases of Investments',
             'Proceeds from Investments', 'Proceeds from Asset Sales',
             'Divestitures', 'Other Investing Activities',
             *_INVESTMENT_COMPONENT_LABELS,
@@ -33888,7 +36312,8 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
 
         _fixed_investing_components = (
             ('Acquisitions', -1.0, None),
-            ('Purchases of Investments', -1.0, purchases_of_investments_n),
+            (_BUSINESS_COMBINATIONS_NET_LABEL, -1.0, None),
+            ('Purchases of Investments', -1.0, purchases_of_investments_bridge_n),
             ('Proceeds from Investments', 1.0, proceeds_from_investments_n),
             ('Proceeds from Asset Sales', 1.0, None),
             ('Divestitures', 1.0, None),
@@ -33903,7 +36328,98 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
             )
             inv_sum += _v0 * _w0
             _inv_contribs[_lbl0] = _v0 * _w0
-        
+
+        # A signed net business-combination line can be serialized with the
+        # opposite polarity from its economic contribution.  Correct only the
+        # exact one-period -2x residual signature; this is deterministic and
+        # cannot absorb unrelated bridge noise.
+        _bc_label = _BUSINESS_COMBINATIONS_NET_LABEL
+        _bc_idx = ('3_Cash_Flow', _bc_label)
+        if _bc_idx in pivoted.index:
+            _bc_values = get_num(
+                _bc_label, preferred_cat='3_Cash_Flow').fillna(0)
+            _bc_contrib = _inv_contribs.get(
+                _bc_label, -_bc_values)
+            _pre_resid = inv_total.fillna(0) - inv_sum
+            _bc_material = _bc_values.abs() > 1.0
+            _bc_tol = pd.concat(
+                [_pre_resid.abs(), _bc_values.abs()], axis=1
+            ).max(axis=1).mul(0.002).add(1_000_000.0)
+            _bc_flip = (
+                _bc_material
+                & (_pre_resid + 2 * _bc_contrib).abs().le(_bc_tol)
+            )
+            if _bc_flip.any():
+                _new_bc_values = _bc_values.copy()
+                _new_bc_values.loc[_bc_flip] = -_new_bc_values.loc[_bc_flip]
+                pivoted.loc[_bc_idx, _bc_flip.index[_bc_flip]] = (
+                    _new_bc_values.loc[_bc_flip].values)
+                # KPI output is emitted separately from the normalized base
+                # pivot.  Add an explicit override so the corrected signed row
+                # survives the later base+KPI merge instead of only affecting
+                # bridge arithmetic inside this function.
+                add_val(
+                    '3_Cash_Flow', _bc_label,
+                    _new_bc_values.loc[_bc_flip])
+                _delta = -2 * _bc_contrib.where(_bc_flip, 0.0)
+                inv_sum = inv_sum + _delta
+                _new_bc_contrib = _bc_contrib.copy()
+                _new_bc_contrib.loc[_bc_flip] = (
+                    -_new_bc_contrib.loc[_bc_flip])
+                _inv_contribs[_bc_label] = _new_bc_contrib
+                print(
+                    '  [Bridge] Sign-corrected Business Combinations, Net of '
+                    'Cash Acquired for exact -2x residual period(s): '
+                    + ', '.join(str(period) for period in _bc_flip.index[_bc_flip]))
+
+        # ``PaymentsForProceedsFromOtherInvestingActivities`` is a signed net
+        # concept, but a filer can serialize a small inflow with the opposite
+        # sign from its economic contribution after a broader comparative line
+        # is decomposed.  Correct only an exact per-period -2x bridge signature,
+        # and update the displayed signed row as well as the bridge.  This cannot
+        # consume unrelated residual noise because no amount is inferred: the
+        # existing reported value is merely polarity-flipped when the statement
+        # equation proves that precise correction.
+        _other_label = 'Other Investing Activities'
+        _other_idx = ('3_Cash_Flow', _other_label)
+        if _other_idx in pivoted.index:
+            _other_values = get_num(
+                _other_label, preferred_cat='3_Cash_Flow').fillna(0)
+            _other_contrib = _inv_contribs.get(
+                _other_label, _other_values).copy()
+            _pre_resid = inv_total.fillna(0) - inv_sum
+            _other_material = _other_values.abs() > 1.0
+            _other_tol = pd.concat(
+                [_pre_resid.abs(), _other_values.abs()], axis=1
+            ).max(axis=1).mul(0.002).add(1_000.0)
+            _other_flip = (
+                _other_material
+                & (_pre_resid + 2 * _other_contrib).abs().le(
+                    _other_tol)
+            )
+            if _other_flip.any():
+                _new_other_values = _other_values.copy()
+                _new_other_values.loc[_other_flip] = (
+                    -_new_other_values.loc[_other_flip])
+                pivoted.loc[
+                    _other_idx, _other_flip.index[_other_flip]
+                ] = _new_other_values.loc[_other_flip].values
+                add_val(
+                    '3_Cash_Flow', _other_label,
+                    _new_other_values.loc[_other_flip])
+                _delta = -2 * _other_contrib.where(_other_flip, 0.0)
+                inv_sum = inv_sum + _delta
+                _new_other_contrib = _other_contrib.copy()
+                _new_other_contrib.loc[_other_flip] = (
+                    -_new_other_contrib.loc[_other_flip])
+                _inv_contribs[_other_label] = _new_other_contrib
+                print(
+                    '  [Bridge] Sign-corrected Other Investing Activities '
+                    'for exact -2x residual period(s): '
+                    + ', '.join(
+                        str(period)
+                        for period in _other_flip.index[_other_flip]))
+
         _inv_counted = set()
         for _l in inv_components:
             _info = CONCEPT_MAP.get(_l)
@@ -34004,6 +36520,7 @@ def _calculate_kpis_impl(pivoted, is_reit=False):
                 'spec': _sp,
                 'complete': _cm,
                 'productive_asset_basis': (_sec == 'inv'),
+                'acquisition_investment_overlap_basis': (_sec == 'inv'),
             }
         _BRIDGE_USED_LABELS.clear()
         for _ctr in (_ocf_contribs, _inv_contribs, _fin_contribs):
@@ -40439,7 +42956,7 @@ def _restore_native_mutable_state(snapshot):
 # and the learned accounting/tag state produced while extracting those facts.
 # This cache stores the extraction checkpoint after all selected filings have
 # been parsed, then restores that exact checkpoint on the next identical run.
-_NATIVE_EXTRACTION_CACHE_VERSION = "2026-07-30.native-extraction.v39-verified-interest-family"
+_NATIVE_EXTRACTION_CACHE_VERSION = "2026-08-06.native-extraction.v42-investment-quarterization"
 _NATIVE_EXTRACTION_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _NATIVE_EXTRACTION_CACHE_ENABLED = (
     os.environ.get("SEC_NATIVE_EXTRACTION_CACHE", "1").strip().lower()
@@ -40609,7 +43126,7 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-07-30.final-pivot.v84-verified-metric-family"
+_FINAL_PIVOT_CACHE_VERSION = "2026-08-06.final-pivot.v87-investment-quarterization"
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
