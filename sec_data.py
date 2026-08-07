@@ -15857,11 +15857,22 @@ def _gb_route_html_business_fact(fact: dict) -> dict:
 def _gb_promote_proven_segment_disclosure_history(df: pd.DataFrame) -> pd.DataFrame:
     """Restore older periods of a segment series after taxonomy-axis changes.
 
-    Some filers change custom axis names while retaining the same member label
-    and metric.  Conservative axis admission can then place early periods in
-    disclosures while later periods are correctly classified as 4a.  Promote
-    only an exact-label lineage with substantial modern segment evidence and no
-    high-risk disclosure axis.  Values are never copied or derived.
+    Two bounded paths are permitted:
+
+    1. Exact-label continuity (the historical behavior): the same public label
+       appears in disclosures on an older custom axis and later as a proven
+       business segment.
+    2. Value-proven renamed continuity: an older disclosure/member caption and
+       a later proven business-segment caption differ only by a benign member
+       qualifier (for example ``Government`` -> ``Government Operating``), and
+       at least three distinct reported periods under the same accounting
+       concept match exactly within filing precision with no conflicting
+       overlap.
+
+    The second path is intentionally much stricter than ordinary name matching.
+    It does not globally bless the old axis as a segment axis. Only the facts
+    that participate in the independently proven concept/member lineage are
+    promoted, and their original axis/member provenance remains attached.
     """
     required = {'Category', 'Label', 'FY', 'Q'}
     if df is None or df.empty or not required.issubset(df.columns):
@@ -15871,10 +15882,63 @@ def _gb_promote_proven_segment_disclosure_history(df: pd.DataFrame) -> pd.DataFr
         'revenue', 'operating income', 'contribution', 'segment profit',
         'expenses attributable to segment', 'other segment item', 'assets',
     }
+
+    def _safe_disclosure_rows(rows: pd.DataFrame) -> pd.DataFrame:
+        if rows.empty:
+            return rows.copy()
+        axes = rows.get(
+            'SourceDimensionAxes', pd.Series('', index=rows.index)
+        ).fillna('').astype(str).str.casefold()
+        safe_axis = ~axes.str.contains(
+            r'fairvalue|securit|derivative|hedg|(?:^|[:_])tax|incometax|'
+            r'deferredtax|taxbenefit|taxexpense|acquisition|intangible|'
+            r'lease|debt|cashflow|maturity|creditquality', regex=True)
+        eligible = rows.loc[safe_axis].copy()
+        if eligible.empty:
+            return eligible
+        roles = eligible.get(
+            'SourceTableRole', pd.Series('', index=eligible.index)
+        ).fillna('').astype(str)
+        kinds = eligible.get(
+            'SourceKind', pd.Series('', index=eligible.index)
+        ).fillna('').astype(str)
+        valid_source = (
+            roles.eq('xbrl_dimensional_fact')
+            | roles.eq(_GB_ROLE_REPORTABLE_SEGMENT_PNL)
+            | kinds.eq('xbrl')
+        )
+        return eligible.loc[valid_source].copy()
+
+    def _mark_promoted(indices, rule, canonical_label=None, concepts=None):
+        indexer = pd.Index(indices)
+        if concepts is not None and 'Concept' in out.columns:
+            concept_mask = out['Concept'].astype(str).isin(set(map(str, concepts)))
+            indexer = indexer.intersection(out.index[concept_mask])
+        if not len(indexer):
+            return 0
+        out.loc[indexer, 'Category'] = '4a_Segments_Business'
+        if canonical_label is not None:
+            out.loc[indexer, 'Label'] = canonical_label
+        if 'SourceAdmissionRule' in out.columns:
+            out.loc[indexer, 'SourceAdmissionRule'] = rule
+        if 'SourceAnalyticalBasis' in out.columns:
+            out.loc[indexer, 'SourceAnalyticalBasis'] = 'business_segment'
+        if canonical_label is not None:
+            if 'SourceMemberAliasCanonical' not in out.columns:
+                out['SourceMemberAliasCanonical'] = pd.Series(
+                    None, index=out.index, dtype=object)
+            elif out['SourceMemberAliasCanonical'].dtype != object:
+                out['SourceMemberAliasCanonical'] = out[
+                    'SourceMemberAliasCanonical'].astype(object)
+            out.loc[indexer, 'SourceMemberAliasCanonical'] = canonical_label
+        return len(indexer)
+
     segment = out[out['Category'].eq('4a_Segments_Business')]
     disclosures = out[out['Category'].eq('6_Disclosures')]
     if segment.empty or disclosures.empty:
         return out
+
+    # ---- Existing exact-label continuity path. ----
     promoted = 0
     for label, seg_rows in segment.groupby('Label', sort=False):
         metric = _normalize_label_key(_split_segment_display_label(label)[0])
@@ -15887,46 +15951,244 @@ def _gb_promote_proven_segment_disclosure_history(df: pd.DataFrame) -> pd.DataFr
         old_rows = disclosures[disclosures['Label'].eq(label)]
         if len(old_rows) < 2:
             continue
-        axes = old_rows.get(
-            'SourceDimensionAxes', pd.Series('', index=old_rows.index)
-        ).fillna('').astype(str).str.casefold()
-        # Filter unsafe disclosure axes row by row.  One fair-value or
-        # acquisition fact must not veto a separate, exact-label segment
-        # lineage from a benign custom axis in the same historical period set.
-        safe_axis = ~axes.str.contains(
-            r'fairvalue|securit|derivative|hedg|(?:^|[:_])tax|incometax|'
-            r'deferredtax|taxbenefit|taxexpense|acquisition|intangible|'
-            r'lease|debt|cashflow|maturity|creditquality', regex=True)
-        eligible_rows = old_rows.loc[safe_axis].copy()
+        eligible_rows = _safe_disclosure_rows(old_rows)
         if len(eligible_rows) < 2:
             continue
-        roles = eligible_rows.get(
-            'SourceTableRole', pd.Series('', index=eligible_rows.index)
-        ).fillna('').astype(str)
-        kinds = eligible_rows.get(
-            'SourceKind', pd.Series('', index=eligible_rows.index)
-        ).fillna('').astype(str)
-        # Exact-label continuity must still come from dimensional XBRL or a
-        # proven reportable-segment table, not a generic disclosure table.
-        valid_source = (
-            roles.eq('xbrl_dimensional_fact')
-            | roles.eq(_GB_ROLE_REPORTABLE_SEGMENT_PNL)
-            | kinds.eq('xbrl')
-        )
-        if not valid_source.all():
+        promoted += _mark_promoted(
+            eligible_rows.index,
+            'exact_label_segment_history_continuity')
+
+    # Refresh after exact-label promotions. Value-proven rename candidates are
+    # drawn only from facts that still remain disclosures.
+    segment = out[out['Category'].eq('4a_Segments_Business')]
+    disclosures = out[out['Category'].eq('6_Disclosures')]
+    if segment.empty or disclosures.empty:
+        if promoted:
+            print(f"  [Segment Continuity] Restored {promoted} older segment fact(s) "
+                  "from exact-label taxonomy continuity.")
+        return out
+
+    _member_stop = {
+        'the', 'and', 'or', 'of', 'for', 'segment', 'segments', 'business',
+        'reportable', 'member', 'inc', 'corp', 'corporation', 'company',
+    }
+    _benign_added_qualifiers = {
+        'operating', 'operations', 'reportable', 'business', 'segment',
+    }
+
+    def _metric_member(label):
+        metric, member = _split_segment_display_label(label)
+        return (_normalize_label_key(metric), _gb_clean_member_footnote(member))
+
+    def _member_tokens(member):
+        return {
+            token for token in re.findall(r'[a-z0-9]+', str(member).casefold())
+            if token and token not in _member_stop
+        }
+
+    def _reported_context_values(rows: pd.DataFrame, concept: str):
+        if 'Concept' not in rows.columns:
+            return {}
+        part = rows[rows['Concept'].astype(str).eq(str(concept))].copy()
+        if part.empty:
+            return {}
+        duration = pd.to_numeric(
+            part.get('Duration', pd.Series(np.nan, index=part.index)),
+            errors='coerce')
+        part['_GBDuration'] = duration.round(0)
+        result = {}
+        for key, group in part.groupby(
+                ['FY', 'Q', '_GBDuration'], dropna=False, sort=False):
+            vals = pd.to_numeric(group['Value'], errors='coerce').dropna()
+            if vals.empty:
+                continue
+            unique = sorted(set(float(v) for v in vals))
+            scale = max(max(abs(v) for v in unique), 1.0)
+            if max(unique) - min(unique) > max(1.0, scale * 0.001):
+                result[key] = None
+                continue
+            result[key] = unique[0]
+        return result
+
+    proposals = []
+    segment_by_label = {
+        label: rows.copy() for label, rows in segment.groupby('Label', sort=False)
+    }
+    disclosure_by_label = {
+        label: _safe_disclosure_rows(rows)
+        for label, rows in disclosures.groupby('Label', sort=False)
+    }
+    for old_label, old_rows in disclosure_by_label.items():
+        if len(old_rows) < 2:
             continue
-        out.loc[eligible_rows.index, 'Category'] = '4a_Segments_Business'
-        if 'SourceAdmissionRule' in out.columns:
-            out.loc[eligible_rows.index, 'SourceAdmissionRule'] = (
-                'exact_label_segment_history_continuity')
-        if 'SourceAnalyticalBasis' in out.columns:
-            out.loc[eligible_rows.index, 'SourceAnalyticalBasis'] = 'business_segment'
-        promoted += len(eligible_rows)
+        old_metric, old_member = _metric_member(old_label)
+        if old_metric not in allowed_metrics or not old_member:
+            continue
+        old_tokens = _member_tokens(old_member)
+        if not old_tokens or 'Concept' not in old_rows.columns:
+            continue
+        old_concepts = set(old_rows['Concept'].dropna().astype(str))
+        if not old_concepts:
+            continue
+        for canonical_label, seg_rows in segment_by_label.items():
+            if canonical_label == old_label:
+                continue
+            new_metric, new_member = _metric_member(canonical_label)
+            if new_metric != old_metric or not new_member:
+                continue
+            new_tokens = _member_tokens(new_member)
+            if not new_tokens:
+                continue
+            if not (old_tokens <= new_tokens or new_tokens <= old_tokens):
+                continue
+            added = (new_tokens - old_tokens) | (old_tokens - new_tokens)
+            if added and not added.issubset(_benign_added_qualifiers):
+                continue
+            seg_periods = {
+                (int(r.FY), str(r.Q)) for r in seg_rows.itertuples()
+                if pd.notna(r.FY) and str(r.Q) in {'Q1','Q2','Q3','Q4'}
+            }
+            if len(seg_periods) < 4 or 'Concept' not in seg_rows.columns:
+                continue
+            common_concepts = old_concepts & set(
+                seg_rows['Concept'].dropna().astype(str))
+            if not common_concepts:
+                continue
+
+            best = None
+            for concept in common_concepts:
+                left = _reported_context_values(old_rows, concept)
+                right = _reported_context_values(seg_rows, concept)
+                overlap = set(left) & set(right)
+                if not overlap:
+                    continue
+                matches, conflicts = [], []
+                for context in overlap:
+                    lv, rv = left.get(context), right.get(context)
+                    if lv is None or rv is None:
+                        conflicts.append(context)
+                        continue
+                    scale = max(abs(float(lv)), abs(float(rv)), 1.0)
+                    tolerance = max(1.0, scale * 0.001)
+                    if abs(float(lv) - float(rv)) <= tolerance:
+                        if scale > 1.0:
+                            matches.append((context, float(lv)))
+                    else:
+                        conflicts.append(context)
+                distinct_periods = {
+                    (int(context[0]), str(context[1]))
+                    for context, _ in matches
+                    if pd.notna(context[0]) and str(context[1]) in {'Q1','Q2','Q3','Q4'}
+                }
+                distinct_values = {round(value, 6) for _, value in matches}
+                if conflicts or len(distinct_periods) < 3 or len(distinct_values) < 3:
+                    continue
+                evidence = (len(distinct_periods), len(matches), str(concept))
+                if best is None or evidence > best:
+                    best = evidence
+            if best is not None:
+                proposals.append((old_label, canonical_label, best[2], best[0], best[1]))
+
+    by_old = defaultdict(list)
+    for proposal in proposals:
+        by_old[proposal[0]].append(proposal)
+    accepted = []
+    for old_label, options in by_old.items():
+        strongest = max((option[3], option[4]) for option in options)
+        winners = [option for option in options
+                   if (option[3], option[4]) == strongest]
+        if len({option[1] for option in winners}) == 1:
+            accepted.append(winners[0])
+
+    renamed_promoted = 0
+    rename_messages = []
+    for old_label, canonical_label, concept, period_count, context_count in accepted:
+        # Do not promote annual-only historical years.  A reportable segment
+        # annual value is not automatically a discrete Q4.  Require at least
+        # two directly reported quarter-duration observations somewhere in the
+        # proven old/new lineage for that fiscal year before any facts from the
+        # year may join the quarterly segment history.
+        lineage_mask = (
+            out['Label'].isin([old_label, canonical_label])
+            & out.get('Concept', pd.Series('', index=out.index)).astype(str)
+                .eq(str(concept)))
+        lineage_rows = out.loc[lineage_mask].copy()
+        lineage_duration = pd.to_numeric(
+            lineage_rows.get('Duration', pd.Series(np.nan, index=lineage_rows.index)),
+            errors='coerce')
+        lineage_quarter = lineage_rows.get(
+            'Q', pd.Series('', index=lineage_rows.index)).astype(str)
+        direct_rows = lineage_rows[
+            lineage_duration.between(45, 125)
+            & lineage_quarter.isin({'Q1', 'Q2', 'Q3', 'Q4'})]
+        supported_years = set()
+        if not direct_rows.empty:
+            for fy, group in direct_rows.groupby('FY', dropna=False, sort=False):
+                if pd.isna(fy):
+                    continue
+                if len(set(group['Q'].astype(str))) >= 2:
+                    try:
+                        supported_years.add(int(fy))
+                    except (TypeError, ValueError):
+                        pass
+        if not supported_years:
+            continue
+
+        old_disclosure_rows = _safe_disclosure_rows(
+            out[out['Category'].eq('6_Disclosures')
+                & out['Label'].eq(old_label)])
+        old_year = pd.to_numeric(
+            old_disclosure_rows.get(
+                'FY', pd.Series(np.nan, index=old_disclosure_rows.index)),
+            errors='coerce')
+        old_disclosure_rows = old_disclosure_rows.loc[
+            old_year.isin(supported_years)]
+        promote_idx = old_disclosure_rows.index
+        if 'Concept' in out.columns:
+            promote_idx = promote_idx.intersection(
+                out.index[out['Concept'].astype(str).eq(str(concept))])
+        renamed_promoted += _mark_promoted(
+            promote_idx,
+            'value_proven_renamed_segment_history_continuity',
+            canonical_label=canonical_label,
+            concepts={str(concept)})
+
+        if 'Concept' in out.columns:
+            alias_fy = pd.to_numeric(
+                out.get('FY', pd.Series(np.nan, index=out.index)),
+                errors='coerce')
+            alias_segment_mask = (
+                out['Category'].eq('4a_Segments_Business')
+                & out['Label'].eq(old_label)
+                & out['Concept'].astype(str).eq(str(concept))
+                & alias_fy.isin(supported_years))
+        else:
+            alias_segment_mask = pd.Series(False, index=out.index)
+        alias_segment_idx = out.index[alias_segment_mask]
+        if len(alias_segment_idx):
+            out.loc[alias_segment_idx, 'Label'] = canonical_label
+            if 'SourceAdmissionRule' in out.columns:
+                out.loc[alias_segment_idx, 'SourceAdmissionRule'] = (
+                    'value_proven_renamed_segment_history_continuity')
+            if 'SourceMemberAliasCanonical' not in out.columns:
+                out['SourceMemberAliasCanonical'] = pd.Series(
+                    None, index=out.index, dtype=object)
+            elif out['SourceMemberAliasCanonical'].dtype != object:
+                out['SourceMemberAliasCanonical'] = out[
+                    'SourceMemberAliasCanonical'].astype(object)
+            out.loc[alias_segment_idx, 'SourceMemberAliasCanonical'] = canonical_label
+        rename_messages.append(
+            f"{old_label} -> {canonical_label} "
+            f"({period_count} periods/{context_count} exact contexts)")
+
     if promoted:
         print(f"  [Segment Continuity] Restored {promoted} older segment fact(s) "
               "from exact-label taxonomy continuity.")
+    if renamed_promoted or rename_messages:
+        print("  [Segment Continuity] Value-proven renamed history: "
+              + '; '.join(rename_messages))
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
     return out
-
 
 def _normalize_extracted_geographic_facts(extracted):
     """Normalize geographic facts without leaking one table basis across a filing.
@@ -31740,6 +32002,169 @@ def _gb_bridge_value_proven_renamed_segment_q4(
 
 
 
+
+def _gb_bridge_audit_proven_renamed_segment_q4(
+        df: pd.DataFrame, fact_audit: pd.DataFrame) -> pd.DataFrame:
+    """Fill a stranded segment Q4 from a value-proven legacy audit identity.
+
+    This final-output repair is deliberately narrower than a global rename.
+    Q1-Q3 of the current business-segment revenue row must already be present,
+    the selected-fact audit must contain one different legacy revenue identity
+    matching all three values within reported-rounding tolerance, and that
+    legacy identity's Q4 must be an independently selected discrete value
+    derived from the same historical annual cohort.
+    """
+    if (df is None or df.empty or not isinstance(df.index, pd.MultiIndex)
+            or fact_audit is None or fact_audit.empty):
+        return df
+    required = {'Category', 'Label', 'Period', 'Value'}
+    if not required.issubset(fact_audit.columns):
+        return df
+
+    category = '4a_Segments_Business'
+    targets = [
+        idx for idx in df.index
+        if idx[0] == category and str(idx[1]).startswith('Revenue - ')
+    ]
+    if not targets:
+        return df
+    audit = fact_audit[
+        fact_audit['Category'].eq(category)
+        & fact_audit['Label'].astype(str).str.startswith('Revenue - ')
+    ].copy()
+    if audit.empty:
+        return df
+    audit['Period'] = audit['Period'].astype(str)
+    audit['_GBValue'] = pd.to_numeric(audit['Value'], errors='coerce')
+    audit = audit[audit['_GBValue'].notna()]
+    if audit.empty:
+        return df
+
+    period_map = {}
+    for column in df.columns:
+        match = re.fullmatch(r'(\d{4})-Q([1-4])', str(column))
+        if match:
+            period_map[(int(match.group(1)), int(match.group(2)))] = column
+    if not period_map:
+        return df
+
+    stop = {
+        'revenue', 'the', 'and', 'or', 'of', 'for', 'inc', 'corp',
+        'corporation', 'company', 'services', 'service', 'segment', 'segments',
+    }
+
+    def _tokens(label):
+        _metric, member = _split_segment_display_label(label)
+        return {
+            token for token in re.findall(r'[a-z0-9]+', str(member).casefold())
+            if token and token not in stop
+        }
+
+    def _agree(left, right):
+        if pd.isna(left) or pd.isna(right):
+            return False
+        scale = max(abs(float(left)), abs(float(right)), 1.0)
+        return abs(float(left) - float(right)) <= max(2_000_000.0, scale * 0.0015)
+
+    def _audit_value(label, period):
+        rows = audit[audit['Label'].eq(label) & audit['Period'].eq(period)]
+        if rows.empty:
+            return np.nan, None
+        if 'Filed' in rows.columns:
+            rows = rows.assign(
+                _GBFiled=pd.to_datetime(rows['Filed'], errors='coerce')
+            ).sort_values('_GBFiled', ascending=False, kind='stable')
+        row = rows.iloc[0]
+        return float(row['_GBValue']), row
+
+    out = df.copy()
+    proposals = []
+    donor_labels = sorted(audit['Label'].dropna().astype(str).unique())
+    years = sorted({year for year, quarter in period_map if quarter == 4})
+    for target in targets:
+        target_label = target[1]
+        target_tokens = _tokens(target_label)
+        if not target_tokens:
+            continue
+        target_values = pd.to_numeric(out.loc[target], errors='coerce')
+        for year in years:
+            qcols = [period_map.get((year, q)) for q in (1, 2, 3, 4)]
+            if any(column is None for column in qcols):
+                continue
+            q1, q2, q3, q4 = qcols
+            if pd.notna(target_values.get(q4)):
+                continue
+            if not all(pd.notna(target_values.get(column))
+                       for column in (q1, q2, q3)):
+                continue
+            later_columns = [
+                column for (py, pq), column in period_map.items()
+                if py * 4 + pq > year * 4 + 4
+            ]
+            if sum(pd.notna(target_values.get(column))
+                   for column in later_columns) < 4:
+                continue
+
+            candidates = []
+            for donor_label in donor_labels:
+                if donor_label == target_label:
+                    continue
+                donor_tokens = _tokens(donor_label)
+                if not donor_tokens or not (target_tokens & donor_tokens):
+                    continue
+                donor_q, donor_rows = [], []
+                matched = True
+                for qnum, target_col in zip((1, 2, 3), (q1, q2, q3)):
+                    value, row = _audit_value(donor_label, f'{year}-Q{qnum}')
+                    donor_q.append(value); donor_rows.append(row)
+                    if not _agree(value, target_values.get(target_col)):
+                        matched = False
+                        break
+                if not matched:
+                    continue
+                donor_q4, q4_row = _audit_value(donor_label, f'{year}-Q4')
+                if q4_row is None or pd.isna(donor_q4):
+                    continue
+                derivation = str(q4_row.get('SourceDerivation') or '').casefold()
+                source_kind = str(q4_row.get('SourceKind') or '').casefold()
+                if ('annual_minus_q1_q2_q3' not in derivation
+                        and source_kind != 'derived_discrete_q4'):
+                    continue
+                if donor_rows[-1] is not None and 'Filed' in audit.columns:
+                    q3_filed = pd.to_datetime(
+                        donor_rows[-1].get('Filed'), errors='coerce')
+                    q4_filed = pd.to_datetime(
+                        q4_row.get('Filed'), errors='coerce')
+                    if pd.notna(q3_filed) and pd.notna(q4_filed):
+                        lag = (q4_filed - q3_filed).days
+                        if lag < 0 or lag > 220:
+                            continue
+                reference = float(np.median(np.abs([float(v) for v in donor_q])))
+                if reference <= 0:
+                    continue
+                ratio = abs(float(donor_q4)) / reference
+                if not 0.15 <= ratio <= 6.0:
+                    continue
+                candidates.append((donor_label, float(donor_q4)))
+            if len(candidates) == 1:
+                proposals.append((target, q4, candidates[0][0], candidates[0][1]))
+
+    if not proposals:
+        return df
+    changed, used = [], set()
+    for target, column, donor_label, value in proposals:
+        key = (target, column)
+        if key in used or pd.notna(out.at[target, column]):
+            continue
+        out.at[target, column] = value
+        used.add(key)
+        changed.append(f'{donor_label} -> {target[1]} {column}')
+    if changed:
+        print('  [Segment Rename Q4 Audit] Bridged value-proven historical Q4: '
+              + '; '.join(changed))
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
 def _gb_route_proven_geographic_metric_families(
         df: pd.DataFrame) -> pd.DataFrame:
     """Move value-proven geographic member families out of business segments.
@@ -44861,6 +45286,8 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             # exact Q1-Q3 continuity to bridge only that stranded Q4.
             final_pivot = _gb_bridge_value_proven_renamed_segment_q4(
                 final_pivot)
+            final_pivot = _gb_bridge_audit_proven_renamed_segment_q4(
+                final_pivot, _fact_audit)
             final_pivot = _merge_prefix_continuation_members(final_pivot)
 
             final_pivot = _repair_q4_from_annual_ytd(final_pivot)
