@@ -2572,15 +2572,19 @@ ul.task-list li.task-done::before {
                 return keys;
             }
 
-            function getCommonComparisonPeriods() {
+            function getWorkspaceComparisonPeriods() {
                 const quarterlyCompanies = companies.filter(c => c && !companyIsAnnualOnly(c));
                 if (quarterlyCompanies.length < 2) return [];
 
-                const sets = quarterlyCompanies.map(getCompanyComparisonPeriodSet);
-                if (sets.some(set => set.size === 0)) return [];
-
-                const [first, ...rest] = sets;
-                return Array.from(first).filter(key => rest.every(set => set.has(key)));
+                // Use the UNION of normalized calendar quarters. The workspace therefore
+                // always includes the newest quarter reported by any loaded company.
+                // Companies that have not reported that quarter simply resolve to null
+                // for that column instead of causing the quarter to disappear globally.
+                const keys = new Set();
+                quarterlyCompanies.forEach(company => {
+                    getCompanyComparisonPeriodSet(company).forEach(key => keys.add(key));
+                });
+                return Array.from(keys);
             }
 
             function findComparisonPeriodIndex(company, comparisonPeriod) {
@@ -4107,9 +4111,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (activePeriodType === 'annual') {
                     globalPeriods = Array.from(pSet).sort((a, b) => parseInt(b) - parseInt(a));
                 } else if (alignByDate) {
-                    // Use the intersection, not the union: every displayed column is a
-                    // normalized quarter present for every compared quarterly company.
-                    globalPeriods = sortPeriods(getCommonComparisonPeriods());
+                    // Use the union of normalized quarters so the latest reported quarter
+                    // is always visible. Missing reports stay blank for that company.
+                    globalPeriods = sortPeriods(getWorkspaceComparisonPeriods());
                 } else {
                     globalPeriods = sortPeriods(Array.from(pSet));
                 }
