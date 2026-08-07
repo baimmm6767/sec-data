@@ -13,6 +13,7 @@ import json
 import pickle
 import sys
 import logging
+import traceback
 import math
 import shutil
 from collections import defaultdict
@@ -2318,6 +2319,20 @@ def _repair_investment_family_migrations(df):
         if not migration_mask.any():
             continue
 
+        # This repair writes provenance text/boolean metadata into columns
+        # that may be completely absent (or all-null float64) in a cold native
+        # cache.  Pandas 3.x no longer silently upcasts those columns.  Make
+        # every metadata destination used by this migration text-safe before
+        # the first assignment.  This is storage-only and cannot change the
+        # financial Value/Label/Concept decisions made above.
+        for _migration_metadata_column in (
+                'SourceOriginalConcept', 'SourceAliasVerified',
+                'SourceAliasRule', 'SourceEquivalentConcept',
+                'SourceMetricFamily', 'SourceMetricIdentity',
+                'SourceSemanticType', 'SourceDerivation',
+                'SourcePeriodRole', 'SourceCanonicalizedFrom'):
+            _ensure_object_column(out, _migration_metadata_column)
+
         # Neutralize stale broad-Other comparative duplicates that equal the
         # newly separated granular family.  Keep the rows as explicit derived
         # zero baselines so later quarter selection cannot resurrect them.
@@ -2358,10 +2373,8 @@ def _repair_investment_family_migrations(df):
 
         source_rows = out.loc[migration_mask].copy()
         if target_concept:
-            if 'SourceOriginalConcept' not in out.columns:
-                out['SourceOriginalConcept'] = np.nan
             out.loc[migration_mask, 'SourceOriginalConcept'] = (
-                out.loc[migration_mask, 'Concept'])
+                out.loc[migration_mask, 'Concept'].astype(object))
             out.loc[migration_mask, 'Concept'] = target_concept
         out.loc[migration_mask, 'Label'] = target
         out.loc[migration_mask, 'Value'] = pd.to_numeric(
@@ -45591,6 +45604,85 @@ def _write_queue_child_result(path, payload):
     os.replace(temporary, destination)
 
 
+def _record_ticker_failure(ticker, exc, traceback_text=None, emit_to_stderr=True, context=None):
+    """Persist a caught ticker exception and optionally print its full traceback.
+
+    This is observability-only: it does not alter extraction, classification,
+    quarterization, reconciliation, or publication behavior.  The helper is
+    deliberately fail-safe so an inability to write the diagnostic log cannot
+    mask the original exception.
+    """
+    try:
+        trace_text = traceback_text or traceback.format_exc()
+        if not trace_text or trace_text.strip() == 'NoneType: None':
+            trace_text = ''.join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+    except Exception:
+        trace_text = f'{type(exc).__name__}: {exc}'
+
+    safe_ticker = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(ticker or 'UNKNOWN'))
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    error_path = None
+    write_error = None
+
+    try:
+        error_dir = os.path.abspath(os.path.join('output', 'errors'))
+        os.makedirs(error_dir, exist_ok=True)
+        error_path = os.path.join(
+            error_dir,
+            f'{safe_ticker}_failure_{stamp}_{os.getpid()}.log',
+        )
+        metadata = {
+            'ticker': str(ticker),
+            'exception': f'{type(exc).__name__}: {exc}',
+            'timestamp_local': stamp,
+            'python_executable': sys.executable,
+            'python_version': sys.version.replace('\\n', ' '),
+            'platform': sys.platform,
+            'cwd': os.getcwd(),
+            'script': os.path.abspath(__file__),
+        }
+        if context:
+            for key, value in context.items():
+                metadata[str(key)] = value
+        with open(error_path, 'w', encoding='utf-8') as handle:
+            handle.write('SEC Financials ticker failure\\n')
+            handle.write('================================\\n')
+            for key, value in metadata.items():
+                handle.write(f'{key}: {value}\\n')
+            handle.write('\\nTraceback\\n---------\\n')
+            handle.write(trace_text.rstrip() + '\\n')
+    except Exception as log_exc:
+        write_error = f'{type(log_exc).__name__}: {log_exc}'
+        error_path = None
+
+    if emit_to_stderr:
+        try:
+            print(
+                f'\\n[ERROR] {ticker} failed: {type(exc).__name__}: {exc}',
+                file=sys.stderr,
+                flush=True,
+            )
+            print(trace_text.rstrip(), file=sys.stderr, flush=True)
+            if error_path:
+                print(
+                    f'[ERROR] Full traceback saved to: {error_path}',
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif write_error:
+                print(
+                    f'[ERROR] Could not write traceback log: {write_error}',
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except Exception:
+            pass
+
+    return error_path
+
+
 def run_ticker_queue(
         tickers, limit, use_arelle=False, dqc_ruleset=None,
         log_output=False, save_xlsx=False, workers=None, annual=False,
@@ -45634,12 +45726,27 @@ def run_ticker_queue(
         except KeyboardInterrupt:
             raise
         except Exception as exc:
+            trace_text = traceback.format_exc()
+            error_log = _record_ticker_failure(
+                ticker,
+                exc,
+                traceback_text=trace_text,
+                emit_to_stderr=True,
+                context={
+                    'mode': 'single_ticker',
+                    'limit': limit,
+                    'workers': workers,
+                    'annual': annual,
+                    'arelle': use_arelle,
+                },
+            )
             return [{
                 'ticker': ticker,
                 'status': 'failed',
                 'output_path': None,
                 'elapsed_seconds': time.monotonic() - started_at,
                 'error': f'{type(exc).__name__}: {exc}',
+                'error_log': error_log,
             }]
 
     print(
@@ -45703,11 +45810,28 @@ def run_ticker_queue(
             print(f"\n[Queue {position}/{total}] Interrupted during {ticker}.")
             raise
         except Exception as exc:
+            trace_text = traceback.format_exc()
+            error_log = _record_ticker_failure(
+                ticker,
+                exc,
+                traceback_text=trace_text,
+                emit_to_stderr=True,
+                context={
+                    'mode': 'queue_parent',
+                    'queue_position': position,
+                    'queue_total': total,
+                    'limit': limit,
+                    'workers': workers,
+                    'annual': annual,
+                    'arelle': use_arelle,
+                },
+            )
             payload = {
                 'ticker': ticker,
                 'status': 'failed',
                 'output_path': None,
                 'error': f'{type(exc).__name__}: {exc}',
+                'error_log': error_log,
             }
         finally:
             if result_path:
@@ -45827,11 +45951,32 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             raise
         except Exception as exc:
+            trace_text = traceback.format_exc()
+            error_log = _record_ticker_failure(
+                ticker,
+                exc,
+                traceback_text=trace_text,
+                emit_to_stderr=False,
+                context={
+                    'mode': 'queue_child',
+                    'limit': args.limit,
+                    'workers': args.workers,
+                    'annual': args.annual,
+                    'arelle': not args.no_arelle,
+                },
+            )
+            if error_log:
+                print(
+                    f'[ERROR] Full traceback saved to: {error_log}',
+                    file=sys.stderr,
+                    flush=True,
+                )
             child_payload = {
                 'ticker': ticker,
                 'status': 'failed',
                 'output_path': None,
                 'error': f'{type(exc).__name__}: {exc}',
+                'error_log': error_log,
             }
             _write_queue_child_result(args.queue_result_file, child_payload)
             raise
