@@ -16,7 +16,7 @@ import logging
 import traceback
 import math
 import shutil
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps, lru_cache
@@ -19690,6 +19690,56 @@ def _merge_value_proven_dimensional_member_renames(
     return out
 
 
+_GB_REVENUE_SCOPE_NEUTRAL_TOKENS = {
+    'and', 'or', 'the', 'of', 'for', 'to', 'in', 'a', 'an', 'net', 'total',
+    'revenue', 'revenues', 'sales', 'segment', 'segments', 'reportable',
+    'business', 'product', 'products', 'service', 'services',
+}
+
+
+def _gb_revenue_member_scope_diverges(left_label: str,
+                                       right_label: str) -> bool:
+    """Return whether two revenue members describe materially different scope.
+
+    Similar-sized revenue lines are not necessarily aliases.  A broad member
+    can coexist with a product/detail member that shares the same brand word,
+    and two successive reportable bases can retain a common root while changing
+    the economic qualifiers.  Those cases require near-exact overlap proof;
+    loose boundary continuity is not enough.
+
+    One benign added qualifier remains eligible (for example ``Government`` ->
+    ``Government Operating``).  Product/service filler is ignored so proven
+    taxonomy variants such as ``Advertising`` / ``Advertising Services`` keep
+    their existing path.
+    """
+    left_metric, left_member = _split_segment_display_label(left_label)
+    right_metric, right_member = _split_segment_display_label(right_label)
+    if (_normalize_label_key(left_metric) != 'revenue'
+            or _normalize_label_key(right_metric) != 'revenue'):
+        return False
+
+    def _tokens(value):
+        return {
+            token for token in re.findall(r'[a-z0-9]+', str(value).casefold())
+            if token not in _GB_REVENUE_SCOPE_NEUTRAL_TOKENS
+        }
+
+    left = _tokens(left_member)
+    right = _tokens(right_member)
+    if not left or not right or left == right:
+        return False
+    common = left & right
+    if not common:
+        return False
+    if left < right:
+        return len(right - left) >= 2
+    if right < left:
+        return len(left - right) >= 2
+    # The members share a root but replace one or more economic qualifiers,
+    # e.g. "Taser Weapons" vs "TASER Devices Professional".
+    return bool(left - common and right - common)
+
+
 def _detect_and_merge_renamed_segments(df: pd.DataFrame) -> pd.DataFrame:
     """
     Intelligently detect and merge segment renaming events (e.g., CAT renaming
@@ -19803,7 +19853,13 @@ def _detect_and_merge_renamed_segments(df: pd.DataFrame) -> pd.DataFrame:
                 # otherwise be silently fused.
                 if ret_tokens and act_tokens:
                     _subset = ret_tokens <= act_tokens or act_tokens <= ret_tokens
-                    if (_subset or jaccard >= 0.6) and avg_diff < 0.05:
+                    _scope_diverges = _gb_revenue_member_scope_diverges(
+                        retired, active)
+                    _values_prove_identity = (
+                        max(diffs, default=float('inf')) <= 0.0015
+                        if _scope_diverges else avg_diff < 0.05)
+                    if ((_subset or jaccard >= 0.6)
+                            and _values_prove_identity):
                         if avg_diff < best_diff:
                             best_diff = avg_diff
                             best_match = active
@@ -19930,7 +19986,12 @@ def _merge_concurrent_member_variants(df: pd.DataFrame) -> pd.DataFrame:
         for p in set(pv[a]) & set(pv[b]):
             va, vb = pv[a][p], pv[b][p]
             denom = max(abs(va), abs(vb))
-            if denom > 0 and abs(va - vb) / denom > 0.10:
+            # A generic descriptor is safe only for a genuinely equivalent
+            # series.  A 10% allowance fused broad segment revenue with a
+            # product-only line whose values merely tracked it.  Taxonomy-name
+            # variants that motivate this helper re-report the same values, so
+            # filing-precision agreement is the appropriate boundary.
+            if denom > 0 and abs(va - vb) / denom > 0.0015:
                 return True
         return False
 
@@ -22869,6 +22930,9 @@ def _gb_apply_audit_backed_segment_publication_repairs(
     out = _gb_rehome_source_proven_company_defined_segment_metrics(
         df, fact_audit)
     out = _gb_apply_mixed_axis_presentation_policy(out, fact_audit)
+    out = _gb_restore_audit_proven_historical_segment_revenue_prefix(
+        out, fact_audit)
+    out = _gb_bridge_audit_proven_renamed_segment_q4(out, fact_audit)
     return out
 
 
@@ -24768,6 +24832,38 @@ def _gb_materialize_atomic_segment_measure_q4_facts(
         f"  [Atomic Segment Q4] Materialized {len(additions)} "
         "complete family member fact(s).")
     return out
+
+
+def _gb_build_segment_cohort_source_ledger(
+        source_df: pd.DataFrame) -> pd.DataFrame:
+    """Capture the raw segment cohort facts used by the final Q4 repair.
+
+    Keep this ledger independent of the pivot builder's local scope so the
+    cold-build and final-pivot-cache paths use the same source facts.  The
+    filtering intentionally matches the original in-builder capture: values
+    are coerced to numeric first, and the ledger is taken before any later
+    reconciliation or candidate-selection pass can change the source rows.
+    """
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+        return pd.DataFrame()
+    if 'Value' not in source_df.columns:
+        return pd.DataFrame()
+
+    numeric_source = source_df.copy()
+    numeric_source['Value'] = pd.to_numeric(
+        numeric_source['Value'], errors='coerce')
+    numeric_source = numeric_source.dropna(subset=['Value'])
+    return numeric_source[
+        numeric_source.get(
+            'Category', pd.Series('', index=numeric_source.index)
+        ).isin({
+            '1_Income_Statement', '4a_Segments_Business', '6_Disclosures'})
+        & numeric_source.get(
+            'Label', pd.Series('', index=numeric_source.index)
+        ).fillna('').astype(str).str.match(
+            r'^(?:Revenue|Cost of Revenue|Gross Profit) - ')
+    ].copy()
+
 
 def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_financial=False, is_insurance=False, is_oil_gas=False, is_reit=False):
     df = pd.DataFrame(all_facts)
@@ -28836,13 +28932,23 @@ def _stitch_era_renamed_members(df: pd.DataFrame) -> pd.DataFrame:
             if not (_toks(ma) & _toks(mb)):
                 continue  # no distinctive shared token -> unrelated
             overlap = set(pa) & set(pb)
+            scope_diverges = _gb_revenue_member_scope_diverges(a[1], b[1])
             # overlapping periods must agree (same economic line, slight
-            # definitional drift tolerated up to 15%).
+            # definitional drift tolerated up to 15%).  When the captions
+            # change economic scope, however, only filing-precision overlap is
+            # rename evidence; correlated parent/detail series often move
+            # within 5-15% of each other.
             bad = False
+            informative_overlap = 0
             for c in overlap:
                 va, vb = vals[a][c], vals[b][c]
                 if pd.notna(va) and pd.notna(vb) and max(abs(va), abs(vb)) > 0:
-                    if abs(va - vb) / max(abs(va), abs(vb)) > 0.15:
+                    if not (np.isfinite(float(va)) and np.isfinite(float(vb))):
+                        bad = True
+                        break
+                    informative_overlap += 1
+                    tolerance = 0.0015 if scope_diverges else 0.15
+                    if abs(va - vb) / max(abs(va), abs(vb)) > tolerance:
                         bad = True
                         break
             if bad:
@@ -28855,9 +28961,17 @@ def _stitch_era_renamed_members(df: pd.DataFrame) -> pd.DataFrame:
             winner, loser = (a, b) if a_recent < b_recent else (b, a)
             if overlap:
                 # overlapping periods already agree within 15% above -> same
-                # line; that is sufficient evidence of continuity.
-                pass
+                # line. Scope-changing captions were held to filing precision
+                # above and need at least two independent overlaps.
+                if scope_diverges and informative_overlap < 2:
+                    continue
             else:
+                # No-overlap evidence is too weak to expand a one-token broad
+                # member into a more specific product/service member merely
+                # because the boundary values are similar.  Equal token sets
+                # (including capitalization-only renames) remain eligible.
+                if scope_diverges:
+                    continue
                 # No overlap: require a clean temporal succession whose boundary
                 # values are continuous. Compare the earlier series' newest
                 # value against the later series' oldest value at the gap.
@@ -31809,6 +31923,10 @@ def _merge_prefix_continuation_members(df: pd.DataFrame) -> pd.DataFrame:
                         diffs.append(abs(va - vb) / d)
                 if not diffs or (sum(diffs) / len(diffs)) >= 0.08:
                     continue
+                scope_diverges = _gb_revenue_member_scope_diverges(a, b)
+                if (scope_diverges
+                        and (len(diffs) < 2 or max(diffs) > 0.0015)):
+                    continue
                 na = int(vals[a].notna().sum())
                 nb = int(vals[b].notna().sum())
                 survivor_lbl, donor_lbl = (a, b) if na >= nb else (b, a)
@@ -31838,6 +31956,459 @@ def _merge_prefix_continuation_members(df: pd.DataFrame) -> pd.DataFrame:
                 df = df.rename(index={(cat, lbl): (cat, surv_lbl)})
     return df
 
+
+
+
+def _gb_repair_coherent_segment_q4_from_source_ledger(
+        df: pd.DataFrame,
+        source_ledger: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Repair a missing segment Q4 from one proven reporting cohort.
+
+    This is a final-output, gap-only repair.  It operates only on rows already
+    accepted as business segments and only when Q4 is blank while Q1-Q3 are
+    present.  The source ledger must prove a genuine annual filing plus direct
+    Q1-Q3 on the same exact display identity.  H1 and 9M, when present, must
+    reconcile tightly to those quarters.
+
+    The original as-reported cohort is preferred.  A later restated annual may
+    replace it only when Q1, Q2, Q3, H1, and 9M were all re-presented after the
+    original annual and reconcile on that later basis.  This prevents an
+    annual-only restatement or later segment realignment from being allocated
+    entirely to Q4.  It also rejects annual-shaped comparative 10-Q contexts.
+    """
+    if (df is None or df.empty or not isinstance(df.index, pd.MultiIndex)
+            or source_ledger is None or source_ledger.empty):
+        return df
+    required = {'Category', 'Label', 'FY', 'Q', 'Value', 'Duration', 'End'}
+    if not required.issubset(source_ledger.columns):
+        return df
+
+    out = df.copy()
+    ledger = source_ledger.copy()
+    ledger['_GBValue'] = pd.to_numeric(ledger['Value'], errors='coerce')
+    ledger['_GBDuration'] = pd.to_numeric(ledger['Duration'], errors='coerce')
+    ledger['_GBFiled'] = pd.to_datetime(
+        ledger.get('Filed', pd.Series(pd.NaT, index=ledger.index)),
+        errors='coerce')
+    ledger = ledger[ledger['_GBValue'].notna() & ledger['_GBDuration'].notna()]
+    if ledger.empty:
+        return out
+
+    period_map = {}
+    for column in out.columns:
+        match = re.fullmatch(r'(\d{4})-Q([1-4])', str(column))
+        if match:
+            period_map[(int(match.group(1)), int(match.group(2)))] = column
+    if not period_map:
+        return out
+
+    allowed_metrics = {'revenue', 'cost of revenue', 'gross profit'}
+    target_rows = []
+    for idx in out.index:
+        if idx[0] != '4a_Segments_Business':
+            continue
+        metric, member = _split_segment_display_label(idx[1])
+        if _normalize_label_key(metric) not in allowed_metrics or not str(member).strip():
+            continue
+        target_rows.append(idx)
+    if not target_rows:
+        return out
+
+    def _text(value):
+        try:
+            if value is None or pd.isna(value):
+                return ''
+        except (TypeError, ValueError):
+            pass
+        return str(value).strip()
+
+    def _label_key(label):
+        metric, member = _split_segment_display_label(label)
+        return (_normalize_label_key(metric), _normalize_label_key(member))
+
+    _label_keys = ledger['Label'].map(_label_key)
+    ledger['_GBMetricKey'] = _label_keys.map(lambda item: item[0])
+    ledger['_GBMemberKey'] = _label_keys.map(lambda item: item[1])
+
+    def _annual_form(row):
+        form = _text(row.get('Form')).upper()
+        return form.startswith(('10-K', '20-F', '40-F'))
+
+    def _close(left, right):
+        if left is None or right is None or pd.isna(left) or pd.isna(right):
+            return False
+        scale = max(abs(float(left)), abs(float(right)), 1.0)
+        # Cohort identity needs a materially tighter gate than ordinary
+        # publication rounding.  A million-dollar difference is a restatement,
+        # not rounding, for the source facts this helper uses.
+        return abs(float(left) - float(right)) <= max(5_000.0, scale * 0.0005)
+
+    def _units_compatible(rows):
+        for column in ('SourceUnitSignature', 'SourceUnitKind'):
+            values = {_text(row.get(column)).casefold() for row in rows
+                      if _text(row.get(column))}
+            if len(values) > 1:
+                return False
+        return True
+
+    def _pick(rows, cutoff=None, preferred_concept=''):
+        if rows is None or rows.empty:
+            return None
+        work = rows.copy()
+        if cutoff is not None and pd.notna(cutoff):
+            dated = work[work['_GBFiled'].notna() & work['_GBFiled'].le(cutoff)]
+            if not dated.empty:
+                work = dated
+        if work.empty:
+            return None
+        concept = preferred_concept.casefold().strip()
+        if concept and 'Concept' in work.columns:
+            keys = work['Concept'].fillna('').astype(str).str.casefold().str.strip()
+            exact = keys.eq(concept)
+            if exact.any():
+                work = work.loc[exact].copy()
+        # Prefer the segment route, then a proven face-disaggregation route,
+        # then disclosures.  Never let a lower-priority copy veto the winner.
+        rank = {
+            '4a_Segments_Business': 0,
+            '1_Income_Statement': 1,
+            '6_Disclosures': 2,
+        }
+        work['_GBRank'] = work['Category'].map(lambda value: rank.get(str(value), 9))
+        work = work[work['_GBRank'].eq(work['_GBRank'].min())].copy()
+        latest = work['_GBFiled'].max()
+        if pd.notna(latest):
+            work = work[work['_GBFiled'].eq(latest)].copy()
+        values = work['_GBValue'].dropna().astype(float)
+        if len(values) > 1 and not _close(values.min(), values.max()):
+            return None
+        sort_cols = [column for column in ('TagRank', 'DimCount') if column in work.columns]
+        if sort_cols:
+            work = work.sort_values(sort_cols, kind='stable')
+        return work.iloc[0]
+
+    def _choose_cohort(rows):
+        annuals = rows[
+            rows['Q'].astype(str).eq('Q4')
+            & rows['_GBDuration'].between(300, 400)
+        ].copy()
+        if annuals.empty:
+            return None
+        genuine = annuals[annuals.apply(_annual_form, axis=1)].copy()
+        if not genuine.empty:
+            annuals = genuine
+        elif ('Form' in annuals.columns
+              and annuals['Form'].fillna('').astype(str).str.strip().ne('').any()):
+            # Known non-annual form: an annual-shaped comparative context.
+            return None
+        annuals = annuals[annuals['_GBFiled'].notna()].copy()
+        if annuals.empty:
+            return None
+        original_annual = annuals['_GBFiled'].min()
+        coherent = []
+        for filed in sorted(pd.Timestamp(value) for value in annuals['_GBFiled'].unique()):
+            filing_rows = annuals[annuals['_GBFiled'].eq(filed)].copy()
+            annual = _pick(filing_rows, cutoff=filed)
+            if annual is None:
+                continue
+            concept = _text(annual.get('Concept')).casefold()
+            quarters = {}
+            for q in ('Q1', 'Q2', 'Q3'):
+                qrows = rows[
+                    rows['Q'].astype(str).eq(q)
+                    & rows['_GBDuration'].between(45, 125)]
+                selected = _pick(qrows, cutoff=filed, preferred_concept=concept)
+                if selected is None:
+                    quarters = {}
+                    break
+                quarters[q] = selected
+            if len(quarters) != 3:
+                continue
+            source_rows = [annual] + list(quarters.values())
+            if not _units_compatible(source_rows):
+                continue
+
+            ytd = {}
+            ytd_ok = True
+            for q, low, high, components in (
+                    ('Q2', 150, 220, ('Q1', 'Q2')),
+                    ('Q3', 240, 310, ('Q1', 'Q2', 'Q3'))):
+                candidates = rows[
+                    rows['Q'].astype(str).eq(q)
+                    & rows['_GBDuration'].between(low, high)]
+                if candidates.empty:
+                    continue
+                selected = _pick(candidates, cutoff=filed,
+                                 preferred_concept=concept)
+                if selected is None:
+                    ytd_ok = False
+                    break
+                expected = sum(float(quarters[item]['_GBValue'])
+                               for item in components)
+                if not _close(float(selected['_GBValue']), expected):
+                    ytd_ok = False
+                    break
+                ytd[q] = selected
+            if not ytd_ok:
+                continue
+
+            annual_value = float(annual['_GBValue'])
+            qsum = sum(float(quarters[q]['_GBValue']) for q in ('Q1', 'Q2', 'Q3'))
+            q4 = annual_value - qsum
+            # Revenue/cost should not become materially negative.  Gross profit
+            # can be negative for a real segment, so only bound it by an
+            # extreme annual-relative sanity check.
+            metric = _label_key(annual.get('Label'))[0]
+            tolerance = max(2_000_000.0, abs(annual_value) * 0.0015)
+            if metric in {'revenue', 'cost of revenue'} and q4 < -tolerance:
+                continue
+            if abs(q4) > max(abs(annual_value) * 2.0, tolerance * 2.0):
+                continue
+            if abs(q4) <= min(tolerance, 2_000_000.0):
+                q4 = 0.0
+
+            complete_revision = False
+            if filed > original_annual:
+                q_dates = [pd.to_datetime(row.get('Filed'), errors='coerce')
+                           for row in quarters.values()]
+                y_dates = [pd.to_datetime(row.get('Filed'), errors='coerce')
+                           for row in ytd.values()]
+                complete_revision = (
+                    len(ytd) == 2
+                    and all(pd.notna(value) and value > original_annual
+                            for value in q_dates)
+                    and all(pd.notna(value) and value > original_annual
+                            for value in y_dates)
+                )
+            coherent.append({
+                'annual': annual,
+                'quarters': quarters,
+                'filed': filed,
+                'original_annual': original_annual,
+                'complete_revision': complete_revision,
+                'q4': float(q4),
+            })
+        if not coherent:
+            return None
+        revised = [item for item in coherent if item['complete_revision']]
+        if revised:
+            return max(revised, key=lambda item: item['filed'])
+        return min(coherent, key=lambda item: item['filed'])
+
+    proposals = []
+    for idx in target_rows:
+        metric_key, member_key = _label_key(idx[1])
+        exact_matching = ledger[
+            ledger['_GBMetricKey'].eq(metric_key)
+            & ledger['_GBMemberKey'].eq(member_key)
+        ].copy()
+        for year in sorted({year for year, quarter in period_map if quarter == 4}):
+            qcols = [period_map.get((year, q)) for q in (1, 2, 3, 4)]
+            if any(column is None for column in qcols):
+                continue
+            q1c, q2c, q3c, q4c = qcols
+            current = pd.to_numeric(out.loc[idx], errors='coerce')
+            if pd.notna(current.get(q4c)):
+                continue
+            if not all(pd.notna(current.get(column)) for column in (q1c, q2c, q3c)):
+                continue
+
+            # Prefer the exact display member.  A prior semantic cleanup can
+            # legitimately retain the same series under a one-qualifier alias
+            # (for example ``Taser`` -> ``Taser Weapons``), while the raw
+            # source ledger correctly keeps the filing caption.  Admit that
+            # alias only when the names share a nested token scope and all
+            # three direct quarters match tightly.  This is deliberately much
+            # stronger than the two-quarter gate used for an exact label and
+            # cannot bridge a broad member into a narrower multi-qualifier
+            # member such as ``TASER Devices Professional``.
+            matching_options = []
+            exact_year_rows = exact_matching[
+                pd.to_numeric(exact_matching['FY'], errors='coerce').eq(year)]
+            if not exact_year_rows.empty:
+                matching_options.append((True, member_key, exact_year_rows))
+
+            if metric_key == 'revenue':
+                metric_year_rows = ledger[
+                    ledger['_GBMetricKey'].eq(metric_key)
+                    & pd.to_numeric(ledger['FY'], errors='coerce').eq(year)
+                ].copy()
+                target_tokens = {
+                    token for token in re.findall(
+                        r'[a-z0-9]+', str(member_key).casefold())
+                    if token not in _GB_REVENUE_SCOPE_NEUTRAL_TOKENS
+                }
+                for alias_key, alias_rows in metric_year_rows.groupby(
+                        '_GBMemberKey', sort=False, dropna=False):
+                    alias_key = str(alias_key)
+                    if alias_key == member_key:
+                        continue
+                    alias_label = _text(alias_rows.iloc[0].get('Label'))
+                    _, alias_member = _split_segment_display_label(alias_label)
+                    alias_tokens = {
+                        token for token in re.findall(
+                            r'[a-z0-9]+', str(alias_member).casefold())
+                        if token not in _GB_REVENUE_SCOPE_NEUTRAL_TOKENS
+                    }
+                    if (not target_tokens or not alias_tokens
+                            or not (target_tokens <= alias_tokens
+                                    or alias_tokens <= target_tokens)
+                            or _gb_revenue_member_scope_diverges(
+                                idx[1], alias_label)):
+                        continue
+                    matching_options.append(
+                        (False, alias_key, alias_rows.copy()))
+
+            compatible_options = []
+            for is_exact, source_member_key, year_rows in matching_options:
+                cohort = _choose_cohort(year_rows)
+                if cohort is None:
+                    continue
+                # The final row must already look like the selected source
+                # cohort.  This is a repair of a missing Q4 / mild revision
+                # drift, not a license to transform a hybrid or mislabeled row
+                # into a different economic series.
+                tight_matches = 0
+                alias_strict_matches = 0
+                alias_informative_matches = 0
+                compatible = True
+                for q, column in zip(('Q1', 'Q2', 'Q3'),
+                                     (q1c, q2c, q3c)):
+                    current_value = pd.to_numeric(
+                        pd.Series([out.at[idx, column]]),
+                        errors='coerce').iloc[0]
+                    source_value = float(cohort['quarters'][q]['_GBValue'])
+                    if pd.isna(current_value):
+                        compatible = False
+                        break
+                    alias_strict = bool(np.isclose(
+                        float(current_value), source_value,
+                        rtol=0.0015, atol=1.0))
+                    if alias_strict:
+                        alias_strict_matches += 1
+                        if (abs(float(current_value)) > 0
+                                and abs(source_value) > 0):
+                            alias_informative_matches += 1
+                    if _close(float(current_value), source_value):
+                        tight_matches += 1
+                        continue
+                    scale = max(abs(float(current_value)),
+                                abs(source_value), 1.0)
+                    if abs(float(current_value) - source_value) > max(
+                            2_000_000.0, scale * 0.05):
+                        compatible = False
+                        break
+                exact_proof = is_exact and tight_matches >= 2
+                alias_proof = (
+                    not is_exact
+                    and alias_strict_matches == 3
+                    and alias_informative_matches >= 2
+                )
+                if compatible and (exact_proof or alias_proof):
+                    compatible_options.append(
+                        (is_exact, source_member_key, cohort))
+
+            exact_options = [option for option in compatible_options
+                             if option[0]]
+            if exact_options:
+                cohort = exact_options[0][2]
+            else:
+                alias_options = [option for option in compatible_options
+                                 if not option[0]]
+                # Fail closed when more than one historical caption produces
+                # the same quarterly series.
+                if len(alias_options) != 1:
+                    continue
+                cohort = alias_options[0][2]
+            annual = cohort['annual']
+            q3_end = pd.to_datetime(cohort['quarters']['Q3'].get('End'), errors='coerce')
+            annual_end = pd.to_datetime(annual.get('End'), errors='coerce')
+            if pd.isna(q3_end) or pd.isna(annual_end) or annual_end <= q3_end:
+                continue
+            duration = int((annual_end - q3_end).days)
+            if not 45 <= duration <= 125:
+                continue
+            q4 = float(cohort['q4'])
+            if metric_key == 'revenue':
+                total_idx = ('1_Income_Statement', 'Revenue')
+                if total_idx in out.index:
+                    total = pd.to_numeric(
+                        pd.Series([out.at[total_idx, q4c]]), errors='coerce').iloc[0]
+                    if pd.notna(total) and total > 0:
+                        if q4 > float(total) * 1.05:
+                            continue
+            proposals.append({
+                'idx': idx,
+                'year': year,
+                'columns': (q1c, q2c, q3c, q4c),
+                'cohort': cohort,
+                'metric': metric_key,
+                'member': member_key,
+                'q4': q4,
+            })
+
+    if not proposals:
+        return out
+
+    # A final-output source-cohort repair is intended for systemic historical
+    # holes, not isolated missing metrics.  Require at least four independently
+    # proven segment rows in the same fiscal year before changing that year.
+    # This sharply reduces the chance that an unusual one-off disclosure is
+    # interpreted as a missing quarterly segment series.
+    proposal_families = defaultdict(set)
+    for proposal in proposals:
+        proposal_families[proposal['year']].add(
+            (proposal['metric'], proposal['member']))
+    proposals = [proposal for proposal in proposals
+                 if len(proposal_families[proposal['year']]) >= 4]
+    if not proposals:
+        return out
+
+    # Paired segment-profit identity: when all three measures are being
+    # reconstructed for one member/year, Revenue - Cost must equal Gross Profit.
+    by_member = defaultdict(dict)
+    for proposal in proposals:
+        by_member[(proposal['year'], proposal['member'])][proposal['metric']] = proposal
+    rejected = set()
+    for key, metrics in by_member.items():
+        if {'revenue', 'cost of revenue', 'gross profit'}.issubset(metrics):
+            revenue = metrics['revenue']['q4']
+            cost = metrics['cost of revenue']['q4']
+            gross = metrics['gross profit']['q4']
+            if not _close(revenue - cost, gross):
+                rejected.update(id(proposal) for proposal in metrics.values())
+
+    accepted_families = defaultdict(set)
+    for proposal in proposals:
+        if id(proposal) not in rejected:
+            accepted_families[proposal['year']].add(
+                (proposal['metric'], proposal['member']))
+
+    changed = []
+    for proposal in proposals:
+        if (id(proposal) in rejected
+                or len(accepted_families[proposal['year']]) < 4):
+            continue
+        idx = proposal['idx']
+        q1c, q2c, q3c, q4c = proposal['columns']
+        quarters = proposal['cohort']['quarters']
+        # Lock Q1-Q3 to the same source cohort only for a row whose Q4 is being
+        # repaired.  This removes mixed original/restated years without
+        # disturbing complete segment histories elsewhere.
+        for q, column in zip(('Q1', 'Q2', 'Q3'), (q1c, q2c, q3c)):
+            value = float(quarters[q]['_GBValue'])
+            old = pd.to_numeric(pd.Series([out.at[idx, column]]), errors='coerce').iloc[0]
+            if pd.isna(old) or not _close(old, value):
+                out.at[idx, column] = value
+        out.at[idx, q4c] = proposal['q4']
+        changed.append(
+            f"{idx[1]} {proposal['year']}-Q4={proposal['q4']:,.0f}")
+
+    if changed:
+        print('  [Segment Cohort Q4] Restored coherent historical segment year(s): '
+              + '; '.join(changed))
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
 
 
 def _gb_bridge_value_proven_renamed_segment_q4(
@@ -32014,6 +32585,120 @@ def _gb_bridge_value_proven_renamed_segment_q4(
     return out
 
 
+def _gb_restore_audit_proven_historical_segment_revenue_prefix(
+        df: pd.DataFrame, fact_audit: pd.DataFrame) -> pd.DataFrame:
+    """Back-fill only a source-proven historical prefix of segment revenue.
+
+    A final publication pass can retain the current member name while losing
+    an older HTML-backed block under that *same* display identity.  Restoring
+    arbitrary gaps from the selected-fact audit would be unsafe: a repeated
+    caption can survive a real segment-basis change.  This repair therefore
+    acts only when all of the following are true:
+
+      * the target is an established business-segment revenue row;
+      * every repaired period is older than its oldest published value;
+      * the audit uses the exact same display label; and
+      * the first three published quarters form a consecutive, filing-precision
+        match to that exact audit series.
+
+    It is gap-only, idempotent, and never joins different member captions.
+    A separately guarded Q4 bridge may run afterwards for one stranded annual
+    value whose historical caption differs.
+    """
+    if (df is None or df.empty or not isinstance(df.index, pd.MultiIndex)
+            or fact_audit is None or fact_audit.empty):
+        return df
+    required = {'Category', 'Label', 'Period', 'Value'}
+    if not required.issubset(fact_audit.columns):
+        return df
+
+    periods = []
+    for column in df.columns:
+        match = re.fullmatch(r'(\d{4})-Q([1-4])', str(column))
+        if match:
+            periods.append((int(match.group(1)), int(match.group(2)), column))
+    periods.sort()
+    if len(periods) < 4:
+        return df
+    period_columns = [column for _year, _quarter, column in periods]
+
+    audit = fact_audit[
+        fact_audit['Category'].eq('4a_Segments_Business')
+        & fact_audit['Label'].astype(str).str.startswith('Revenue - ')
+    ].copy()
+    if audit.empty:
+        return df
+    audit['_GBValue'] = pd.to_numeric(audit['Value'], errors='coerce')
+    audit = audit[audit['_GBValue'].notna()].copy()
+    if audit.empty:
+        return df
+
+    def _close(left, right):
+        if pd.isna(left) or pd.isna(right):
+            return False
+        return bool(np.isclose(float(left), float(right),
+                               rtol=0.0015, atol=1.0))
+
+    out = df.copy()
+    restored = []
+    targets = [
+        idx for idx in out.index
+        if idx[0] == '4a_Segments_Business'
+        and str(idx[1]).startswith('Revenue - ')
+    ]
+    for idx in targets:
+        current = pd.to_numeric(out.loc[idx], errors='coerce').copy()
+        populated = [position for position, column in enumerate(period_columns)
+                     if pd.notna(current.get(column))]
+        if len(populated) < 4:
+            continue
+        first = min(populated)
+        # Three exact-label matches at the hand-off boundary prove continuity.
+        if first + 2 >= len(period_columns):
+            continue
+
+        rows = audit[audit['Label'].eq(idx[1])].copy()
+        if rows.empty:
+            continue
+        audit_values = {}
+        for period, group in rows.groupby('Period', sort=False):
+            period = str(period)
+            values = group['_GBValue'].dropna().astype(float)
+            if values.empty:
+                continue
+            low, high = float(values.min()), float(values.max())
+            if not _close(low, high):
+                continue
+            audit_values[period] = float(values.median())
+
+        anchor_periods = periods[first:first + 3]
+        anchor_ordinals = [year * 4 + quarter
+                           for year, quarter, _column in anchor_periods]
+        if any(right - left != 1 for left, right in
+               zip(anchor_ordinals, anchor_ordinals[1:])):
+            continue
+        anchors = [column for _year, _quarter, column in anchor_periods]
+        if not all(
+                column in audit_values
+                and _close(current.get(column), audit_values[column])
+                for column in anchors):
+            continue
+
+        for column in period_columns[:first]:
+            value = audit_values.get(str(column))
+            if value is None or pd.notna(current.get(column)):
+                continue
+            out.at[idx, column] = value
+            current.at[column] = value
+            restored.append(f'{idx[1]} {column}')
+
+    if restored:
+        print('  [Segment Audit History] Restored exact-label historical '
+              'revenue prefix: ' + '; '.join(restored))
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+
 
 
 def _gb_bridge_audit_proven_renamed_segment_q4(
@@ -32124,6 +32809,16 @@ def _gb_bridge_audit_proven_renamed_segment_q4(
                     continue
                 donor_tokens = _tokens(donor_label)
                 if not donor_tokens or not (target_tokens & donor_tokens):
+                    continue
+                # Reject a broad/detail caption bridge when both are simple
+                # one-level members.  A multi-member donor can instead be the
+                # same leaf carried with its dimensional parent path (for
+                # example ``Connected Devices - Personal Sensors``); exact
+                # Q1-Q3 value proof remains sufficient for that lineage form.
+                if (target_label.count(' - ') == 1
+                        and donor_label.count(' - ') == 1
+                        and _gb_revenue_member_scope_diverges(
+                            target_label, donor_label)):
                     continue
                 donor_q, donor_rows = [], []
                 matched = True
@@ -34441,6 +35136,274 @@ def _gb_refresh_segment_footing_v96(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _gb_repair_face_proven_segment_profitability_cells(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Repair one inconsistent segment P&L cell from a repeated face identity.
+
+    Some filers publish the same current reportable basis both as a product /
+    service face disaggregation and as named business segments.  A single Q4
+    candidate can nevertheless be selected from an incompatible annual cohort.
+    This helper maps the two presentations only after at least three complete,
+    exact quarterly triplets prove they are the same series.  It then corrects
+    a period only when exactly two of Revenue / Cost / Gross Profit still match
+    the proven face triplet and the segment identity itself is broken.
+
+    It never fills a blank, never changes a face-statement cell, and never acts
+    on an unproved or multiply-ambiguous mapping.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    periods = [column for column in df.columns
+               if re.fullmatch(r'\d{4}-Q[1-4]', str(column))]
+    if not periods:
+        return df
+
+    metrics = ('Revenue', 'Cost of Revenue', 'Gross Profit')
+
+    def _rows(category, metric):
+        candidates = defaultdict(list)
+        for idx in df.index:
+            if idx[0] != category or str(idx[1]).count(' - ') != 1:
+                continue
+            current_metric, member = _split_segment_display_label(idx[1])
+            if _normalize_label_key(current_metric) == _normalize_label_key(metric):
+                candidates[_normalize_label_key(member)].append(idx)
+        # Normalized-name collisions are not a unique economic mapping.  Do
+        # not let row order choose between spelling variants that both survived
+        # upstream publication cleanup.
+        return {member: indices[0] for member, indices in candidates.items()
+                if len(indices) == 1}
+
+    segment_by_metric = {
+        metric: _rows('4a_Segments_Business', metric) for metric in metrics}
+    segment_members = set.intersection(*(
+        set(segment_by_metric[metric]) for metric in metrics))
+    if not segment_members:
+        return df
+
+    # Face nature disaggregations normally keep Revenue/Cost on the income
+    # statement.  Gross Profit can be routed to 4a by the generic segment
+    # cleanup, so accept that row only as the third member of an otherwise
+    # complete income-statement family.
+    face_revenue = _rows('1_Income_Statement', 'Revenue')
+    face_cost = _rows('1_Income_Statement', 'Cost of Revenue')
+    face_gp = _rows('1_Income_Statement', 'Gross Profit')
+    routed_gp = _rows('4a_Segments_Business', 'Gross Profit')
+    face_members = set(face_revenue) & set(face_cost)
+    face_triplets = {}
+    for member in face_members:
+        gp_idx = face_gp.get(member) or routed_gp.get(member)
+        if gp_idx is not None:
+            face_triplets[member] = (
+                face_revenue[member], face_cost[member], gp_idx)
+    if not face_triplets:
+        return df
+
+    numeric = {idx: pd.to_numeric(df.loc[idx], errors='coerce').copy()
+               for idx in set(
+                   idx for metric in metrics
+                   for idx in segment_by_metric[metric].values())
+               | set(idx for triplet in face_triplets.values() for idx in triplet)}
+
+    def _close(left, right):
+        return (pd.notna(left) and pd.notna(right)
+                and bool(np.isclose(float(left), float(right),
+                                    rtol=1e-9, atol=1.0)))
+
+    mappings = {}
+    for segment_member in segment_members:
+        segment_triplet = tuple(
+            segment_by_metric[metric][segment_member] for metric in metrics)
+        candidates = []
+        for face_member, face_triplet in face_triplets.items():
+            anchors = 0
+            for period in periods:
+                sr, sc, sg = (numeric[idx].get(period)
+                              for idx in segment_triplet)
+                fr, fc, fg = (numeric[idx].get(period)
+                              for idx in face_triplet)
+                if not all(pd.notna(value)
+                           for value in (sr, sc, sg, fr, fc, fg)):
+                    continue
+                if float(sc) < 0 or float(fc) < 0:
+                    continue
+                if (not _close(float(fr) - float(fc), fg)
+                        or not _close(float(sr) - float(sc), sg)):
+                    continue
+                if all(_close(left, right) for left, right in
+                       zip((sr, sc, sg), (fr, fc, fg))):
+                    anchors += 1
+            if anchors >= 3:
+                candidates.append((anchors, face_member, face_triplet))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+            continue
+        mappings[segment_member] = (
+            segment_triplet, candidates[0][1], candidates[0][2])
+
+    # A face-disaggregation member is one economic series and may repair at
+    # most one segment member.  If two segment triplets claim the same face
+    # triplet, the apparent value match is not a unique mapping; fail closed
+    # for every claimant rather than duplicating that face result.
+    face_claims = Counter(
+        face_member for _segment_triplet, face_member, _face_triplet
+        in mappings.values())
+    mappings = {
+        member: mapping for member, mapping in mappings.items()
+        if face_claims[mapping[1]] == 1
+    }
+
+    if not mappings:
+        return df
+    out = df.copy()
+    repaired = []
+    for segment_member, (segment_triplet, _face_member,
+                         face_triplet) in mappings.items():
+        for period in periods:
+            segment_values = [numeric[idx].get(period)
+                              for idx in segment_triplet]
+            face_values = [numeric[idx].get(period)
+                           for idx in face_triplet]
+            if not all(pd.notna(value)
+                       for value in segment_values + face_values):
+                continue
+            fr, fc, fg = map(float, face_values)
+            sr, sc, sg = map(float, segment_values)
+            if fc < 0 or not _close(fr - fc, fg):
+                continue
+            matches = [_close(left, right) for left, right in
+                       zip((sr, sc, sg), (fr, fc, fg))]
+            if sum(matches) != 2 or _close(sr - sc, sg):
+                continue
+            position = matches.index(False)
+            idx = segment_triplet[position]
+            old = segment_values[position]
+            new = face_values[position]
+            out.at[idx, period] = float(new)
+            numeric[idx].at[period] = float(new)
+            repaired.append(
+                f'{idx[1]} {period}: {float(old):,.0f} -> {float(new):,.0f}')
+    if repaired:
+        print('  [Segment Face Identity] Repaired source-proven cell(s): '
+              + '; '.join(repaired))
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+
+def _gb_normalize_proven_segment_cost_sign_family(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize signed segment costs only when the complete family proves it.
+
+    A flattened calculation relationship can treat an already-negative segment
+    cost as though it still needs a negative calculation weight, synthesizing
+    Gross Profit above Revenue.  Do not infer from one row.  Normalize a period
+    only when at least two complete one-level member triplets exist, every cost
+    is negative, every published gross profit has the exact inflated signature,
+    and the canonical magnitudes close consolidated Revenue, Cost of Revenue,
+    and Gross Profit as a complete family.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    consolidated = {
+        metric: ('1_Income_Statement', metric)
+        for metric in ('Revenue', 'Cost of Revenue', 'Gross Profit')
+    }
+    if any(idx not in df.index for idx in consolidated.values()):
+        return df
+
+    metric_candidates = defaultdict(lambda: defaultdict(list))
+    for idx in df.index:
+        if idx[0] != '4a_Segments_Business' or str(idx[1]).count(' - ') != 1:
+            continue
+        metric, member = _split_segment_display_label(idx[1])
+        metric_key = _normalize_label_key(metric)
+        if metric_key in {'revenue', 'cost of revenue', 'gross profit'}:
+            metric_candidates[metric_key][
+                _normalize_label_key(member)].append(idx)
+    by_metric = {
+        metric: {
+            member: indices[0]
+            for member, indices in metric_candidates[metric].items()
+            if len(indices) == 1
+        }
+        for metric in ('revenue', 'cost of revenue', 'gross profit')
+    }
+    members = (set(by_metric['revenue'])
+               & set(by_metric['cost of revenue'])
+               & set(by_metric['gross profit']))
+    if len(members) < 2:
+        return df
+
+    series = {idx: pd.to_numeric(df.loc[idx], errors='coerce').copy()
+              for metric_rows in by_metric.values()
+              for idx in metric_rows.values()}
+    totals = {metric: pd.to_numeric(df.loc[idx], errors='coerce').copy()
+              for metric, idx in consolidated.items()}
+
+    def _close(left, right):
+        if pd.isna(left) or pd.isna(right):
+            return False
+        return bool(np.isclose(float(left), float(right),
+                               rtol=0.0015, atol=1.0))
+
+    out = df.copy()
+    repaired = []
+    for period in df.columns:
+        if not re.fullmatch(r'\d{4}-Q[1-4]', str(period)):
+            continue
+        complete = []
+        for member in members:
+            indices = (
+                by_metric['revenue'][member],
+                by_metric['cost of revenue'][member],
+                by_metric['gross profit'][member],
+            )
+            values = tuple(series[idx].get(period) for idx in indices)
+            if all(pd.notna(value) for value in values):
+                complete.append((member, indices, tuple(map(float, values))))
+        if len(complete) < 2:
+            continue
+        if not all(values[0] > 0 and values[1] < 0
+                   for _member, _indices, values in complete):
+            continue
+        if not all(_close(values[0] - values[1], values[2])
+                   for _member, _indices, values in complete):
+            continue
+        total_revenue = totals['Revenue'].get(period)
+        total_cost = totals['Cost of Revenue'].get(period)
+        total_gross = totals['Gross Profit'].get(period)
+        if not all(pd.notna(value)
+                   for value in (total_revenue, total_cost, total_gross)):
+            continue
+        revenue_sum = sum(values[0] for _member, _indices, values in complete)
+        cost_sum = sum(abs(values[1]) for _member, _indices, values in complete)
+        gross_sum = sum(values[0] - abs(values[1])
+                        for _member, _indices, values in complete)
+        if not (_close(revenue_sum, total_revenue)
+                and _close(cost_sum, total_cost)
+                and _close(gross_sum, total_gross)
+                and _close(float(total_revenue) - float(total_cost),
+                           total_gross)):
+            continue
+        for _member, indices, values in complete:
+            revenue, cost, _gross = values
+            corrected_cost = abs(cost)
+            corrected_gross = revenue - corrected_cost
+            out.at[indices[1], period] = corrected_cost
+            out.at[indices[2], period] = corrected_gross
+            series[indices[1]].at[period] = corrected_cost
+            series[indices[2]].at[period] = corrected_gross
+            repaired.append(
+                f'{indices[1][1]} / {indices[2][1]} {period}')
+    if repaired:
+        print('  [Segment Cost Sign] Normalized identity-proven family cell(s): '
+              + '; '.join(repaired))
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # v97 presentation-basis-locked Q4 cross-tab restoration
 # ---------------------------------------------------------------------------
@@ -34958,6 +35921,8 @@ def _gb_apply_v96_output_repairs(
         out, cross_tab_source_ledger)
     out = _gb_quarantine_nonclosing_cross_tab_revenue(out)
     out = _gb_drop_rpo_taxonomy_artifacts(out)
+    out = _gb_repair_face_proven_segment_profitability_cells(out)
+    out = _gb_normalize_proven_segment_cost_sign_family(out)
     out = _gb_refresh_balance_sheet_footing_v96(out)
     out = _gb_refresh_segment_footing_v96(out)
     return out
@@ -43587,7 +44552,9 @@ def _restore_cached_native_extraction(cache_value, all_facts, period_dates):
 # This is deliberately a checkpoint cache, not a final-file cache.  The script
 # still writes CSV/XLSX normally.  The cached object is the fully repaired
 # DataFrame that would otherwise be recomputed from the same extracted facts.
-_FINAL_PIVOT_CACHE_VERSION = "2026-08-06.final-pivot.v87-investment-quarterization"
+_FINAL_PIVOT_CACHE_VERSION = (
+    "2026-08-08.final-pivot.v89-segment-audit-history-and-scope-guards"
+)
 _FINAL_PIVOT_CACHE_DISABLED = {"0", "false", "no", "off", "disable", "disabled"}
 _FINAL_PIVOT_CACHE_ENABLED = (
     os.environ.get("SEC_FINAL_PIVOT_CACHE", "1").strip().lower()
@@ -44911,6 +45878,8 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         _rpo_source_ledger = _gb_build_rpo_source_ledger(_raw_fact_frame)
         _cross_tab_source_ledger = _gb_build_cross_tab_q4_source_ledger(
             _raw_fact_frame)
+        _segment_cohort_source_ledger = (
+            _gb_build_segment_cohort_source_ledger(_raw_fact_frame))
 
         final_cache_key = _final_pivot_cache_key(
             ticker, company, f"{profile.pipeline}_FINAL", limit, ye_month,
@@ -45294,6 +46263,8 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             # disaggregation or a mangled segment continuation. Resolve both
             # after the accounting passes have populated every usable period.
             final_pivot = _stitch_or_drop_abandoned_face_disagg(final_pivot)
+            final_pivot = _gb_repair_coherent_segment_q4_from_source_ledger(
+                final_pivot, _segment_cohort_source_ledger)
             # Q4 derivation can create a valid cell under a retired member name
             # immediately before the current-name face history is spliced.  Use
             # exact Q1-Q3 continuity to bridge only that stranded Q4.
