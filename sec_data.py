@@ -21481,6 +21481,13 @@ def _gb_promote_complete_segment_asset_basis(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _gb_exact_segment_member_key(member: str) -> str:
+    """Normalize presentation syntax while retaining semantic qualifiers."""
+    text = _gb_clean_member_footnote(member).casefold().replace('&', ' and ')
+    text = re.sub(r'[^\w\s]', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
 def _gb_reportable_segment_revenue_indices(df: pd.DataFrame, labels=None):
     """Return reportable revenue row indices across 4a/4b/4c.
 
@@ -21500,6 +21507,11 @@ def _gb_reportable_segment_revenue_indices(df: pd.DataFrame, labels=None):
         idx for idx in df.index
         if idx[0] in revenue_categories
         and str(idx[1]).startswith('Revenue - ')
+        # A reportable participant is one metric/member pair.  Labels with a
+        # second separator are product-by-segment (or other nested) cross-tabs;
+        # admitting them here double-counts a parent and can publish a stale
+        # false segment-footing failure after later routing.
+        and str(idx[1]).count(' - ') == 1
         and (labels is None or idx[1] in set(labels))
     ]
     support_metrics = {
@@ -21509,22 +21521,24 @@ def _gb_reportable_segment_revenue_indices(df: pd.DataFrame, labels=None):
         'expense attributable to segment', 'other segment item', 'assets',
         'depreciation and amortization',
     }
-    support_labels = []
+    support_members = set()
     for cat, label in df.index:
         if cat != '4a_Segments_Business':
             continue
         metric, member = _split_segment_display_label(label)
         if _normalize_label_key(metric) in support_metrics and member:
-            support_labels.append(label)
+            member_key = _gb_exact_segment_member_key(member)
+            if member_key:
+                support_members.add(member_key)
     result = [
         idx for idx in revenue_indices
-        if any(_gb_duplicate_members_related(idx[1], support_label)
-               for support_label in support_labels)
+        if _gb_exact_segment_member_key(
+            _split_segment_display_label(idx[1])[1]) in support_members
     ]
     # At least two participants are required to establish a reportable basis.
     unique_members = {
-        _normalize_label_key(_gb_clean_member_footnote(
-            _split_segment_display_label(idx[1])[1]))
+        _gb_exact_segment_member_key(
+            _split_segment_display_label(idx[1])[1])
         for idx in result
     }
     return result if len(unique_members) >= 2 else []
@@ -35136,6 +35150,134 @@ def _gb_refresh_segment_footing_v96(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _gb_refresh_single_final_reportable_segment_footing(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None = None
+        ) -> pd.DataFrame:
+    """Correct an isolated stale mismatch from the strict reportable basis.
+
+    ``_gb_refresh_segment_footing_v96`` intentionally repairs only repeated
+    clusters of failed diagnostics.  A single stale failure needs a different
+    proof: the final reportable rows must be identified by same-member support
+    metrics, nested cross-tabs must be excluded, and that exact family must
+    close consolidated revenue in at least three periods and at least 60% of
+    every evaluable period.  Only an already-explicit mismatch is eligible and
+    only its diagnostic cells change.
+    """
+    if (df is None or df.empty or not isinstance(df.index, pd.MultiIndex)
+            or fact_audit is None or fact_audit.empty
+            or not {'Label', 'Period'}.issubset(fact_audit.columns)):
+        return df
+    INT = '8_Integrity_Checks'
+    idx_flag = (INT, 'Metric: Segment Revenue Footing Verified')
+    idx_basis = (INT, 'Metric: Segment Revenue Footing Basis Code')
+    idx_error = (INT, 'Metric: Segment Revenue Footing Error %')
+    total_idx = ('1_Income_Statement', 'Revenue')
+    if (total_idx not in df.index or idx_basis not in df.index
+            or idx_error not in df.index):
+        return df
+    existing_basis = pd.to_numeric(df.loc[idx_basis], errors='coerce')
+    existing_error = pd.to_numeric(df.loc[idx_error], errors='coerce')
+    eligible = existing_basis.eq(-1.0) & existing_error.ge(30.0)
+    if not bool(eligible.any()):
+        return df
+
+    reportable = _gb_reportable_segment_revenue_indices(df)
+    if not (2 <= len(reportable) <= 8):
+        return df
+    members = [
+        _normalize_label_key(_split_segment_display_label(idx[1])[1])
+        for idx in reportable
+    ]
+    if any(not member for member in members) or len(set(members)) != len(members):
+        return df
+
+    # When audit provenance is available (the normal publication path), prove
+    # that every participant is a repeatedly reported member of one recognized
+    # segment/geographic axis.  This rejects coincidental additive subsets.
+    axis_sets = []
+    for idx in reportable:
+        audit = fact_audit[
+            fact_audit['Label'].fillna('').astype(str).eq(str(idx[1]))
+        ].copy()
+        if audit.empty:
+            return df
+        analytical = audit.get(
+            'SourceAnalyticalBasis', pd.Series('', index=audit.index)
+        ).fillna('').astype(str).str.casefold()
+        admission = audit.get(
+            'SourceAdmissionRule', pd.Series('', index=audit.index)
+        ).fillna('').astype(str).str.casefold()
+        dim_count = pd.to_numeric(
+            audit.get('DimCount', pd.Series(np.nan, index=audit.index)),
+            errors='coerce')
+        selected = audit[
+            (analytical.eq('business_segment')
+             | analytical.str.contains('geographic', regex=False))
+            & admission.str.match(r'^recognized_.+_axis$')
+            & dim_count.eq(1)
+        ].copy()
+        if selected['Period'].dropna().astype(str).nunique() < 3:
+            return df
+        signature = selected.get(
+            'SourceAxisSignature', pd.Series('', index=selected.index)
+        ).fillna('').astype(str).str.strip()
+        dimensions = selected.get(
+            'SourceDimensionAxes', pd.Series('', index=selected.index)
+        ).fillna('').astype(str).str.strip()
+        identity = signature.where(signature.ne(''), dimensions)
+        identity_key = identity.str.casefold()
+        axis_set = set(identity[
+            identity.ne('')
+            & ~identity_key.str.contains('productorserviceaxis', regex=False)
+        ])
+        if not axis_set:
+            return df
+        axis_sets.append(axis_set)
+    if not set.intersection(*axis_sets):
+        return df
+
+    total = pd.to_numeric(df.loc[total_idx], errors='coerce')
+    rows = {
+        idx: pd.to_numeric(df.loc[idx], errors='coerce')
+        for idx in reportable
+    }
+    ratios = {}
+    for period in df.columns:
+        tv = total.get(period)
+        present = [series.get(period) for series in rows.values()]
+        # Evaluate complete families only.  A missing legacy/current member can
+        # make an era-mixed set appear to close by accident.
+        if (pd.isna(tv) or float(tv) == 0
+                or any(pd.isna(value) or float(value) < 0
+                       for value in present)):
+            continue
+        ratios[period] = (
+            abs(float(tv) - sum(map(float, present))) / abs(float(tv)))
+    closing = [ratio for ratio in ratios.values() if ratio <= 0.015]
+    if (len(closing) < 3 or not ratios
+            or len(closing) / len(ratios) < 0.60):
+        return df
+
+    out = df.copy()
+    if idx_flag not in out.index:
+        out.loc[idx_flag, :] = np.nan
+    corrected = []
+    for period, ratio in ratios.items():
+        if not bool(eligible.get(period, False)) or ratio > 0.015:
+            continue
+        out.at[idx_flag, period] = 1.0
+        out.at[idx_basis, period] = 1.0
+        out.at[idx_error, period] = ratio * 100.0
+        corrected.append(period)
+    if corrected:
+        labels = ', '.join(idx[1] for idx in reportable)
+        print('  [Segment Footing Final] Corrected isolated stale '
+              f"period(s) {', '.join(corrected)} from strict reportable "
+              f'basis: {labels}')
+    out.attrs.update(dict(getattr(df, 'attrs', {}) or {}))
+    return out
+
+
 def _gb_repair_face_proven_segment_profitability_cells(
         df: pd.DataFrame) -> pd.DataFrame:
     """Repair one inconsistent segment P&L cell from a repeated face identity.
@@ -35911,12 +36053,655 @@ def _gb_drop_rpo_taxonomy_artifacts(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+_GB_SHARE_AWARD_NONADDITIVE_CONCEPT_LABELS = {
+    (
+        'ShareBasedCompensationArrangementByShareBasedPaymentAward'
+        'VestingConditionRelatingToOperationalGoalsRevenue'
+    ): 'Share-Based Compensation Revenue Performance Target',
+    (
+        'ShareBasedCompensationArrangementByShareBasedPaymentAward'
+        'VestingConditionRelatingToOperationalGoalsAdjustedEarningsBefore'
+        'InterestTaxesDepreciationAndAmortization'
+    ): 'Share-Based Compensation Adjusted EBITDA Performance Target',
+    (
+        'ShareBasedCompensationArrangementByShareBasedPaymentAward'
+        'NumberOfPerformanceGoalsRevenue'
+    ): 'Share-Based Compensation Revenue Performance Goal Count',
+}
+
+
+def _gb_remove_source_proven_cost_as_revenue_artifacts(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None) -> pd.DataFrame:
+    """Drop a zero-axis HTML cost row mispublished as segment revenue.
+
+    The gate is deliberately redundant: the raw caption must be an exact cost
+    caption, every source candidate must be a zero-dimensional HTML segment
+    expense row, every public period must be represented in the audit, and the
+    absolute public series must exactly duplicate the consolidated Cost of
+    Revenue face row.  A legitimate segment (or a merely similar caption) is
+    therefore never selected by wording alone.
+    """
+    face_idx = ('1_Income_Statement', 'Cost of Revenue')
+    if (df is None or df.empty or not isinstance(df.index, pd.MultiIndex)
+            or face_idx not in df.index or fact_audit is None
+            or fact_audit.empty):
+        return df
+    required = {'Label', 'Period', 'SourceKind', 'DimCount'}
+    if not required.issubset(fact_audit.columns):
+        return df
+
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+    out = df.copy()
+    face = pd.to_numeric(out.loc[face_idx], errors='coerce')
+    cost_caption_keys = {
+        'cost of sale', 'cost of sales', 'cost of revenue',
+        'cost of good sold', 'cost of goods sold',
+    }
+    dropped = []
+    for idx in list(out.index):
+        if idx[0] != '4a_Segments_Business':
+            continue
+        metric, member = _split_segment_display_label(str(idx[1]))
+        if (_normalize_label_key(metric) != 'revenue'
+                or _normalize_label_key(member) not in cost_caption_keys):
+            continue
+        audit = fact_audit[
+            fact_audit['Label'].fillna('').astype(str).eq(str(idx[1]))
+        ].copy()
+        if audit.empty:
+            continue
+        source_kind = audit['SourceKind'].fillna('').astype(str).str.casefold()
+        dim_count = pd.to_numeric(audit['DimCount'], errors='coerce')
+        axes = audit.get(
+            'SourceDimensionAxes', pd.Series('', index=audit.index)
+        ).fillna('').astype(str).str.strip()
+        table_role = audit.get(
+            'SourceTableRole', pd.Series('', index=audit.index)
+        ).fillna('').astype(str).str.casefold()
+        raw_caption = audit.get(
+            'SourceRawLabel', audit.get(
+                'SourceLabel', pd.Series('', index=audit.index))
+        ).fillna('').astype(str).map(_normalize_label_key)
+        if not (
+                source_kind.eq('html_table').all()
+                and dim_count.eq(0).all()
+                and axes.eq('').all()
+                and table_role.eq('segment_expense_detail').all()
+                and raw_caption.isin(cost_caption_keys).all()):
+            continue
+
+        values = pd.to_numeric(out.loc[idx], errors='coerce')
+        populated = values.notna()
+        if int(populated.sum()) < 3 or not bool(face[populated].notna().all()):
+            continue
+        proven_periods = set(audit['Period'].dropna().astype(str))
+        if not set(values.index[populated].map(str)).issubset(proven_periods):
+            continue
+        if not bool(np.isclose(
+                values[populated].abs().to_numpy(dtype=float),
+                face[populated].abs().to_numpy(dtype=float),
+                rtol=1e-10, atol=1.0).all()):
+            continue
+        out = out.drop(index=idx)
+        dropped.append(str(idx[1]))
+    if dropped:
+        print('  [Publication Semantics] Removed cost-as-revenue artifact(s): '
+              + ', '.join(dropped))
+    out.attrs.update(attrs)
+    return out
+
+
+def _gb_nonadditive_award_level_from_audit_row(row) -> float | None:
+    """Return the reported level behind an incorrectly discretized target."""
+    derivation = str(getattr(row, 'SourceDerivation', '') or '').strip()
+    if not derivation:
+        return None
+    field_order = []
+    if 'annual' in derivation.casefold():
+        field_order.append('SourceDerivationAnnualValue')
+    field_order.extend([
+        'SourceDerivationYTDValue',
+        'SourceDerivationYTD9Value',
+        'SourceDerivationAnnualValue',
+        'SourceReportedValue',
+    ])
+    for field in dict.fromkeys(field_order):
+        value = pd.to_numeric(
+            pd.Series([getattr(row, field, np.nan)]), errors='coerce'
+        ).iloc[0]
+        if pd.notna(value) and np.isfinite(float(value)):
+            return float(value)
+    return None
+
+
+def _gb_relabel_nonadditive_share_award_targets(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None) -> pd.DataFrame:
+    """Publish share-award goals as targets/counts, never financial flows.
+
+    These US-GAAP concepts contain the words ``Revenue`` or ``Depreciation``
+    inside a much longer share-award definition.  A lexical classifier can
+    consequently label them as actual revenue/depreciation and duration logic
+    can subtract successive reported target levels.  Exact concept identity is
+    sufficient proof both for the semantic label and for restoring a retained
+    cumulative/annual source level from the audit ledger.
+    """
+    if (df is None or df.empty or not isinstance(df.index, pd.MultiIndex)
+            or fact_audit is None or fact_audit.empty
+            or not {'Label', 'Period', 'Concept'}.issubset(fact_audit.columns)):
+        return df
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+    out = df.copy()
+    audit = fact_audit.copy()
+    audit['_GBConceptKey'] = audit['Concept'].fillna('').astype(str).map(
+        lambda value: value.rsplit(':', 1)[-1])
+    candidate_labels = audit.loc[
+        audit['_GBConceptKey'].isin(
+            _GB_SHARE_AWARD_NONADDITIVE_CONCEPT_LABELS),
+        'Label',
+    ].dropna().astype(str).drop_duplicates().tolist()
+    if not candidate_labels:
+        return df
+
+    changes = []
+    for label in candidate_labels:
+        label = str(label or '').strip()
+        old_idx = ('6_Disclosures', label)
+        if not label or old_idx not in out.index or ' - ' not in label:
+            continue
+        rows = audit[
+            audit['Label'].fillna('').astype(str).eq(label)
+        ].copy()
+        concept_keys = set(rows['_GBConceptKey'].dropna().astype(str))
+        categories = rows.get(
+            'Category', pd.Series('', index=rows.index)
+        ).fillna('').astype(str)
+        if (not concept_keys
+                or not concept_keys.issubset(
+                    _GB_SHARE_AWARD_NONADDITIVE_CONCEPT_LABELS)
+                or not bool(categories.eq('6_Disclosures').all())):
+            continue
+        targets = {
+            _GB_SHARE_AWARD_NONADDITIVE_CONCEPT_LABELS[concept]
+            for concept in concept_keys
+        }
+        if len(targets) != 1:
+            continue
+        target_metric = next(iter(targets))
+        _old_metric, member = label.split(' - ', 1)
+        if not member.strip():
+            continue
+
+        published = pd.to_numeric(out.loc[old_idx], errors='coerce')
+        public_periods = list(published.index[published.notna()])
+        is_count = target_metric.endswith('Goal Count')
+        restored_levels = {}
+        valid = bool(public_periods)
+        for period in public_periods:
+            period_rows = rows[
+                rows['Period'].fillna('').astype(str).eq(str(period))
+            ]
+            candidates = []
+            for row in period_rows.itertuples(index=False):
+                value = _gb_nonadditive_award_level_from_audit_row(row)
+                if value is None:
+                    raw_value = pd.to_numeric(pd.Series([
+                        getattr(row, 'Value', np.nan)
+                    ]), errors='coerce').iloc[0]
+                    value = (float(raw_value)
+                             if pd.notna(raw_value) else None)
+                if value is not None:
+                    candidates.append(value)
+            if not candidates:
+                valid = False
+                break
+            representative = candidates[0]
+            if is_count:
+                compatible = (
+                    float(representative).is_integer()
+                    and all(value == representative for value in candidates[1:]))
+            else:
+                compatible = all(np.isclose(
+                    representative, value, rtol=1e-10, atol=1.0)
+                    for value in candidates[1:])
+            if not compatible:
+                valid = False
+                break
+            restored_levels[period] = representative
+        if not valid:
+            continue
+        trial = out.copy()
+        for period, representative in restored_levels.items():
+            trial.at[old_idx, period] = representative
+
+        new_idx = ('6_Disclosures', f'{target_metric} - {member.strip()}')
+        if new_idx in trial.index:
+            source_values = pd.to_numeric(
+                trial.loc[old_idx], errors='coerce')
+            target_values = pd.to_numeric(
+                trial.loc[new_idx], errors='coerce')
+            overlap = source_values.notna() & target_values.notna()
+            if bool(overlap.any()):
+                source_overlap = source_values[overlap].to_numpy(dtype=float)
+                target_overlap = target_values[overlap].to_numpy(dtype=float)
+                if is_count:
+                    compatible = bool(np.equal(
+                        source_overlap, target_overlap).all())
+                else:
+                    compatible = bool(np.isclose(
+                        source_overlap, target_overlap,
+                        rtol=1e-10, atol=1.0).all())
+                if not compatible:
+                    continue
+        trial, applied = _gb_safe_rename_or_merge_pivot_row(
+            trial, old_idx, new_idx)
+        if applied:
+            out = trial
+            changes.append(f'{label} -> {new_idx[1]}')
+    if changes:
+        print('  [Publication Semantics] Corrected share-award target label(s): '
+              + '; '.join(changes))
+    out.attrs.update(attrs)
+    return out
+
+
+def _gb_has_exact_source_axes(value, required_fragments) -> bool:
+    """Return whether a pipe-delimited source signature has only these axes."""
+    tokens = [
+        token.strip()
+        for token in str(value or '').split('|')
+        if token.strip()
+    ]
+    fragments = [
+        re.sub(r'[^a-z0-9]', '', str(fragment).casefold())
+        for fragment in required_fragments
+    ]
+    if len(tokens) != len(fragments):
+        return False
+    local_names = []
+    for token in tokens:
+        local_name = token.rsplit('}', 1)[-1].rsplit(':', 1)[-1]
+        if '_' in local_name:
+            local_name = local_name.rsplit('_', 1)[-1]
+        local_names.append(re.sub(
+            r'[^a-z0-9]', '', local_name.casefold()))
+    return sorted(local_names) == sorted(fragments)
+
+
+def _gb_route_zero_only_product_segment_cross_tabs(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None) -> pd.DataFrame:
+    """Move explicit zero product-by-segment intersections from 4a to 4d.
+
+    Nonzero product disclosures remain in their established publication block
+    to avoid broad cross-company churn.  A row moves only when every public
+    value is zero and every populated period is backed by both the product or
+    service axis and the statement business-segment axis.
+    """
+    if (df is None or df.empty or not isinstance(df.index, pd.MultiIndex)
+            or fact_audit is None or fact_audit.empty
+            or not {'Label', 'Period'}.issubset(fact_audit.columns)):
+        return df
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+    out = df.copy()
+    moved = []
+    for old_idx in list(out.index):
+        if (old_idx[0] != '4a_Segments_Business'
+                or not str(old_idx[1]).startswith('Revenue - ')
+                or str(old_idx[1]).count(' - ') < 2):
+            continue
+        values = pd.to_numeric(out.loc[old_idx], errors='coerce')
+        populated = values.notna()
+        if (not populated.any()
+                or not bool(values[populated].abs().le(1e-12).all())):
+            continue
+        rows = fact_audit[
+            fact_audit['Label'].fillna('').astype(str).eq(str(old_idx[1]))
+        ].copy()
+        if rows.empty:
+            continue
+        relevant = rows[
+            rows['Period'].fillna('').astype(str).isin(
+                set(values.index[populated].map(str)))
+        ].copy()
+        if relevant.empty:
+            continue
+        dim_count = pd.to_numeric(
+            relevant.get('DimCount', pd.Series(np.nan, index=relevant.index)),
+            errors='coerce')
+        axes = relevant.get(
+            'SourceDimensionAxes', pd.Series('', index=relevant.index)
+        ).fillna('').astype(str)
+        exact_axes = axes.map(lambda value: _gb_has_exact_source_axes(
+            value, ('productorserviceaxis', 'statementbusinesssegmentsaxis')))
+        admission = relevant.get(
+            'SourceAdmissionRule', pd.Series('', index=relevant.index)
+        ).fillna('').astype(str).str.casefold()
+        analytical = relevant.get(
+            'SourceAnalyticalBasis', pd.Series('', index=relevant.index)
+        ).fillna('').astype(str).str.casefold()
+        category = relevant.get(
+            'Category', pd.Series('', index=relevant.index)
+        ).fillna('').astype(str)
+        audit_values = pd.to_numeric(
+            relevant.get('Value', pd.Series(np.nan, index=relevant.index)),
+            errors='coerce')
+        compatible = (
+            dim_count.eq(2)
+            & exact_axes
+            & admission.isin({
+                'recognized_business_axis',
+                'annual_minus_q1_q2_q3_same_segment_identity',
+            })
+            & analytical.eq('business_segment')
+            & category.eq(old_idx[0])
+            & audit_values.notna()
+            & audit_values.abs().le(1e-12)
+        )
+        # Mixed source/category evidence is ambiguous; filtering down to a
+        # convenient two-axis subset would conceal a real third coordinate.
+        if (not bool(compatible.all())
+                or int(admission.eq('recognized_business_axis').sum()) < 2):
+            continue
+        proven_periods = set(relevant['Period'].dropna().astype(str))
+        public_periods = set(values.index[populated].map(str))
+        if not public_periods.issubset(proven_periods):
+            continue
+        new_idx = ('4d_Segments_Cross_Tabulated', old_idx[1])
+        out, applied = _gb_safe_rename_or_merge_pivot_row(
+            out, old_idx, new_idx)
+        if applied:
+            moved.append(str(old_idx[1]))
+    if moved:
+        print('  [Publication Semantics] Routed zero-only cross-tab row(s): '
+              + ', '.join(moved))
+    out.attrs.update(attrs)
+    return out
+
+
+def _gb_remove_selector_axis_geographic_revenue_duplicates(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None) -> pd.DataFrame:
+    """Remove a concentration-selector overlay that duplicates geography.
+
+    ``ConcentrationRiskByBenchmarkAxis`` can qualify what the geography fact
+    measures (for example ``Sales Revenue``); it is not a second operating
+    coordinate.  If that two-axis parse is published as a 4d row and its whole
+    public series duplicates the independently published geographic parent,
+    retain the parent and remove only the redundant overlay.  Genuine customer
+    concentration percentages and non-duplicate cross-tabs are untouched.
+    """
+    if (df is None or df.empty or not isinstance(df.index, pd.MultiIndex)
+            or fact_audit is None or fact_audit.empty
+            or not {'Label', 'Period'}.issubset(fact_audit.columns)):
+        return df
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+    out = df.copy()
+    dropped = []
+    for idx in list(out.index):
+        if (idx[0] != '4d_Segments_Cross_Tabulated'
+                or not str(idx[1]).startswith('Revenue - ')
+                or str(idx[1]).count(' - ') < 2):
+            continue
+        rows = fact_audit[
+            fact_audit['Label'].fillna('').astype(str).eq(str(idx[1]))
+        ].copy()
+        if rows.empty:
+            continue
+        axes = rows.get(
+            'SourceDimensionAxes', pd.Series('', index=rows.index)
+        ).fillna('').astype(str)
+        exact_axes = axes.map(lambda value: _gb_has_exact_source_axes(
+            value, ('concentrationriskbybenchmarkaxis',
+                    'statementgeographicalaxis')))
+        admission = rows.get(
+            'SourceAdmissionRule', pd.Series('', index=rows.index)
+        ).fillna('').astype(str).str.casefold()
+        category = rows.get(
+            'Category', pd.Series('', index=rows.index)
+        ).fillna('').astype(str)
+        dim_count = pd.to_numeric(
+            rows.get('DimCount', pd.Series(np.nan, index=rows.index)),
+            errors='coerce')
+        selector_proof = (
+            dim_count.eq(2)
+            & exact_axes
+            & admission.eq('cross_tabulated_dimensions')
+            & category.eq(idx[0])
+        )
+        proof = rows[selector_proof].copy()
+        if (not bool(selector_proof.all())
+                or proof['Period'].dropna().astype(str).nunique() < 2):
+            continue
+
+        parts = str(idx[1]).split(' - ')
+        parent_idx = None
+        # Prefer the leading displayed member, then try the trailing member in
+        # case a filer presents the axes in the opposite order.
+        for member in (parts[1], parts[-1]):
+            for category in (
+                    '4b_Segments_Geographic_Regions',
+                    '4c_Segments_Geographic_Countries'):
+                candidate = (category, f'Revenue - {member}')
+                if candidate in out.index:
+                    parent_idx = candidate
+                    break
+            if parent_idx is not None:
+                break
+        if parent_idx is None:
+            continue
+        overlay = pd.to_numeric(out.loc[idx], errors='coerce')
+        parent = pd.to_numeric(out.loc[parent_idx], errors='coerce')
+        populated = overlay.notna()
+        if (int(populated.sum()) < 3
+                or not bool(parent[populated].notna().all())):
+            continue
+        proof_values = pd.to_numeric(
+            proof.get('Value', pd.Series(np.nan, index=proof.index)),
+            errors='coerce')
+        proof_periods = proof['Period'].fillna('').astype(str)
+        audit_matches_overlay = []
+        for row_position, period in zip(proof.index, proof_periods):
+            value = proof_values.get(row_position)
+            if period not in out.columns or pd.isna(value):
+                audit_matches_overlay.append(False)
+                continue
+            published = overlay.get(period)
+            audit_matches_overlay.append(
+                pd.notna(published)
+                and bool(np.isclose(
+                    float(value), float(published),
+                    rtol=1e-10, atol=1.0)))
+        if not audit_matches_overlay or not all(audit_matches_overlay):
+            continue
+        scale = pd.concat([
+            overlay[populated].abs(), parent[populated].abs()
+        ], axis=1).max(axis=1)
+        tolerance = (scale * 0.0015).clip(lower=5_000.0)
+        if not bool(((overlay[populated] - parent[populated]).abs()
+                     <= tolerance).all()):
+            continue
+        out = out.drop(index=idx)
+        dropped.append(f'{idx[1]} (duplicate of {parent_idx[1]})')
+    if dropped:
+        print('  [Publication Semantics] Removed selector-axis geographic '
+              'duplicate(s): ' + '; '.join(dropped))
+    out.attrs.update(attrs)
+    return out
+
+
+def _gb_period_order_key(period) -> tuple[int, int] | None:
+    match = re.fullmatch(r'(\d{4})-Q([1-4])', str(period or ''))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def _gb_disambiguate_conflicting_case_only_segment_rows(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None) -> pd.DataFrame:
+    """Qualify two case-only product captions that prove different scopes.
+
+    Capitalization alone must never be the user's only indication that two
+    overlapping rows carry different values.  This acts only on an exact pair
+    of case-normalized revenue labels, requires at least three materially and
+    consistently divergent overlaps, and requires at least three direct
+    one-axis product/service facts for each label.  The uniquely later-ending
+    series is the current basis.
+    """
+    if (df is None or df.empty or not isinstance(df.index, pd.MultiIndex)
+            or fact_audit is None or fact_audit.empty
+            or not {'Label', 'Period'}.issubset(fact_audit.columns)):
+        return df
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+    out = df.copy()
+    groups = defaultdict(list)
+    for idx in out.index:
+        if (idx[0] == '4a_Segments_Business'
+                and str(idx[1]).startswith('Revenue - ')
+                and str(idx[1]).count(' - ') == 1):
+            groups[_normalize_label_key(str(idx[1]))].append(idx)
+    changes = []
+    for indices in groups.values():
+        if len(indices) != 2 or indices[0][1] == indices[1][1]:
+            continue
+        left, right = indices
+        if str(left[1]).casefold() != str(right[1]).casefold():
+            continue
+        left_values = pd.to_numeric(out.loc[left], errors='coerce')
+        right_values = pd.to_numeric(out.loc[right], errors='coerce')
+        overlap = left_values.notna() & right_values.notna()
+        if int(overlap.sum()) < 3:
+            continue
+        conflicts = [
+            not _gb_close_publication_values(left_value, right_value)
+            for left_value, right_value in zip(
+                left_values[overlap], right_values[overlap])
+        ]
+        if sum(conflicts) < 3:
+            continue
+        conflict_periods = [
+            period for period, is_conflict in zip(
+                left_values.index[overlap], conflicts)
+            if is_conflict
+        ]
+        left_overlap = left_values[overlap].astype(float).to_numpy()
+        right_overlap = right_values[overlap].astype(float).to_numpy()
+        difference = left_overlap - right_overlap
+        scale = np.maximum(
+            np.maximum(np.abs(left_overlap), np.abs(right_overlap)), 1.0)
+        divergence = np.abs(difference) / scale
+        direction = np.sign(difference)
+        if (not bool(np.isfinite(divergence).all())
+                or not bool((divergence > 0.05).all())
+                or float(np.median(divergence)) <= 0.10
+                or bool((direction == 0).any())
+                or len(set(direction.tolist())) != 1):
+            continue
+
+        proven = True
+        for idx, published_values in (
+                (left, left_values), (right, right_values)):
+            rows = fact_audit[
+                fact_audit['Label'].fillna('').astype(str).eq(str(idx[1]))
+            ].copy()
+            if rows.empty:
+                proven = False
+                break
+            axes = rows.get(
+                'SourceDimensionAxes', pd.Series('', index=rows.index)
+            ).fillna('').astype(str)
+            exact_product_axis = axes.map(
+                lambda value: _gb_has_exact_source_axes(
+                    value, ('productorserviceaxis',)))
+            dim_count = pd.to_numeric(
+                rows.get('DimCount', pd.Series(np.nan, index=rows.index)),
+                errors='coerce')
+            admission = rows.get(
+                'SourceAdmissionRule', pd.Series('', index=rows.index)
+            ).fillna('').astype(str).str.casefold()
+            direct_product = rows[
+                dim_count.eq(1)
+                & exact_product_axis
+                & admission.eq('product_service_axis_face_disaggregation')
+            ].copy()
+            direct_product['_GBPeriod'] = direct_product[
+                'Period'].fillna('').astype(str)
+            direct_product['_GBValue'] = pd.to_numeric(
+                direct_product.get(
+                    'Value', pd.Series(np.nan, index=direct_product.index)),
+                errors='coerce')
+            matching_conflicts = 0
+            for period in conflict_periods:
+                expected = published_values.get(period)
+                candidates = direct_product.loc[
+                    direct_product['_GBPeriod'].eq(str(period)), '_GBValue'
+                ].dropna()
+                if (pd.notna(expected) and not candidates.empty
+                        and bool(np.isclose(
+                            candidates.to_numpy(dtype=float), float(expected),
+                            rtol=1e-10, atol=1.0).any())):
+                    matching_conflicts += 1
+            if matching_conflicts < 3:
+                proven = False
+                break
+        if not proven:
+            continue
+
+        last_periods = {}
+        for idx, values in ((left, left_values), (right, right_values)):
+            keys = [
+                key for key in (
+                    _gb_period_order_key(period)
+                    for period in values.index[values.notna()]
+                ) if key is not None
+            ]
+            if not keys:
+                proven = False
+                break
+            last_periods[idx] = max(keys)
+        if not proven or last_periods[left] == last_periods[right]:
+            continue
+        current = max(last_periods, key=last_periods.get)
+        legacy = right if current == left else left
+        current_new = (
+            current[0], f'{current[1]} (Current Reporting Basis)')
+        legacy_new = (
+            legacy[0], f'{legacy[1]} (Legacy Reporting Basis)')
+        trial = out.copy()
+        trial, current_applied = _gb_safe_rename_or_merge_pivot_row(
+            trial, current, current_new)
+        trial, legacy_applied = _gb_safe_rename_or_merge_pivot_row(
+            trial, legacy, legacy_new)
+        if current_applied and legacy_applied:
+            out = trial
+            changes.extend([
+                f'{current[1]} -> {current_new[1]}',
+                f'{legacy[1]} -> {legacy_new[1]}',
+            ])
+    if changes:
+        print('  [Publication Semantics] Qualified conflicting reporting bases: '
+              + '; '.join(changes))
+    out.attrs.update(attrs)
+    return out
+
+
+def _gb_apply_source_proven_publication_semantic_repairs(
+        df: pd.DataFrame, fact_audit: pd.DataFrame | None) -> pd.DataFrame:
+    """Apply idempotent, audit-backed public-label/category corrections."""
+    out = _gb_remove_source_proven_cost_as_revenue_artifacts(df, fact_audit)
+    out = _gb_relabel_nonadditive_share_award_targets(out, fact_audit)
+    out = _gb_route_zero_only_product_segment_cross_tabs(out, fact_audit)
+    out = _gb_remove_selector_axis_geographic_revenue_duplicates(
+        out, fact_audit)
+    out = _gb_disambiguate_conflicting_case_only_segment_rows(out, fact_audit)
+    return out
+
+
 def _gb_apply_v96_output_repairs(
         df: pd.DataFrame, fact_audit=None,
         cross_tab_source_ledger: pd.DataFrame | None = None) -> pd.DataFrame:
     out = _gb_restore_or_reconstruct_liabilities_v96(df, fact_audit)
     out = _gb_refresh_debt_and_net_cash_kpis_v96(out, fact_audit)
     out = _gb_reclassify_nonsemantic_segment_rows(out)
+    out = _gb_apply_source_proven_publication_semantic_repairs(
+        out, fact_audit)
     out = _gb_restore_basis_consistent_q4_cross_tabs(
         out, cross_tab_source_ledger)
     out = _gb_quarantine_nonclosing_cross_tab_revenue(out)
@@ -35925,6 +36710,8 @@ def _gb_apply_v96_output_repairs(
     out = _gb_normalize_proven_segment_cost_sign_family(out)
     out = _gb_refresh_balance_sheet_footing_v96(out)
     out = _gb_refresh_segment_footing_v96(out)
+    out = _gb_refresh_single_final_reportable_segment_footing(
+        out, fact_audit)
     return out
 
 def _repair_balance_sheet_identity(df: pd.DataFrame) -> pd.DataFrame:
