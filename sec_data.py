@@ -24538,6 +24538,24 @@ def _gb_prove_dissimilar_revenue_member_handoff(
             grouped.setdefault(key, []).append(row)
         return grouped
 
+    # This path is for genuinely dissimilar member captions only.  A pair
+    # that still shares meaningful member words (for example
+    # ``Search Advertising`` -> ``Search And News Advertising``) may be a
+    # scope expansion rather than a rename and must stay on the ordinary
+    # lexical/scope-aware paths.  Gaming -> XBOX has no shared member token.
+    def _member_tokens(label):
+        member = str(label or '').split(' - ', 1)[-1]
+        return {
+            token for token in re.findall(r'[a-z0-9]+', member.casefold())
+            if token not in {'and', 'or', 'the', 'of', 'for', 'to', 'in',
+                             'a', 'an', 'revenue', 'revenues', 'segment'}
+        }
+
+    tokens_a = _member_tokens(label_a)
+    tokens_b = _member_tokens(label_b)
+    if not tokens_a or not tokens_b or (tokens_a & tokens_b):
+        return False, 0, 0
+
     contexts_a = _rows_by_context(label_a)
     contexts_b = _rows_by_context(label_b)
     shared = set(contexts_a) & set(contexts_b)
@@ -24545,6 +24563,7 @@ def _gb_prove_dissimilar_revenue_member_handoff(
         return False, 0, 0
 
     exact_nonzero = 0
+    conflicting_contexts = 0
     forward = 0
     reverse = 0
     copublished = 0
@@ -24559,6 +24578,11 @@ def _gb_prove_dissimilar_revenue_member_handoff(
         scale = max(max(abs(value) for value in values), 1.0)
         tolerance = max(1.0, scale * 1e-9)
         if max(values) - min(values) > tolerance:
+            # A genuine rename is one economic series.  Any material
+            # disagreement in an otherwise identical concrete context is
+            # direct evidence of different scope, so two coincidental matches
+            # elsewhere must not override it.
+            conflicting_contexts += 1
             continue
         if max(abs(value) for value in values) <= tolerance:
             continue
@@ -24612,6 +24636,7 @@ def _gb_prove_dissimilar_revenue_member_handoff(
     handoff = max(forward, reverse)
     verified = (
         exact_nonzero >= 2
+        and conflicting_contexts == 0
         and copublished == 0
         and handoff >= 2
         and min(forward, reverse) == 0
@@ -25683,6 +25708,12 @@ def _build_pivoted_data_impl(all_facts, ticker, ye_month, company_name=None, is_
                 else:
                     # Text can change completely while the SEC context proves the
                     # member is the same economic series (MSFT Gaming -> XBOX).
+                    # This escape hatch is intentionally limited to captions
+                    # with no shared meaningful token.  Partial lexical overlap
+                    # can signal a scope change (Search Advertising -> Search
+                    # And News Advertising) and must not use this path.
+                    if a_toks & b_toks:
+                        continue
                     # First use the already-built fiscal-period ledger as a cheap
                     # prefilter; the expensive filing-context proof runs only when
                     # at least two periods contain an identical non-zero value.
@@ -31914,6 +31945,14 @@ def _refresh_granular_footing_checks(df: pd.DataFrame) -> pd.DataFrame:
             idx: pd.to_numeric(df.loc[idx], errors='coerce')
             for idx in reportable_indices
         }
+        def _era_bucket(label):
+            text = str(label or '').casefold()
+            if '(post change)' in text:
+                return 'post'
+            if '(pre change)' in text:
+                return 'pre'
+            return 'current'
+
         for col in cols:
             if pd.isna(total.get(col)) or float(total.get(col)) == 0:
                 continue
@@ -31922,10 +31961,28 @@ def _refresh_granular_footing_checks(df: pd.DataFrame) -> pd.DataFrame:
             if len(present) < 2:
                 seg_basis_code[col] = 0.0
                 continue
-            segment_sum = sum(float(seg_rows[idx][col]) for idx in present)
-            ratio = abs(float(total[col]) - segment_sum) / abs(float(total[col]))
-            seg_error_pct[col] = ratio * 100.0
-            if ratio <= 0.05:
+
+            # Never add mutually exclusive reporting eras together.  For a
+            # period that has both historical (Pre Change) and recast/current
+            # (Post Change) rows, evaluate each coherent basis independently
+            # and use the one that best reconciles to consolidated revenue.
+            candidate_groups = []
+            for bucket in ('post', 'pre', 'current'):
+                group = [idx for idx in present
+                         if _era_bucket(idx[1]) == bucket]
+                if len(group) >= 2:
+                    candidate_groups.append(group)
+            if not candidate_groups:
+                seg_basis_code[col] = 2.0
+                continue
+            best = None
+            for group in candidate_groups:
+                segment_sum = sum(float(seg_rows[idx][col]) for idx in group)
+                ratio = abs(float(total[col]) - segment_sum) / abs(float(total[col]))
+                if best is None or ratio < best[0]:
+                    best = (ratio, group)
+            seg_error_pct[col] = best[0] * 100.0
+            if best[0] <= 0.05:
                 seg_flag[col] = 1.0
                 seg_basis_code[col] = 1.0
             else:
@@ -31954,19 +32011,32 @@ def _refresh_granular_footing_checks(df: pd.DataFrame) -> pd.DataFrame:
 
             def basis_groups(labels):
                 groups = []
+
+                def era_bucket(label):
+                    text = str(label or '').casefold()
+                    if '(post change)' in text:
+                        return 'post'
+                    if '(pre change)' in text:
+                        return 'pre'
+                    return 'current'
+
+                def add_partitioned(candidates):
+                    # Pre/Post rows are alternative presentation eras, never
+                    # additive participants.  Ordinary untagged companies keep
+                    # exactly one ``current`` partition, preserving the old
+                    # behavior.
+                    for bucket in ('post', 'pre', 'current'):
+                        group = [label for label in candidates
+                                 if era_bucket(label) == bucket]
+                        if len(group) >= 2:
+                            groups.append(group)
+
                 if len(reportable_basis) >= 2:
-                    present_reportable = [
-                        label for label in reportable_basis if label in labels]
-                    if len(present_reportable) >= 2:
-                        groups.append(present_reportable)
-                    return groups
-                groups.append(labels)
-                for marker in ('(Post Change)', '(Pre Change)'):
-                    group = [
-                        label for label in labels
-                        if marker.lower() in label.lower()]
-                    if len(group) >= 2:
-                        groups.append(group)
+                    add_partitioned([
+                        label for label in reportable_basis if label in labels])
+
+                add_partitioned(labels)
+
                 base = [
                     label for label in labels
                     if not any(keyword in label.lower() for keyword in (
@@ -31978,8 +32048,8 @@ def _refresh_granular_footing_checks(df: pd.DataFrame) -> pd.DataFrame:
                         'windows division', 'search advertising', 'contract'
                     ))
                 ]
-                if len(base) >= 2:
-                    groups.append(base)
+                add_partitioned(base)
+
                 output = []
                 seen = set()
                 for group in groups:
