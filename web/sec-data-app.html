@@ -11638,8 +11638,8 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                 // ── Sensitivity matrix ──
                 const waccBase = state.wacc;
                 const s1Base = state.stage1Growth;
-                const waccSteps = [2, 1, 0, -1, -2];
-                const s1Steps = [-4, -2, 0, 2, 4];
+                const waccSteps = [5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5];
+                const s1Steps = [-10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10];
                 const waccVals = waccSteps.map(d => +(waccBase + d).toFixed(2));
                 const s1Vals = s1Steps.map(d => +(s1Base + d).toFixed(2));
 
@@ -11670,10 +11670,10 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
 
                 // EEM Sensitivity matrix
                 const eMultBase = state.exitMultiple || 0;
-                const eMultSteps = [-4, -2, 0, 2, 4];
+                const eMultSteps = [-10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10];
                 const eMultVals = eMultSteps.map(d => +(eMultBase + d).toFixed(2));
 
-                let matrixHeaderEEM = `<tr><th style="padding:6px 4px;text-align:center;color:var(--term-text-dimmer);font-size:10px;border-bottom:1px solid var(--term-border);">WACC+"/EEM</th>`;
+                let matrixHeaderEEM = `<tr><th style="padding:6px 4px;text-align:center;color:var(--term-text-dimmer);font-size:10px;border-bottom:1px solid var(--term-border);">WACC↓/EEM→</th>`;
                 eMultVals.forEach(t => {
                     matrixHeaderEEM += `<th style="padding:6px 4px;text-align:center;color:var(--term-text-dim);font-size:10px;border-bottom:1px solid var(--term-border);">${t.toFixed(1)}x</th>`;
                 });
@@ -12061,7 +12061,7 @@ ${(() => {
                                     style="padding:2px 8px;font-size:10px;font-family:inherit;border:none;cursor:pointer;transition:all .15s;${evBtnStyle}">EV</button>
                             </div>
                         </div>
-                        <div style="overflow-x:visible;">
+                        <div style="overflow-x:auto;">
                             <table style="width:100%;border-collapse:collapse;font-size:10px;table-layout:fixed;">
                                 <thead>${matrixHeader}</thead>
                                 <tbody>${matrixRows}</tbody>
@@ -12083,7 +12083,7 @@ ${(() => {
                                     style="padding:2px 8px;font-size:10px;font-family:inherit;border:none;cursor:pointer;transition:all .15s;${evBtnStyle}">EV</button>
                             </div>
                         </div>
-                        <div style="overflow-x:visible;">
+                        <div style="overflow-x:auto;">
                             <table style="width:100%;border-collapse:collapse;font-size:10px;table-layout:fixed;">
                                 <thead>${matrixHeaderEEM}</thead>
                                 <tbody>${matrixRowsEEM}</tbody>
@@ -12770,7 +12770,7 @@ if (key === 'riskFreeRate') {
                 // Each row: { label, hint, render(m) → { val, color } }
                 const FUND_SECTIONS = [
                     {
-                        icon: '🔬', label: 'Forensic Risk & Solvency',
+                        icon: '', label: 'Forensic Risk & Solvency',
                         rows: [
                             {
                                 label: `Altman Z-Score`, hint: fundTechMode ? 'Tech/SaaS' : 'Mfg',
@@ -12811,7 +12811,7 @@ if (key === 'riskFreeRate') {
                         ]
                     },
                     {
-                        icon: '⚙ï¸', label: 'Operating Leverage & Scalability',
+                        icon: '', label: 'Operating Leverage & Scalability',
                         rows: [
                             {
                                 label: 'Degree of Operating Leverage', hint: 'EBIT Δ% / Rev Δ%', render: m => {
@@ -12841,7 +12841,7 @@ if (key === 'riskFreeRate') {
                         ]
                     },
                     {
-                        icon: '💵', label: 'Cash Efficiency & Quality of Earnings',
+                        icon: '', label: 'Cash Efficiency & Quality of Earnings',
                         rows: [
                             {
                                 label: 'Owner Earnings', hint: 'NI + D&A − Maint.CapEx', render: m => {
@@ -12900,7 +12900,7 @@ if (key === 'riskFreeRate') {
                         ]
                     },
                     {
-                        icon: '📊', label: 'Capital Efficiency & Returns',
+                        icon: '', label: 'Capital Efficiency & Returns',
                         rows: [
                             {
                                 label: 'Net Margin', hint: 'NI / Revenue', isSubHdr: 'DuPont ROE', render: m => {
