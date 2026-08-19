@@ -2353,7 +2353,7 @@ ul.task-list li.task-done::before {
     class="fixed top-0 left-0 h-full bg-term-card border-r border-term-border z-[120] transform -translate-x-full transition-transform duration-300 ease-in-out flex flex-col shadow-2xl"
     style="width:470px;max-width:92vw;">
 
-    <!-- Drag the right edge to resize. AI Analyst intentionally stacks above Research Notes. -->
+    <!-- Drag the right edge to resize. AI Analyst intentionally stacks above Research Notes, which opens from the right. -->
     <div id="qwenAnalystResizeHandle"
         class="absolute top-0 right-0 h-full w-2 z-[130] cursor-col-resize select-none touch-none"
         style="transform:translateX(50%);"
@@ -2372,10 +2372,6 @@ ul.task-list li.task-done::before {
         <button id="qwenAnalystCloseBtn" class="text-term-text-dimmer hover:text-term-text-red p-1 transition-colors">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
         </button>
-    </div>
-
-    <div class="px-4 py-2 bg-term-bg-sub border-b border-term-border flex items-center justify-end gap-3 text-[10px] flex-shrink-0">
-        <span id="qwenResearchStatus" class="text-term-text-dimmer whitespace-nowrap">tools: checking</span>
     </div>
 
     <div id="qwenAnalystChatLog" class="flex-1 overflow-y-auto p-4 flex flex-col gap-3 space-y-2 bg-term-bg"></div>
@@ -14897,7 +14893,6 @@ const qwenReconnectBtn = document.getElementById('qwenReconnectBtn');
 const qwenConnectionStatus = document.getElementById('qwenConnectionStatus');
 const qwenConnectionDot = document.getElementById('qwenConnectionDot');
 const qwenModelBadge = document.getElementById('qwenModelBadge');
-const qwenResearchStatus = document.getElementById('qwenResearchStatus');
 const qwenAnalystResizeHandle = document.getElementById('qwenAnalystResizeHandle');
 
 const QWEN_ANALYST_DEFAULT_WIDTH = 470;
@@ -15154,23 +15149,36 @@ function createAnalystThinkingStream() {
     const wrap = document.createElement('div');
     wrap.className = 'self-start w-[92%] border border-term-border bg-term-bg-nav';
 
-    const header = document.createElement('div');
-    header.className = 'px-3 py-2 border-b border-term-border flex items-center justify-between gap-3';
+    const header = document.createElement('button');
+    header.type = 'button';
+    header.className = 'w-full px-3 py-2 border-0 border-b border-term-border bg-transparent flex items-center justify-between gap-3 text-left cursor-pointer select-none hover:bg-term-bg-hover focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-term-accent';
+    header.setAttribute('aria-expanded', 'true');
+    header.title = 'Collapse or expand thinking';
 
     const title = document.createElement('span');
     title.className = 'text-[9px] font-bold uppercase tracking-wider text-term-accent flex items-center gap-1.5';
     title.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-term-accent inline-block animate-pulse"></span>Thinking';
 
+    const right = document.createElement('span');
+    right.className = 'flex items-center gap-2 min-w-0';
+
     const status = document.createElement('span');
-    status.className = 'text-[9px] text-term-text-dimmer font-mono';
+    status.className = 'text-[9px] text-term-text-dimmer font-mono whitespace-nowrap';
     status.textContent = 'streaming';
+
+    const chevron = document.createElement('span');
+    chevron.className = 'text-[10px] text-term-text-dimmer font-mono leading-none transition-transform duration-150';
+    chevron.textContent = '⌃';
+    chevron.setAttribute('aria-hidden', 'true');
 
     const body = document.createElement('pre');
     body.className = 'm-0 px-3 py-2.5 text-[10px] leading-relaxed text-term-text-dim whitespace-pre-wrap break-words font-mono max-h-[280px] overflow-y-auto';
     body.textContent = '';
 
+    right.appendChild(status);
+    right.appendChild(chevron);
     header.appendChild(title);
-    header.appendChild(status);
+    header.appendChild(right);
     wrap.appendChild(header);
     wrap.appendChild(body);
     qwenAnalystChatLog.appendChild(wrap);
@@ -15178,6 +15186,18 @@ function createAnalystThinkingStream() {
 
     let sawReasoning = false;
     let turnCount = 0;
+    let collapsed = false;
+
+    const setCollapsed = (nextCollapsed) => {
+        collapsed = !!nextCollapsed;
+        body.classList.toggle('hidden', collapsed);
+        header.classList.toggle('border-b', !collapsed);
+        header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        chevron.textContent = collapsed ? '⌄' : '⌃';
+        header.title = collapsed ? 'Expand thinking' : 'Collapse thinking';
+    };
+
+    header.addEventListener('click', () => setCollapsed(!collapsed));
 
     return {
         startTurn(turn) {
@@ -15189,14 +15209,16 @@ function createAnalystThinkingStream() {
             if (!delta) return;
             sawReasoning = true;
             body.textContent += String(delta);
-            body.scrollTop = body.scrollHeight;
-            qwenAnalystChatLog.scrollTop = qwenAnalystChatLog.scrollHeight;
+            if (!collapsed) {
+                body.scrollTop = body.scrollHeight;
+                qwenAnalystChatLog.scrollTop = qwenAnalystChatLog.scrollHeight;
+            }
         },
         note(text) {
             if (!text) return;
             if (sawReasoning && body.textContent && !body.textContent.endsWith('\n')) body.textContent += '\n';
             body.textContent += `[${text}]\n`;
-            body.scrollTop = body.scrollHeight;
+            if (!collapsed) body.scrollTop = body.scrollHeight;
         },
         finish() {
             status.textContent = turnCount ? `turn ${turnCount} · complete` : 'complete';
@@ -15871,7 +15893,6 @@ async function qwenLoadDirectExaTools() {
 async function refreshQwenAnalystConnection(force = false) {
     qwenConnectionStatus.lastChild.textContent = ' AI model: checking';
     qwenConnectionDot.className = 'w-1.5 h-1.5 rounded-full bg-term-text-dimmer inline-block';
-    qwenResearchStatus.textContent = 'tools: checking';
     try {
         const r = await fetch(`${QWEN_ANALYST_BASE}/v1/models`, { headers: { 'Accept': 'application/json' } });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -15889,15 +15910,12 @@ async function refreshQwenAnalystConnection(force = false) {
             direct.forEach(t => { if (!names.has(t.function.name)) tools.push(t); });
         }
         qwenResearchTools = tools;
-        const exaCount = tools.filter(t => /exa/i.test(t.function?.name || '')).length;
-        qwenResearchStatus.textContent = exaCount ? `Exa: ${exaCount} tools` : (tools.length ? `research: ${tools.length} tools` : 'research: unavailable');
         return true;
     } catch (e) {
         qwenActiveModel = null;
         qwenConnectionStatus.lastChild.textContent = ' AI model: offline';
         qwenConnectionDot.className = 'w-1.5 h-1.5 rounded-full bg-term-text-red inline-block';
         qwenModelBadge.textContent = `${QWEN_ANALYST_BASE} · start your local AI server`;
-        qwenResearchStatus.textContent = 'tools: offline';
         if (force) appendQwenSystemMessage(`Could not reach the local AI model at ${QWEN_ANALYST_BASE}.`);
         return false;
     }
@@ -17659,16 +17677,77 @@ setTimeout(() => refreshQwenAnalystConnection(false), 0);
     const toggleNotesBtn = document.getElementById('toggleNotesBtn');
     const closeNotesBtn = document.getElementById('closeNotesBtn');
     const notesEditor = document.getElementById('notesEditor');
+    const notesResizeHandle = document.getElementById('notesResizeHandle');
+
+    const NOTES_DEFAULT_WIDTH = 450;
+    const NOTES_MIN_WIDTH = 300;
+    const NOTES_WIDTH_KEY = 'research_notes_drawer_width';
+
+    function notesWidthBounds() {
+        const maxWidth = Math.max(260, Math.min(window.innerWidth * 0.90, window.innerWidth - 8));
+        return { min: Math.min(NOTES_MIN_WIDTH, maxWidth), max: maxWidth };
+    }
+
+    function applyNotesWidth(rawWidth, persist = false) {
+        const bounds = notesWidthBounds();
+        const numeric = (rawWidth == null || rawWidth === '') ? NaN : Number(rawWidth);
+        const fallback = Math.min(NOTES_DEFAULT_WIDTH, bounds.max);
+        const width = Math.max(bounds.min, Math.min(bounds.max, Number.isFinite(numeric) ? numeric : fallback));
+        notesDrawer.style.width = `${Math.round(width)}px`;
+        if (persist) localStorage.setItem(NOTES_WIDTH_KEY, String(Math.round(width)));
+        return width;
+    }
+
+    applyNotesWidth(localStorage.getItem(NOTES_WIDTH_KEY));
 
     // ── Drawer Open/Close Logic ──
     const toggleDrawer = () => {
         const isOpen = notesDrawer.style.transform === 'translateX(0px)';
-        notesDrawer.style.transform = isOpen ? 'translateX(-100%)' : 'translateX(0px)';
+        notesDrawer.style.transform = isOpen ? 'translateX(100%)' : 'translateX(0px)';
         if (!isOpen) notesEditor.focus();
     };
 
     toggleNotesBtn.addEventListener('click', toggleDrawer);
     closeNotesBtn.addEventListener('click', toggleDrawer);
+
+    // ── Resize from the left edge (drawer is anchored to the right) ──
+    if (notesResizeHandle) {
+        let notesResizeActive = false;
+
+        notesResizeHandle.addEventListener('pointerdown', (e) => {
+            if (e.pointerType === 'mouse' && e.button !== 0) return;
+            notesResizeActive = true;
+            notesResizeHandle.setPointerCapture?.(e.pointerId);
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+            e.preventDefault();
+        });
+
+        notesResizeHandle.addEventListener('pointermove', (e) => {
+            if (!notesResizeActive) return;
+            applyNotesWidth(window.innerWidth - e.clientX, false);
+            e.preventDefault();
+        });
+
+        const finishNotesResize = (e) => {
+            if (!notesResizeActive) return;
+            notesResizeActive = false;
+            if (e?.pointerId != null && notesResizeHandle.hasPointerCapture?.(e.pointerId)) {
+                notesResizeHandle.releasePointerCapture(e.pointerId);
+            }
+            document.body.style.cursor = '';
+            document.body.style.userSelect = '';
+            applyNotesWidth(notesDrawer.getBoundingClientRect().width, true);
+        };
+
+        notesResizeHandle.addEventListener('pointerup', finishNotesResize);
+        notesResizeHandle.addEventListener('pointercancel', finishNotesResize);
+        notesResizeHandle.addEventListener('dblclick', () => applyNotesWidth(NOTES_DEFAULT_WIDTH, true));
+    }
+
+    window.addEventListener('resize', () => {
+        applyNotesWidth(notesDrawer.getBoundingClientRect().width || localStorage.getItem(NOTES_WIDTH_KEY));
+    });
 
     // ── Basic Formatting Buttons ──
     document.querySelectorAll('.note-btn').forEach(btn => {
@@ -17941,7 +18020,13 @@ document.addEventListener('DOMContentLoaded', () => {
         </script>
 		
 		<!-- ── Notes Drawer Panel ────────────────────────────────────────── -->
-<div id="notesDrawer" class="fixed top-0 left-0 h-full w-[450px] max-w-[90vw] bg-term-card border-r border-term-border z-[100] transform -translate-x-full transition-transform duration-300 ease-in-out flex flex-col shadow-[15px_0_40px_rgba(0,0,0,0.85)] overflow-hidden">
+<div id="notesDrawer" class="fixed top-0 right-0 h-full bg-term-card border-l border-term-border z-[100] transform translate-x-full transition-transform duration-300 ease-in-out flex flex-col shadow-[-15px_0_40px_rgba(0,0,0,0.85)] overflow-hidden" style="width:450px;max-width:90vw;">
+
+    <!-- Drag the left edge to resize. Double-click the edge to reset width. -->
+    <div id="notesResizeHandle"
+        class="absolute top-0 left-0 h-full w-2 z-[110] cursor-col-resize select-none touch-none"
+        style="transform:translateX(-50%);"
+        title="Drag to resize Research Notes"></div>
     
     <!-- ISO 3200 Film Grain Overlay -->
     <div class="pointer-events-none absolute inset-0 opacity-[0.06] z-0" style="background-image: url('data:image/svg+xml,%3Csvg viewBox=%220 0 200 200%22 xmlns=%22http://www.w3.org/2000/svg%22%3E%3Cfilter id=%22noiseFilter%22%3E%3CfeTurbulence type=%22fractalNoise%22 baseFrequency=%220.85%22 numOctaves=%223%22 stitchTiles=%22stitch%22/%3E%3C/filter%3E%3Crect width=%22100%25%22 height=%22100%25%22 filter=%22url(%23noiseFilter)%22/%3E%3C/svg%3E');"></div>
@@ -17982,7 +18067,7 @@ document.addEventListener('DOMContentLoaded', () => {
 </div>
 
 <!-- ── Sideways Bookmark Button ──────────────────────────────────── -->
-<button id="toggleNotesBtn" class="fixed left-0 top-1/2 -translate-y-1/2 z-[90] bg-term-bg-nav border-y border-r border-term-border text-term-text hover:text-term-accent hover:bg-term-bg shadow-[6px_0_20px_rgba(0,0,0,0.6)] px-2 py-6 rounded-r-lg transition-all flex items-center justify-center cursor-pointer group" style="writing-mode: vertical-rl; text-orientation: mixed;">
+<button id="toggleNotesBtn" class="fixed right-0 top-1/2 -translate-y-1/2 z-[90] bg-term-bg-nav border-y border-l border-term-border text-term-text hover:text-term-accent hover:bg-term-bg shadow-[-6px_0_20px_rgba(0,0,0,0.6)] px-2 py-6 rounded-l-lg transition-all flex items-center justify-center cursor-pointer group" style="writing-mode: vertical-rl; text-orientation: mixed;">
     <span class="text-[6px] font-normal tracking-widest uppercase transition-transform group-hover:scale-105">Notes</span>
 </button>
 	
