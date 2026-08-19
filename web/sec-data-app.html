@@ -2376,14 +2376,6 @@ ul.task-list li.task-done::before {
 
     <div id="qwenAnalystChatLog" class="flex-1 overflow-y-auto p-4 flex flex-col gap-3 space-y-2 bg-term-bg"></div>
 
-    <div class="px-4 py-1.5 bg-term-bg-nav border-t border-term-border flex items-center justify-between text-[10px] text-term-text-dimmer">
-        <span id="qwenConnectionStatus" class="flex items-center gap-1.5">
-            <span id="qwenConnectionDot" class="w-1.5 h-1.5 rounded-full bg-term-text-dimmer inline-block"></span>
-            AI model: checking
-        </span>
-        <button id="qwenReconnectBtn" class="hover:text-term-accent transition-colors underline cursor-pointer">Reconnect</button>
-    </div>
-
     <div class="p-3 bg-term-bg-nav border-t border-term-border flex-shrink-0">
         <div class="flex gap-2">
             <textarea id="qwenAnalystInput" placeholder="Ask about the loaded companies, valuation, or research…" rows="2"
@@ -14889,9 +14881,6 @@ const qwenAnalystCloseBtn = document.getElementById('qwenAnalystCloseBtn');
 const qwenAnalystChatLog = document.getElementById('qwenAnalystChatLog');
 const qwenAnalystInput = document.getElementById('qwenAnalystInput');
 const qwenAnalystSendBtn = document.getElementById('qwenAnalystSendBtn');
-const qwenReconnectBtn = document.getElementById('qwenReconnectBtn');
-const qwenConnectionStatus = document.getElementById('qwenConnectionStatus');
-const qwenConnectionDot = document.getElementById('qwenConnectionDot');
 const qwenModelBadge = document.getElementById('qwenModelBadge');
 const qwenAnalystResizeHandle = document.getElementById('qwenAnalystResizeHandle');
 
@@ -14974,7 +14963,6 @@ qwenAnalystToggleBtn.addEventListener('click', () => {
     refreshQwenAnalystConnection();
 });
 qwenAnalystCloseBtn.addEventListener('click', () => qwenAnalystDrawer.classList.add('-translate-x-full'));
-qwenReconnectBtn.addEventListener('click', () => refreshQwenAnalystConnection(true));
 qwenAnalystSendBtn.addEventListener('click', sendQueryToQwenAnalyst);
 qwenAnalystInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -15127,6 +15115,105 @@ function appendQwenChatMessage(sender, text) {
     container.appendChild(bubble);
     qwenAnalystChatLog.appendChild(container);
     qwenAnalystChatLog.scrollTop = qwenAnalystChatLog.scrollHeight;
+}
+
+function createAnalystResponseStream() {
+    const container = document.createElement('div');
+    container.className = 'hidden flex flex-col gap-1 max-w-[88%] self-start';
+
+    const label = document.createElement('span');
+    label.className = 'text-[9px] font-bold uppercase tracking-wider text-term-accent';
+    label.textContent = 'AI Analyst';
+
+    const bubble = document.createElement('div');
+    bubble.className = 'qwen-markdown bg-term-bg-sub border border-term-border text-term-text-dim p-3 text-xs leading-relaxed overflow-x-auto';
+    bubble.setAttribute('aria-live', 'polite');
+    bubble.setAttribute('aria-busy', 'true');
+
+    container.appendChild(label);
+    container.appendChild(bubble);
+    qwenAnalystChatLog.appendChild(container);
+
+    let turnText = '';
+    let renderTimer = null;
+    let committed = false;
+    let accepting = true;
+
+    const nearBottom = () => (
+        qwenAnalystChatLog.scrollHeight - qwenAnalystChatLog.scrollTop - qwenAnalystChatLog.clientHeight < 96
+    );
+
+    const render = (force = false) => {
+        if (renderTimer) {
+            clearTimeout(renderTimer);
+            renderTimer = null;
+        }
+        if (!turnText && !force) return;
+        const stick = nearBottom();
+        bubble.innerHTML = qwenRenderMarkdown(turnText);
+        if (stick) qwenAnalystChatLog.scrollTop = qwenAnalystChatLog.scrollHeight;
+    };
+
+    const scheduleRender = () => {
+        if (renderTimer) return;
+        renderTimer = setTimeout(() => render(), 45);
+    };
+
+    return {
+        beginTurn() {
+            committed = false;
+            accepting = true;
+            turnText = '';
+            if (renderTimer) {
+                clearTimeout(renderTimer);
+                renderTimer = null;
+            }
+            bubble.innerHTML = '';
+            bubble.setAttribute('aria-busy', 'true');
+            container.classList.add('hidden');
+        },
+        append(delta) {
+            if (!delta || !accepting) return;
+            if (!turnText) {
+                qwenClearLoader();
+                container.classList.remove('hidden');
+                qwenAnalystChatLog.scrollTop = qwenAnalystChatLog.scrollHeight;
+            }
+            turnText += String(delta);
+            scheduleRender();
+        },
+        discardTurn() {
+            accepting = false;
+            turnText = '';
+            if (renderTimer) {
+                clearTimeout(renderTimer);
+                renderTimer = null;
+            }
+            bubble.innerHTML = '';
+            container.classList.add('hidden');
+        },
+        finish(fullText) {
+            committed = true;
+            accepting = false;
+            turnText = String(fullText ?? turnText);
+            if (turnText) container.classList.remove('hidden');
+            render(true);
+            bubble.setAttribute('aria-busy', 'false');
+            qwenAnalystChatLog.scrollTop = qwenAnalystChatLog.scrollHeight;
+        },
+        fail() {
+            if (renderTimer) {
+                clearTimeout(renderTimer);
+                renderTimer = null;
+            }
+            bubble.setAttribute('aria-busy', 'false');
+            if (!committed && !turnText.trim()) container.remove();
+        },
+        remove() {
+            if (renderTimer) clearTimeout(renderTimer);
+            container.remove();
+        }
+    };
 }
 
 function qwenSetLoader(text = 'AI is analyzing…') {
@@ -15891,15 +15978,12 @@ async function qwenLoadDirectExaTools() {
 }
 
 async function refreshQwenAnalystConnection(force = false) {
-    qwenConnectionStatus.lastChild.textContent = ' AI model: checking';
-    qwenConnectionDot.className = 'w-1.5 h-1.5 rounded-full bg-term-text-dimmer inline-block';
+    qwenModelBadge.textContent = `${QWEN_ANALYST_BASE} · connecting…`;
     try {
         const r = await fetch(`${QWEN_ANALYST_BASE}/v1/models`, { headers: { 'Accept': 'application/json' } });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
         qwenActiveModel = data?.data?.[0]?.id || qwenActiveModel || 'qwen3.6-35b-a3b-big-bang';
-        qwenConnectionStatus.lastChild.textContent = ' AI model: connected';
-        qwenConnectionDot.className = 'w-1.5 h-1.5 rounded-full bg-term-text-green inline-block';
         qwenModelBadge.textContent = `${qwenActiveModel} · ${QWEN_ANALYST_BASE}`;
 
         let tools = await qwenLoadServerTools();
@@ -15913,8 +15997,6 @@ async function refreshQwenAnalystConnection(force = false) {
         return true;
     } catch (e) {
         qwenActiveModel = null;
-        qwenConnectionStatus.lastChild.textContent = ' AI model: offline';
-        qwenConnectionDot.className = 'w-1.5 h-1.5 rounded-full bg-term-text-red inline-block';
         qwenModelBadge.textContent = `${QWEN_ANALYST_BASE} · start your local AI server`;
         if (force) appendQwenSystemMessage(`Could not reach the local AI model at ${QWEN_ANALYST_BASE}.`);
         return false;
@@ -16086,7 +16168,12 @@ async function qwenChatCompletion(messages, tools, toolChoice = 'auto', streamHo
             content += delta.content;
             streamHooks?.onContentDelta?.(delta.content);
         }
-        if (Array.isArray(delta.tool_calls)) delta.tool_calls.forEach(mergeToolCallDelta);
+        if (Array.isArray(delta.tool_calls)) {
+            delta.tool_calls.forEach(part => {
+                mergeToolCallDelta(part);
+                streamHooks?.onToolCallDelta?.(part);
+            });
+        }
     };
 
     while (true) {
@@ -16122,7 +16209,7 @@ async function qwenChatCompletion(messages, tools, toolChoice = 'auto', streamHo
     };
 }
 
-async function runQwenAnalystAgent(prompt, thinkingStream = null) {
+async function runQwenAnalystAgent(prompt, thinkingStream = null, responseStream = null) {
     const needsDashboard = qwenQuestionNeedsDashboard(prompt);
     const system = qwenBuildSystemPrompt(needsDashboard);
     const messages = [
@@ -16136,13 +16223,18 @@ async function runQwenAnalystAgent(prompt, thinkingStream = null) {
     for (let turn = 0; turn < QWEN_MAX_AGENT_TURNS; turn++) {
         const turnNumber = turn + 1;
         thinkingStream?.startTurn(turnNumber);
+        responseStream?.beginTurn(turnNumber);
         const firstForcedDashboardRead = needsDashboard && !dashboardValueEvidenceSeen;
         const toolsThisTurn = firstForcedDashboardRead ? qwenDashboardTools : allTools;
         const message = await qwenChatCompletion(
             messages,
             toolsThisTurn,
             firstForcedDashboardRead ? 'required' : 'auto',
-            { onReasoningDelta: delta => thinkingStream?.append(delta) }
+            {
+                onReasoningDelta: delta => thinkingStream?.append(delta),
+                onContentDelta: delta => responseStream?.append(delta),
+                onToolCallDelta: () => responseStream?.discardTurn()
+            }
         );
         if (!message) throw new Error('The local AI model returned no assistant message.');
 
@@ -16150,8 +16242,14 @@ async function runQwenAnalystAgent(prompt, thinkingStream = null) {
         if (!toolCalls.length) {
             const finalText = String(message.content || '').trim();
             if (!finalText) throw new Error('The local AI model returned an empty answer.');
+            responseStream?.finish(finalText);
             return finalText;
         }
+
+        // If a turn emitted prose before deciding to call a tool, it was not the
+        // final answer. Remove that transient draft and reuse the same response
+        // bubble for the next turn.
+        responseStream?.discardTurn();
 
         const assistantToolMessage = {
             role: 'assistant',
@@ -16180,6 +16278,7 @@ async function runQwenAnalystAgent(prompt, thinkingStream = null) {
     // one tool-free synthesis pass using only evidence already collected. This keeps
     // runaway tool loops bounded while still returning a useful answer.
     thinkingStream?.note(`tool-turn safety ceiling reached (${QWEN_MAX_AGENT_TURNS}); synthesizing from collected evidence`);
+    responseStream?.beginTurn(QWEN_MAX_AGENT_TURNS + 1);
     messages.push({
         role: 'user',
         content: '[ANALYST_TOOL_BUDGET_REACHED] Stop calling tools. Produce the best final answer from the dashboard and research evidence already present in this conversation. Be explicit about any unresolved uncertainty or missing evidence.'
@@ -16188,10 +16287,16 @@ async function runQwenAnalystAgent(prompt, thinkingStream = null) {
         messages,
         [],
         'none',
-        { onReasoningDelta: delta => thinkingStream?.append(delta) }
+        {
+            onReasoningDelta: delta => thinkingStream?.append(delta),
+            onContentDelta: delta => responseStream?.append(delta)
+        }
     );
     const finalText = String(finalMessage?.content || '').trim();
-    if (finalText) return finalText;
+    if (finalText) {
+        responseStream?.finish(finalText);
+        return finalText;
+    }
     throw new Error('The analyst exhausted its tool budget and the final synthesis returned no answer.');
 }
 
@@ -16203,6 +16308,7 @@ async function sendQueryToQwenAnalyst() {
     appendQwenChatMessage('user', prompt);
     qwenAnalystInput.value = '';
     const thinkingStream = createAnalystThinkingStream();
+    const responseStream = createAnalystResponseStream();
     qwenSetLoader('AI is analyzing…');
 
     try {
@@ -16210,15 +16316,15 @@ async function sendQueryToQwenAnalyst() {
             const ok = await refreshQwenAnalystConnection();
             if (!ok) throw new Error(`The local AI model is not reachable at ${QWEN_ANALYST_BASE}.`);
         }
-        const answer = await runQwenAnalystAgent(prompt, thinkingStream);
+        const answer = await runQwenAnalystAgent(prompt, thinkingStream, responseStream);
         qwenClearLoader();
         thinkingStream.finish();
-        appendQwenChatMessage('ai', answer);
         qwenChatHistory.push({ role: 'user', content: prompt }, { role: 'assistant', content: answer });
         if (qwenChatHistory.length > 16) qwenChatHistory = qwenChatHistory.slice(-16);
     } catch (err) {
         qwenClearLoader();
         thinkingStream.fail();
+        responseStream.fail();
         appendQwenSystemMessage(`Analyst error: ${err.message || String(err)}`);
         console.error('[AI Analyst]', err);
     } finally {
