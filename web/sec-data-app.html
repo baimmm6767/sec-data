@@ -11638,8 +11638,8 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
                 // ── Sensitivity matrix ──
                 const waccBase = state.wacc;
                 const s1Base = state.stage1Growth;
-                const waccSteps = [5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5];
-                const s1Steps = [-10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10];
+                const waccSteps = [3, 2, 1, 0, -1, -2, -3];
+                const s1Steps = [-6, -4, -2, 0, 2, 4, 6];
                 const waccVals = waccSteps.map(d => +(waccBase + d).toFixed(2));
                 const s1Vals = s1Steps.map(d => +(s1Base + d).toFixed(2));
 
@@ -11670,7 +11670,7 @@ document.querySelectorAll('.frmImportMainBtn').forEach(btn => {
 
                 // EEM Sensitivity matrix
                 const eMultBase = state.exitMultiple || 0;
-                const eMultSteps = [-10, -8, -6, -4, -2, 0, 2, 4, 6, 8, 10];
+                const eMultSteps = [-6, -4, -2, 0, 2, 4, 6];
                 const eMultVals = eMultSteps.map(d => +(eMultBase + d).toFixed(2));
 
                 let matrixHeaderEEM = `<tr><th style="padding:6px 4px;text-align:center;color:var(--term-text-dimmer);font-size:10px;border-bottom:1px solid var(--term-border);">WACC↓/EEM→</th>`;
@@ -12770,7 +12770,7 @@ if (key === 'riskFreeRate') {
                 // Each row: { label, hint, render(m) → { val, color } }
                 const FUND_SECTIONS = [
                     {
-                        icon: '', label: 'Forensic Risk & Solvency',
+                        icon: '🔬', label: 'Forensic Risk & Solvency',
                         rows: [
                             {
                                 label: `Altman Z-Score`, hint: fundTechMode ? 'Tech/SaaS' : 'Mfg',
@@ -12811,7 +12811,7 @@ if (key === 'riskFreeRate') {
                         ]
                     },
                     {
-                        icon: '', label: 'Operating Leverage & Scalability',
+                        icon: '⚙ï¸', label: 'Operating Leverage & Scalability',
                         rows: [
                             {
                                 label: 'Degree of Operating Leverage', hint: 'EBIT Δ% / Rev Δ%', render: m => {
@@ -12841,7 +12841,7 @@ if (key === 'riskFreeRate') {
                         ]
                     },
                     {
-                        icon: '', label: 'Cash Efficiency & Quality of Earnings',
+                        icon: '💵', label: 'Cash Efficiency & Quality of Earnings',
                         rows: [
                             {
                                 label: 'Owner Earnings', hint: 'NI + D&A − Maint.CapEx', render: m => {
@@ -12900,7 +12900,7 @@ if (key === 'riskFreeRate') {
                         ]
                     },
                     {
-                        icon: '', label: 'Capital Efficiency & Returns',
+                        icon: '📊', label: 'Capital Efficiency & Returns',
                         rows: [
                             {
                                 label: 'Net Margin', hint: 'NI / Revenue', isSubHdr: 'DuPont ROE', render: m => {
@@ -15852,6 +15852,183 @@ const qwenDashboardTools = [
     }
 ];
 
+const qwenCalculatorTool = {
+    type: 'function',
+    function: {
+        name: 'calculator',
+        description: 'Perform deterministic arithmetic and common financial calculations. Use this instead of estimating arithmetic in model tokens. Retrieve source/dashboard values first when the calculation depends on dashboard data.',
+        parameters: {
+            type: 'object',
+            properties: {
+                operation: {
+                    type: 'string',
+                    enum: [
+                        'add',
+                        'subtract',
+                        'multiply',
+                        'divide',
+                        'percentage_change',
+                        'percentage_point_change',
+                        'margin',
+                        'ratio',
+                        'cagr',
+                        'compound',
+                        'present_value'
+                    ],
+                    description: 'Calculation to perform.'
+                },
+                values: {
+                    type: 'array',
+                    items: { type: 'number' },
+                    minItems: 1,
+                    description: 'Numeric inputs in calculation order. percentage_change uses [old, new]; margin/ratio use [numerator, denominator]; CAGR uses [start, end].'
+                },
+                periods: {
+                    type: 'number',
+                    description: 'Number of periods for CAGR, compound, or present_value.'
+                },
+                rate: {
+                    type: 'number',
+                    description: 'Rate as a decimal for compound/present_value, e.g. 0.08 for 8%.'
+                }
+            },
+            required: ['operation', 'values']
+        }
+    }
+};
+
+function qwenCalculator(args = {}) {
+    const op = String(args.operation || '');
+    const values = Array.isArray(args.values) ? args.values.map(Number) : [];
+
+    if (!values.length || values.some(v => !Number.isFinite(v))) {
+        return { error: 'Calculator requires finite numeric values.' };
+    }
+
+    const exactly = (n, label) => {
+        if (values.length !== n) return { error: `${label} requires exactly ${n} value${n === 1 ? '' : 's'}.` };
+        return null;
+    };
+
+    let result;
+    let unit = 'number';
+
+    switch (op) {
+        case 'add':
+            result = values.reduce((a, b) => a + b, 0);
+            break;
+
+        case 'subtract': {
+            const err = exactly(2, 'subtract');
+            if (err) return err;
+            result = values[0] - values[1];
+            break;
+        }
+
+        case 'multiply':
+            result = values.reduce((a, b) => a * b, 1);
+            break;
+
+        case 'divide': {
+            const err = exactly(2, 'divide');
+            if (err) return err;
+            if (values[1] === 0) return { error: 'divide requires a non-zero denominator.' };
+            result = values[0] / values[1];
+            break;
+        }
+
+        case 'percentage_change': {
+            const err = exactly(2, 'percentage_change');
+            if (err) return err;
+            if (values[0] === 0) return { error: 'percentage_change requires a non-zero starting value.' };
+            result = ((values[1] - values[0]) / Math.abs(values[0])) * 100;
+            unit = 'percent';
+            break;
+        }
+
+        case 'percentage_point_change': {
+            const err = exactly(2, 'percentage_point_change');
+            if (err) return err;
+            result = values[1] - values[0];
+            unit = 'percentage_points';
+            break;
+        }
+
+        case 'margin': {
+            const err = exactly(2, 'margin');
+            if (err) return err;
+            if (values[1] === 0) return { error: 'margin requires a non-zero denominator.' };
+            result = (values[0] / values[1]) * 100;
+            unit = 'percent';
+            break;
+        }
+
+        case 'ratio': {
+            const err = exactly(2, 'ratio');
+            if (err) return err;
+            if (values[1] === 0) return { error: 'ratio requires a non-zero denominator.' };
+            result = values[0] / values[1];
+            unit = 'ratio';
+            break;
+        }
+
+        case 'cagr': {
+            const err = exactly(2, 'cagr');
+            if (err) return err;
+            const periods = Number(args.periods);
+            if (!(periods > 0) || !Number.isFinite(periods)) {
+                return { error: 'cagr requires periods > 0.' };
+            }
+            if (!(values[0] > 0) || values[1] < 0) {
+                return { error: 'cagr requires a positive starting value and a non-negative ending value.' };
+            }
+            result = (Math.pow(values[1] / values[0], 1 / periods) - 1) * 100;
+            unit = 'percent';
+            break;
+        }
+
+        case 'compound': {
+            const err = exactly(1, 'compound');
+            if (err) return err;
+            const periods = Number(args.periods);
+            const rate = Number(args.rate);
+            if (!Number.isFinite(periods) || !Number.isFinite(rate)) {
+                return { error: 'compound requires finite periods and rate.' };
+            }
+            result = values[0] * Math.pow(1 + rate, periods);
+            break;
+        }
+
+        case 'present_value': {
+            const err = exactly(1, 'present_value');
+            if (err) return err;
+            const periods = Number(args.periods);
+            const rate = Number(args.rate);
+            if (!Number.isFinite(periods) || !Number.isFinite(rate) || (1 + rate) === 0) {
+                return { error: 'present_value requires finite periods and a valid rate.' };
+            }
+            result = values[0] / Math.pow(1 + rate, periods);
+            break;
+        }
+
+        default:
+            return { error: `Unsupported calculator operation '${op}'.` };
+    }
+
+    if (!Number.isFinite(result)) {
+        return { error: 'Calculation produced a non-finite result.' };
+    }
+
+    return {
+        operation: op,
+        inputs: values,
+        ...(args.periods !== undefined ? { periods: Number(args.periods) } : {}),
+        ...(args.rate !== undefined ? { rate: Number(args.rate) } : {}),
+        result,
+        unit
+    };
+}
+
 function qwenQuestionNeedsDashboard(prompt) {
     if (!companies.length) return false;
     const q = qwenNormalizeText(prompt);
@@ -16011,6 +16188,7 @@ async function refreshQwenAnalystConnection(force = false) {
 async function qwenExecuteTool(name, args) {
     if (name === 'dashboard_search') return qwenDashboardSearch(args);
     if (name === 'dashboard_get') return qwenDashboardGet(args);
+    if (name === 'calculator') return qwenCalculator(args);
     const entry = qwenServerToolRegistry.get(name);
     if (!entry) return { error: `Tool '${name}' is not available.` };
     if (entry.executor === 'exa_direct') {
@@ -16090,6 +16268,12 @@ function qwenBuildSystemPrompt(needsDashboard) {
         `- Prefer precise arithmetic and explicit denominators. Sanity-check percentages, signs, units, and period bases before drawing conclusions.\n` +
         `- Missing data is not zero. Do not silently fill missing quarters or infer values that were not retrieved.\n` +
         `- Be concise but analytical: lead with the answer, support it with the most decision-relevant numbers, then explain drivers/risks. Avoid generic finance commentary that is not supported by the retrieved evidence.\n\n` +
+        `CALCULATION DISCIPLINE:\n` +
+        `- Use the calculator tool for arithmetic derived from retrieved values instead of estimating, eyeballing, or mentally calculating numeric results in model tokens.\n` +
+        `- Use it for percentage changes, percentage-point changes, margins, ratios, CAGR, compounding, discounting/present value, and multi-step numeric comparisons when arithmetic is material to the answer.\n` +
+        `- When a calculation depends on dashboard data, retrieve the exact source values with dashboard_get first, then pass those exact values to the calculator.\n` +
+        `- Treat calculator output as authoritative for arithmetic, but you remain responsible for selecting the economically correct formula, denominator, period basis, and units.\n` +
+        `- Do not substitute missing values with zero. Do not round intermediate inputs unless required; round only the displayed final result as appropriate.\n\n` +
         `FINAL RESPONSE FORMAT — GITHUB-FLAVORED MARKDOWN:\n` +
         `- Write the final answer as clean GFM Markdown, not raw HTML and not pseudo-Markdown.\n` +
         `- Use ## / ### headings only when they improve navigation; always include a space after the # characters. Do not expose literal heading markers as prose.\n` +
@@ -16222,7 +16406,11 @@ async function runQwenAnalystAgent(prompt, thinkingStream = null, responseStream
         ...qwenHistoryForRequest(),
         { role: 'user', content: prompt }
     ];
-    const allTools = [...qwenDashboardTools, ...qwenResearchTools];
+    const allTools = [
+        ...qwenDashboardTools,
+        qwenCalculatorTool,
+        ...qwenResearchTools.filter(t => t?.function?.name !== 'calculator')
+    ];
     let dashboardValueEvidenceSeen = false;
 
     for (let turn = 0; turn < QWEN_MAX_AGENT_TURNS; turn++) {
