@@ -2374,16 +2374,11 @@ ul.task-list li.task-done::before {
         </button>
     </div>
 
-    <div class="px-4 py-2 bg-term-bg-sub border-b border-term-border flex items-center justify-between gap-3 text-[10px] flex-shrink-0">
-        <span class="text-term-text-dimmer">Context is retrieved on demand; dashboard values are not preloaded into prompts.</span>
+    <div class="px-4 py-2 bg-term-bg-sub border-b border-term-border flex items-center justify-end gap-3 text-[10px] flex-shrink-0">
         <span id="qwenResearchStatus" class="text-term-text-dimmer whitespace-nowrap">tools: checking</span>
     </div>
 
-    <div id="qwenAnalystChatLog" class="flex-1 overflow-y-auto p-4 flex flex-col gap-3 space-y-2 bg-term-bg">
-        <div class="bg-term-bg-nav border border-term-border p-3 text-xs text-term-text-muted leading-relaxed">
-            <strong>AI analyst ready.</strong> The model receives only a compact dashboard manifest first. It must read the relevant dashboard section before using its values, and can use Exa/web tools only when external research is needed.
-        </div>
-    </div>
+    <div id="qwenAnalystChatLog" class="flex-1 overflow-y-auto p-4 flex flex-col gap-3 space-y-2 bg-term-bg"></div>
 
     <div class="px-4 py-1.5 bg-term-bg-nav border-t border-term-border flex items-center justify-between text-[10px] text-term-text-dimmer">
         <span id="qwenConnectionStatus" class="flex items-center gap-1.5">
