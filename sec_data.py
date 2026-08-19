@@ -20833,6 +20833,159 @@ def _gb_rename_or_merge_pivot_row(df: pd.DataFrame, old_idx, new_idx,
     return out
 
 
+# Exact placeholder/aggregate member names that must never publish as named
+# business segments.  These are deliberately exact normalized names, so real
+# members such as "All Other Segments" or "TotalEnergies" are unaffected.
+_GB_AGGREGATE_SEGMENT_MEMBER_KEYS = frozenset({
+    'total', 'totals', 'consolidated',
+    'all segment', 'all segments',
+    'operating segment', 'operating segments',
+    'reportable segment', 'reportable segments',
+})
+
+# Low-information member aliases eligible for the narrow sparse-subset duplicate
+# rule below.  Keep this intentionally small: words such as "Gross", "Other",
+# "Combined", or "Services" can be genuine reportable business names.
+_GB_SPARSE_GENERIC_SEGMENT_ALIAS_KEYS = frozenset({'net'})
+
+
+def _gb_reclassify_aggregate_segment_members(df: pd.DataFrame) -> pd.DataFrame:
+    """Move exact aggregate placeholders out of 4a business segments.
+
+    This is a publication-only semantic cleanup.  Values are preserved under
+    ``6_Disclosures`` rather than deleted, and matching is exact after label
+    normalization to avoid touching genuine names that merely contain words
+    such as ``total`` or ``segment``.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+    out = df.copy()
+    moved = []
+    for idx in list(out.index):
+        if idx[0] != '4a_Segments_Business':
+            continue
+        _metric, member = _split_segment_display_label(idx[1])
+        member_key = _normalize_label_key(_gb_clean_member_footnote(member))
+        if member_key not in _GB_AGGREGATE_SEGMENT_MEMBER_KEYS:
+            continue
+        target = ('6_Disclosures', f'Business Segment Disclosure - {idx[1]}')
+        out = _gb_rename_or_merge_pivot_row(out, idx, target)
+        moved.append(idx[1])
+    if moved:
+        print(
+            f"  [Segment Aggregate Gate] Moved {len(moved)} aggregate "
+            "placeholder row(s) out of 4a_Segments_Business: "
+            + '; '.join(sorted(set(moved)))
+        )
+    out.attrs.update(attrs)
+    return out
+
+
+def _gb_drop_strict_sparse_generic_segment_aliases(
+        df: pd.DataFrame) -> pd.DataFrame:
+    """Drop a short generic 4a alias only when a longer row proves identity.
+
+    The rule is intentionally narrower than the ordinary duplicate gate:
+      * same normalized metric family only;
+      * losing member must be an explicitly generic alias (currently ``Net``);
+      * at least four populated alias periods and four distinct values;
+      * the alias periods must be a strict subset of the candidate row;
+      * the candidate must have at least twice the coverage and four additional
+        populated periods;
+      * every overlapping value must match essentially exactly; and
+      * exactly one longer candidate may satisfy all conditions.
+
+    No values are merged or calculated.  The source/audit ledger remains intact;
+    only the redundant public pivot row is removed.
+    """
+    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
+        return df
+    attrs = dict(getattr(df, 'attrs', {}) or {})
+    out = df.copy()
+    segment_indices = [
+        idx for idx in out.index if idx[0] == '4a_Segments_Business']
+    if len(segment_indices) < 2:
+        out.attrs.update(attrs)
+        return out
+
+    series = {idx: pd.to_numeric(out.loc[idx], errors='coerce')
+              for idx in segment_indices}
+    metrics = {
+        idx: _normalize_label_key(_split_segment_display_label(idx[1])[0])
+        for idx in segment_indices
+    }
+    members = {
+        idx: _normalize_label_key(_gb_clean_member_footnote(
+            _split_segment_display_label(idx[1])[1]))
+        for idx in segment_indices
+    }
+
+    drop = []
+    decisions = []
+    for short_idx in segment_indices:
+        if short_idx not in out.index:
+            continue
+        if members[short_idx] not in _GB_SPARSE_GENERIC_SEGMENT_ALIAS_KEYS:
+            continue
+        short = series[short_idx]
+        short_mask = short.notna()
+        short_coverage = int(short_mask.sum())
+        if short_coverage < 4:
+            continue
+        short_values = short[short_mask]
+        distinct = len({round(float(value), 6) for value in short_values})
+        if distinct < 4:
+            continue
+
+        matches = []
+        for long_idx in segment_indices:
+            if long_idx == short_idx or long_idx not in out.index:
+                continue
+            if metrics[long_idx] != metrics[short_idx]:
+                continue
+            if members[long_idx] in (
+                    _GB_AGGREGATE_SEGMENT_MEMBER_KEYS
+                    | _GB_SPARSE_GENERIC_SEGMENT_ALIAS_KEYS):
+                continue
+            long = series[long_idx]
+            long_mask = long.notna()
+            long_coverage = int(long_mask.sum())
+            if long_coverage < max(short_coverage + 4, short_coverage * 2):
+                continue
+            # The generic alias must add no unique period information.
+            if not bool((~short_mask | long_mask).all()):
+                continue
+            if bool((short_mask == long_mask).all()):
+                continue
+            left = short[short_mask]
+            right = long[short_mask]
+            if not bool(np.isclose(
+                    left.to_numpy(dtype=float),
+                    right.to_numpy(dtype=float),
+                    rtol=1e-9, atol=1.0).all()):
+                continue
+            matches.append(long_idx)
+
+        # Ambiguous identity is not enough evidence to delete a public row.
+        if len(matches) != 1:
+            continue
+        winner = matches[0]
+        drop.append(short_idx)
+        decisions.append((short_idx[1], winner[1], short_coverage))
+
+    if drop:
+        out = out.drop(index=drop)
+        messages = [
+            f'{loser} -> {winner} ({count}/{count} exact sparse periods)'
+            for loser, winner, count in decisions
+        ]
+        print('  [Segment Sparse Alias Gate] Removed strict sparse duplicate(s): '
+              + '; '.join(messages))
+    out.attrs.update(attrs)
+    return out
+
+
 def _gb_repair_discrete_q4_operating_openings(df: pd.DataFrame) -> pd.DataFrame:
     """Use prior-Q3 ending balances as discrete-Q4 opening balances.
 
@@ -22962,7 +23115,12 @@ def _gb_apply_final_segment_publication_gates(df: pd.DataFrame) -> pd.DataFrame:
     out = _gb_reclassify_significant_expense_details(out)
     out = _gb_promote_complete_significant_expense_details(out)
     out = _gb_reconcile_company_defined_segment_measure_aliases(out)
+    # Keep aggregate table placeholders out of the named business-segment block
+    # before duplicate arbitration, then apply the narrow four-period sparse
+    # generic-alias exception (e.g. AVGO ``Revenue - Net``).
+    out = _gb_reclassify_aggregate_segment_members(out)
     out = _gb_consolidate_pivot_segment_duplicates(out)
+    out = _gb_drop_strict_sparse_generic_segment_aliases(out)
     out = _gb_drop_invalid_asset_series_from_pivot(out)
     out = _gb_drop_nonmonetary_asset_disclosures(out)
     out = _gb_suppress_unproven_segment_footing_diagnostics(out)
@@ -46731,6 +46889,12 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
         final_pivot = _gb_apply_v96_output_repairs(
             final_pivot, _fact_audit,
             cross_tab_source_ledger=_cross_tab_source_ledger)
+        # Absolute segment publication boundary.  Late audit/v96 repairs can
+        # create or restore rows after the earlier idempotent segment gate, so
+        # rerun only the two narrow no-derivation cleanup rules immediately
+        # before sorting/writing.
+        final_pivot = _gb_reclassify_aggregate_segment_members(final_pivot)
+        final_pivot = _gb_drop_strict_sparse_generic_segment_aliases(final_pivot)
         final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native quarterly pre-write sort")
 
         progress.set(98.0, "Writing output file")
