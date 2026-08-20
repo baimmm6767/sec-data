@@ -10407,15 +10407,42 @@ def _gb_segment_asset_concept_kind(concept: str, duration) -> str:
         return 'balance'
     return 'unknown'
 
-# Product/service-like member names that actually identify acquired intangible
-# asset classes.  A nearby revenue heading must not turn these into revenue
-# segments (for example customer relationships or reacquired rights).
-_GB_NON_REVENUE_MEMBER_RE = re.compile(
+# Member names that identify accounting/disclosure classes rather than
+# reportable business segments.  These captions can sit near segment P&L tables
+# in flattened SEC HTML/XBRL, so no inherited metric prefix (Revenue, Operating
+# Income, Contribution, etc.) may turn them into 4a business-segment members.
+_GB_NON_SEGMENT_ACCOUNTING_MEMBER_RE = re.compile(
     r'^(?:customer\s+relationships?|reacquired\s+rights?|developed\s+technology|'
-    r'trade\s+names?|trademarks?|patents?|contractual\s+relationships?|'
-    r'non[- ]compete\s+agreements?|order\s+backlog|goodwill|'
+    r'trade\s+names?|(?:product\s+)?trademarks?|patents?|'
+    r'contractual\s+relationships?|non[- ]compete\s+agreements?|'
+    r'(?:order|customer)\s+backlog|goodwill|'
     r'acquired\s+intangible(?:\s+assets?)?|finite[- ]lived\s+intangibles?)$',
     re.I)
+
+# Debt instruments are a separate accounting class from acquired intangibles.
+# Keep this deliberately shape-specific so ordinary segment names containing
+# words such as "notes" or a year are never suppressed.
+_GB_NON_SEGMENT_DEBT_MEMBER_RE = re.compile(
+    r'^(?:(?:\d+(?:\.\d+)?|\.\d+)%\s+)?(?:senior\s+)?notes?\s+due\s+20\d{2}'
+    r'(?:\s*\([^)]*\))?$',
+    re.I)
+
+# Backward-compatible alias for any external/diagnostic code that referenced the
+# older revenue-specific name.  Admission logic below uses the generalized helper.
+_GB_NON_REVENUE_MEMBER_RE = _GB_NON_SEGMENT_ACCOUNTING_MEMBER_RE
+
+
+def _gb_is_non_segment_accounting_member(member: str) -> bool:
+    """True only for strongly identified non-segment accounting members."""
+    text = re.sub(r'\s+', ' ', str(member or '')).strip()
+    # Mirror the conservative member-footnote cleanup used later in the segment
+    # publication layer without depending on definition order.
+    text = re.sub(r'(?<=[A-Za-z])\d+$', '', text).strip()
+    text = re.sub(r'\s*\([a-z]\)\s*$', '', text, flags=re.I).strip()
+    return bool(
+        _GB_NON_SEGMENT_ACCOUNTING_MEMBER_RE.fullmatch(text)
+        or _GB_NON_SEGMENT_DEBT_MEMBER_RE.fullmatch(text)
+    )
 
 
 def _gb_row_semantic_override(label: str, table_role: str,
@@ -13146,12 +13173,11 @@ def _extract_generic_business_breakdown_from_table(
         label = row_member
         lowered = label.casefold()
 
-        # Acquired-intangible classes can appear in product/service tables near
-        # revenue disclosures.  Their member names are not revenue categories;
-        # preserving them as 4a rows produced false series such as ``Revenue -
-        # Customer relationships`` and ``Revenue - Reacquired rights``.
-        if (effective_prefix == 'Revenue'
-                and _GB_NON_REVENUE_MEMBER_RE.fullmatch(label.strip())):
+        # Strong accounting-member semantics outrank an inherited table prefix.
+        # This must apply to every segment P&L metric, not only Revenue; otherwise
+        # an intangible/debt table near an Operating Income heading can publish
+        # false rows such as ``Operating Income - Developed technology``.
+        if _gb_is_non_segment_accounting_member(label):
             continue
 
         period_basis = None
@@ -17968,8 +17994,7 @@ def _extract_from_filing_impl(filing, ye_month, ticker=None, use_arelle=False):
                 _GB_CONTEXT_ROLE_BLOCKER_RE.search(member)
                 or _GB_NON_MEMBER_ACCOUNTING_ROW_RE.fullmatch(
                     str(member).casefold().rstrip(':').strip())
-                or (matched_prefix == 'Revenue'
-                    and _GB_NON_REVENUE_MEMBER_RE.fullmatch(str(member).strip()))
+                or _gb_is_non_segment_accounting_member(member)
                 for member in label_mems)
 
             # SPECIFICITY FILTER: If multiple members exist, keep only the most specific.
@@ -29550,6 +29575,11 @@ def _move_noisy_business_segment_rows_to_disclosures(df: pd.DataFrame) -> pd.Dat
         if metric == 'operating measure':
             continue
         if metric == 'net income':
+            noisy.append(idx)
+            continue
+        # Cache/output backstop for rows admitted by older extraction logic or
+        # restored by a late repair pass.  Preserve the values in disclosures.
+        if _gb_is_non_segment_accounting_member(member):
             noisy.append(idx)
             continue
         if any(k in m or k in full for k in (
@@ -46891,8 +46921,10 @@ def main(ticker, limit, use_arelle=False, dqc_ruleset=None, log_output=False,
             cross_tab_source_ledger=_cross_tab_source_ledger)
         # Absolute segment publication boundary.  Late audit/v96 repairs can
         # create or restore rows after the earlier idempotent segment gate, so
-        # rerun only the two narrow no-derivation cleanup rules immediately
-        # before sorting/writing.
+        # rerun the narrow no-derivation cleanup rules immediately before
+        # sorting/writing.  The accounting-member pass is cache-safe: values are
+        # rehomed to disclosures rather than discarded.
+        final_pivot = _move_noisy_business_segment_rows_to_disclosures(final_pivot)
         final_pivot = _gb_reclassify_aggregate_segment_members(final_pivot)
         final_pivot = _gb_drop_strict_sparse_generic_segment_aliases(final_pivot)
         final_pivot = _sort_final_output_pivot(final_pivot, is_financial=is_financial, is_insurance=is_insurance, context="native quarterly pre-write sort")
