@@ -17,8 +17,6 @@ Convert SEC EDGAR filings into detailed, modelling-ready quarterly or annual fin
 > [!IMPORTANT]
 > The primary supported workflow is **quarterly financial statement extraction for U.S. domestic filers using 10-Q and 10-K filings**. Annual extraction and foreign private issuer support are experimental.
 
-> SHA256: b89c040fa96d93682fa6217e171135768b5a6e186df3361c156a8f6341e60ac4
-
 **sec-data** is an open-source Python financial data extraction engine. It retrieves company filings directly from the SEC EDGAR database and transforms XBRL facts, company-specific tags, filing linkbases, historical comparative data, and selected HTML tables into structured financial statements.
 
 The result is a local dataset suitable for financial modelling, valuation, screening, research tools, dashboards, and other open-source financial applications.
